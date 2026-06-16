@@ -314,10 +314,19 @@ function routeTo(hash) {
 // `/api/archive/rescan` (walking the whole recordings tree) from every
 // open tab — so N open archive clients meant N full rescans per tick.
 // The work is the server's to do once; the browser just reacts to it.
+// Trailing debounce: the derive worker emits `clip_derived` per clip, so a
+// boot backfill of a large archive would otherwise fire one reload per clip
+// across every open tab. Coalesce a burst into a single reload shortly after
+// it settles. Guards are evaluated at fire time (state may have changed).
+let _archiveRefreshTimer = null;
 function refreshArchiveOnIndexChange() {
-  if (document.getElementById("view-archive").hidden) return;
-  if (document.querySelector("#days .day .day-body:not([hidden])")) return;
-  loadDays();
+  if (_archiveRefreshTimer) clearTimeout(_archiveRefreshTimer);
+  _archiveRefreshTimer = setTimeout(() => {
+    _archiveRefreshTimer = null;
+    if (document.getElementById("view-archive").hidden) return;
+    if (document.querySelector("#days .day .day-body:not([hidden])")) return;
+    loadDays();
+  }, 400);
 }
 
 // ---------- Archive ----------
@@ -2524,10 +2533,12 @@ function handleEvent(ev) {
   };
   switch (ev.type) {
     case "clip_indexed":
+    case "clip_derived":
       // Server re-indexed (download landed, manual rescan, import, or
-      // startup scan) and pushed this. Cheap read-only refresh — the
-      // scan already happened server-side, and this fires only on real
-      // changes, not on a timer.
+      // startup scan), or the derive worker finished a clip's
+      // thumbnail/filmstrip. Cheap read-only refresh — the work already
+      // happened server-side, and this fires only on real changes, not
+      // on a timer.
       refreshArchiveOnIndexChange();
       break;
     case "snapshot":
@@ -2744,6 +2755,7 @@ function renderSettingsSection(name) {
     gps: renderGpsSection,
     exports: renderExportsSection,
     archive: renderArchiveSection,
+    thumbnails: renderThumbnailsSection,
     web: renderWebSection,
     security: renderSecuritySection,
     system: renderSystemSection,
@@ -2993,6 +3005,22 @@ function renderGpsSection(pane) {
               textInput("NOMINATIM_EMAIL"));
   renderField(pane, "DISTANCE_UNITS", "Distance units",
               select("DISTANCE_UNITS", ["km", "miles"]));
+}
+
+function renderThumbnailsSection(pane) {
+  renderField(pane, "DERIVE_THUMBS_EAGER",
+              "Pre-generate thumbnails", checkbox("DERIVE_THUMBS_EAGER"));
+  renderField(pane, "DERIVE_FILMSTRIPS_EAGER",
+              "Pre-generate timeline filmstrips", checkbox("DERIVE_FILMSTRIPS_EAGER"));
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent =
+    "When on, these are built in the background as clips download (and " +
+    "existing clips are backfilled), so the archive and timeline feel instant. " +
+    "When off, they're generated on demand the first time you view a clip — " +
+    "lighter on low-power hosts. Filmstrips are far heavier than thumbnails " +
+    "(one decode every few seconds of clip), so they're off by default.";
+  pane.appendChild(note);
 }
 
 function renderExportsSection(pane) {

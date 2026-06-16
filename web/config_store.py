@@ -91,6 +91,7 @@ class ConfigStore:
     _ENV_RE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
     _BOOL_KEYS = {
         "HTML", "GPS_EXTRACT", "ENABLE_SCHEDULED_SYNC", "GEOCODE_ENABLED",
+        "DERIVE_THUMBS_EAGER", "DERIVE_FILMSTRIPS_EAGER",
     }
     _INT_KEYS = {
         "TIMEOUT", "DOWNLOAD_ATTEMPTS", "MAX_DOWNLOAD_ATTEMPTS",
