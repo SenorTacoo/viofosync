@@ -599,14 +599,6 @@ async def rescan(request: Request) -> JSONResponse:
         request.app.state.db, s.recordings, s.grouping,
         request.app.state.hub, asyncio.get_running_loop(),
     )
-    _tasks.spawn(
-        scanner.sweep_missing_thumbs(request.app.state.db, s.recordings),
-        name="rescan-thumb-sweep",
-    )
-    _tasks.spawn(
-        durations.sweep_missing_durations(request.app.state.db),
-        name="rescan-duration-sweep",
-    )
     return JSONResponse({"ok": True, "indexed": n})
 
 

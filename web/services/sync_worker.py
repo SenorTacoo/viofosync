@@ -794,9 +794,6 @@ class SyncWorker:
                     self.db, snap.recordings, snap.grouping,
                     self.hub, asyncio.get_running_loop(),
                 )
-                await scanner.sweep_missing_thumbs(
-                    self.db, snap.recordings,
-                )
                 sink = WebSink(self.hub, asyncio.get_running_loop())
                 await asyncio.to_thread(
                     _retention.sweep,
@@ -944,6 +941,16 @@ class SyncWorker:
                 await self._clear_sync_error()
             q.mark_done(self.db, item.id)
             q.emit_queue_changed(self.db, self.hub)
+            # Index this clip now so it appears immediately, then enqueue
+            # its (heavier) derive at live priority.
+            from . import derive_queue as _dq
+            _snap = self._provider.get()
+            _cid = scanner.index_one_clip(
+                self.db, _snap.recordings, _snap.grouping, item.filename,
+                source_dir=item.source_dir,
+            )
+            if _cid is not None:
+                _dq.enqueue(self.db, _cid, priority=0, now=int(time.time()))
             return True
 
         new_state = q.mark_transient_failure(

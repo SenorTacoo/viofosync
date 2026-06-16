@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
@@ -49,6 +50,8 @@ from .services.hub import Hub
 from .services.log_store import DBLogHandler
 from .services.mqtt import MqttService
 from .services.sync_worker import SyncWorker
+from .services import derive_worker
+from .services.derive_worker import DeriveWorker
 from .setup_mode import SetupModeMiddleware
 
 log = logging.getLogger("viofosync.web")
@@ -155,20 +158,6 @@ async def lifespan(app: FastAPI):
             log.info("initial archive scan: %d clips indexed", n)
         except Exception as e:  # pragma: no cover — non-fatal
             log.warning("initial scan failed: %s", e)
-            return
-        # Sweep any clips that don't have a cached thumbnail yet —
-        # backfills the cache on first boot of this image and on any
-        # subsequent boot where new files landed (e.g. manual drop).
-        try:
-            await scanner.sweep_missing_thumbs(
-                app.state.db, s.recordings,
-            )
-        except Exception as e:  # pragma: no cover — non-fatal
-            log.warning("thumb sweep failed: %s", e)
-        try:
-            await _dur_mod.sweep_missing_durations(app.state.db)
-        except Exception as e:  # pragma: no cover — non-fatal
-            log.warning("duration sweep failed: %s", e)
 
     app.state.initial_scan_task = asyncio.create_task(_background_scan())
 
@@ -268,6 +257,27 @@ async def lifespan(app: FastAPI):
         provider.subscribe(_on_sync_settings_changed)
     )
 
+    app.state.derive_worker = DeriveWorker(
+        app.state.db, provider, app.state.hub
+    )
+    app.state.derive_worker.bind_loop(asyncio.get_running_loop())
+    app.state.derive_worker.start()
+    app.state.derive_worker.kick()  # pick up whatever the boot scan enqueues
+
+    def _on_derive_settings_changed(keys, snap) -> None:
+        # When eager-derive toggles change, backfill existing clips so
+        # they get the newly-enabled artifact without waiting for the next
+        # download cycle.
+        if {"DERIVE_THUMBS_EAGER", "DERIVE_FILMSTRIPS_EAGER"} & keys:
+            derive_worker.enqueue_backfill(
+                app.state.db, now=int(time.time())
+            )
+            app.state.derive_worker.kick()
+
+    app.state.settings_unsubscribes.append(
+        provider.subscribe(_on_derive_settings_changed)
+    )
+
     app.state.mqtt = MqttService(
         db=app.state.db,
         provider=provider,
@@ -304,6 +314,7 @@ async def lifespan(app: FastAPI):
             if task is not None and not task.done():
                 task.cancel()
         await app.state.sync_worker.stop()
+        await app.state.derive_worker.stop()
         await app.state.export_worker.stop()
         drain = getattr(app.state, "log_drain_task", None)
         if drain is not None and not drain.done():
