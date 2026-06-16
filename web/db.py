@@ -149,6 +149,18 @@ CREATE TABLE IF NOT EXISTS export_jobs (
     clip_end      INTEGER             -- max source-clip timestamp (unix s)
 );
 
+CREATE TABLE IF NOT EXISTS derive_queue (
+    clip_id     INTEGER PRIMARY KEY,   -- clip_index.id
+    priority    INTEGER NOT NULL,      -- 0 = live (new clip), 1 = backfill
+    state       TEXT NOT NULL,         -- pending|running|done|failed
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    enqueued_at INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_derive_state
+    ON derive_queue(state, priority ASC, clip_id DESC);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
