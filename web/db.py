@@ -26,7 +26,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 
 log = logging.getLogger("viofosync.db")
@@ -268,3 +268,20 @@ class Database:
         """Serialised write connection."""
         with self._lock, self.conn() as c:
             yield c
+
+    # ---- kv: small persisted app state (string-valued) ----
+
+    def kv_get(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT value FROM kv WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else default
+
+    def kv_set(self, key: str, value: str) -> None:
+        with self.write() as c:
+            c.execute(
+                "INSERT INTO kv(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
