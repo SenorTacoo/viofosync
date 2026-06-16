@@ -28,6 +28,7 @@ const EXTRA_CAMERAS = CAMERAS.filter(
 const state = {
   csrf: null,
   modalClip: null,         // { id, camera, dayEl, timelines }
+  camera: null,            // cached { info, cat } from the last good fetch
   autoAdvance: localStorage.getItem("vfs.autoAdvance") === "1",
   page: 1,
   perPage: 20,
@@ -2837,6 +2838,7 @@ function textInput(key, opts = {}) {
 function checkbox(key) {
   const inp = document.createElement("input");
   inp.type = "checkbox";
+  inp.className = "switch";
   inp.checked = !!valueOf(key);
   inp.addEventListener("change", () => setPending(key, inp.checked));
   return inp;
@@ -3020,9 +3022,8 @@ function renderThumbnailsSection(pane) {
   note.textContent =
     "When on, these are built in the background as clips download (and " +
     "existing clips are backfilled), so the archive and timeline feel instant. " +
-    "When off, they're generated on demand the first time you view a clip — " +
-    "lighter on low-power hosts. Filmstrips are far heavier than thumbnails " +
-    "(one decode every few seconds of clip), so they're off by default.";
+    "Without, the filmstrips are generated on demand which can be slow on " +
+    "low-power hosts.";
   pane.appendChild(note);
 }
 
@@ -3196,7 +3197,7 @@ function renderSecuritySection(pane) {
     <div class="form-row"><label>Current password</label><input type="password" id="pw-current" autocomplete="current-password" /></div>
     <div class="form-row"><label>New password (min 8 characters)</label><input type="password" id="pw-new" autocomplete="new-password" /></div>
     <div class="form-row"><label>Confirm new password</label><input type="password" id="pw-confirm" autocomplete="new-password" /></div>
-    <div class="form-row"><label><input type="checkbox" id="pw-logout-others" /> Log out other sessions</label></div>
+    <div class="form-row"><label><input type="checkbox" class="switch" id="pw-logout-others" /> Log out other sessions</label></div>
     <button type="button" id="pw-save">Change password</button>
     <span id="pw-result" class="hint" aria-live="polite"></span>
     <h3>Session secret</h3>
@@ -3683,6 +3684,87 @@ window.addEventListener("hashchange", () => {
   };
 })();
 
+// ---------- Tooltips ----------
+// Reusable, app-wide tooltip. Any element with a `data-tip="…"` attribute
+// shows it on hover, keyboard focus, and tap/click — covering the gaps in
+// native `title` (no click, nothing on touch, unreliable timing). One shared
+// element lives on <body> and is fixed-positioned from the trigger's rect, so
+// it escapes overflow:hidden containers and flips/clamps near the viewport
+// edges. Wiring is delegated on `document`, so dynamically-rendered content
+// works with no per-element setup.
+(() => {
+  let tip = null;
+  let current = null;
+
+  function el() {
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.className = "tooltip";
+      tip.setAttribute("role", "tooltip");
+      tip.hidden = true;
+      document.body.appendChild(tip);
+    }
+    return tip;
+  }
+
+  function show(target) {
+    const text = target.getAttribute("data-tip");
+    if (!text) return;
+    current = target;
+    const t = el();
+    t.textContent = text;
+    t.hidden = false;
+    position(target, t);
+  }
+
+  function position(target, t) {
+    const r = target.getBoundingClientRect();
+    const tr = t.getBoundingClientRect();
+    const gap = 8;
+    let placement = "top";
+    let top = r.top - tr.height - gap;
+    if (top < gap) { top = r.bottom + gap; placement = "bottom"; }
+    let left = r.left + r.width / 2 - tr.width / 2;
+    left = Math.max(gap, Math.min(left, window.innerWidth - tr.width - gap));
+    t.style.left = `${Math.round(left)}px`;
+    t.style.top = `${Math.round(top)}px`;
+    t.dataset.placement = placement;
+    // Keep the arrow pointing at the trigger even after horizontal clamping.
+    const arrow = Math.max(12, Math.min(tr.width - 12,
+      r.left + r.width / 2 - left));
+    t.style.setProperty("--tip-arrow", `${Math.round(arrow)}px`);
+  }
+
+  function hide() {
+    if (tip) tip.hidden = true;
+    current = null;
+  }
+
+  document.addEventListener("mouseover", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t) show(t);
+  });
+  document.addEventListener("mouseout", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t && t === current && !t.contains(e.relatedTarget)) hide();
+  });
+  document.addEventListener("focusin", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t) show(t);
+  });
+  document.addEventListener("focusout", hide);
+  // Tap/click shows (re-shows) on the target, dismisses anywhere else. Not a
+  // toggle, so a touch's synthetic mouseover+click doesn't flash-and-hide.
+  document.addEventListener("click", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t) show(t); else hide();
+  });
+  window.addEventListener("scroll", hide, true);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hide();
+  });
+})();
+
 // ---------- Camera control ----------
 // Reads/writes live dashcam settings via /api/camera/*. The server enforces
 // the destructive-command denylist and per-value validation; the UI only ever
@@ -3714,31 +3796,71 @@ function cameraErr(e) {
   return "Error: " + m;
 }
 
+// Disable/enable every live control in the settings table. Controls stay
+// disabled until a fetch confirms the camera is actually reachable, so we
+// never let the user write a setting against stale/unconfirmed state.
+function setCamControlsDisabled(disabled) {
+  document.querySelectorAll("#camera-settings [data-cam-control]")
+    .forEach((c) => { c.disabled = disabled; });
+}
+
+// Opening the tab renders the last-known snapshot instantly (controls
+// disabled) and refreshes in the background; controls re-enable only once
+// the camera answers.
 async function loadCamera() {
   const statusEl = document.getElementById("camera-status");
   const infoEl = document.getElementById("camera-info");
   const setEl = document.getElementById("camera-settings");
   if (!statusEl) return;
-  statusEl.className = "camera-status";
-  statusEl.textContent = "Loading camera…";
-  infoEl.innerHTML = "";
-  setEl.innerHTML = `<div class="cam-loading">Reading settings from the camera…</div>`;
+  if (state.camera) {
+    renderCameraInfo(infoEl, state.camera.info, state.camera.cat);
+    renderCameraSettings(setEl, state.camera.cat);
+    setCamControlsDisabled(true);
+    statusEl.className = "camera-status";
+    statusEl.textContent = "Refreshing from camera…";
+  } else {
+    statusEl.className = "camera-status";
+    statusEl.textContent = "Loading camera…";
+    infoEl.innerHTML = "";
+    setEl.innerHTML =
+      `<div class="cam-loading">Reading settings from the camera…</div>`;
+  }
+  await refreshCamera();
+}
+
+async function refreshCamera() {
+  const statusEl = document.getElementById("camera-status");
+  const infoEl = document.getElementById("camera-info");
+  const setEl = document.getElementById("camera-settings");
+  if (!statusEl) return;
+  const refreshBtn = document.getElementById("camera-refresh");
+  if (refreshBtn) refreshBtn.disabled = true;
+  setCamControlsDisabled(true);
 
   let info, cat;
   try {
     info = await api("/api/camera/info");
     cat = await api("/api/camera/settings/catalog");
   } catch (e) {
+    // Keep showing the cached snapshot (controls stay disabled) rather than
+    // blanking the page when the camera is briefly unreachable.
     statusEl.className = "camera-status error";
-    statusEl.textContent = cameraErr(e);
-    setEl.innerHTML = "";
+    statusEl.textContent = state.camera
+      ? cameraErr(e) + " Showing last-known settings."
+      : cameraErr(e);
+    if (!state.camera) setEl.innerHTML = "";
+    if (refreshBtn) refreshBtn.disabled = false;
     return;
   }
+  state.camera = { info, cat };
   renderCameraInfo(infoEl, info, cat);
   const adjustable = cat.settings.filter((s) => s.supported !== false).length;
+  statusEl.className = "camera-status";
   statusEl.textContent =
     `${cat.model} · ${adjustable} of ${cat.settings.length} settings adjustable now`;
+  // A fresh render replaces the disabled cached controls with live ones.
   renderCameraSettings(setEl, cat);
+  if (refreshBtn) refreshBtn.disabled = false;
 }
 
 function renderCameraInfo(el, info, cat) {
@@ -3774,12 +3896,19 @@ function renderCamRow(s) {
   const label = escHtml(settingLabel(s.key));
   const status = `<span class="cam-row-status" id="cam-status-${s.cmd}"></span>`;
 
+  // Row order is label | status | control: the status sits right after the
+  // label so the control is always the last column and right-aligned (no
+  // empty gap on the right when the status is blank).
   if (s.supported === false) {
     const cur = s.current_label != null ? escHtml(s.current_label) : "—";
+    const reason = escHtml(s.unsupported_reason || "Not adjustable now");
+    // A small ⓘ marker after the label; the reason is revealed by the
+    // data-tip tooltip (hover/focus/tap). The value stays right-aligned.
     return `<div class="cam-row disabled">
         <label>${label}</label>
-        <span class="cam-current" title="current value">${cur}</span>
-        <span class="cam-note">${escHtml(s.unsupported_reason || "Not adjustable now")}</span>
+        <span class="cam-note" tabindex="0" data-tip="${reason}"
+              aria-label="${reason}">ⓘ</span>
+        <span class="cam-current">${cur}</span>
       </div>`;
   }
 
@@ -3788,13 +3917,10 @@ function renderCamRow(s) {
     const on = s.current === b.on;
     return `<div class="cam-row">
         <label for="${id}">${label}</label>
-        <label class="cam-switch">
-          <input type="checkbox" id="${id}" data-cam-control
-                 data-key="${escHtml(s.key)}" data-cmd="${s.cmd}"
-                 data-on="${b.on}" data-off="${b.off}"${on ? " checked" : ""} />
-          <span class="cam-slider"></span>
-        </label>
         ${status}
+        <input type="checkbox" class="switch" id="${id}" data-cam-control
+               data-key="${escHtml(s.key)}" data-cmd="${s.cmd}"
+               data-on="${b.on}" data-off="${b.off}"${on ? " checked" : ""} />
       </div>`;
   }
 
@@ -3803,8 +3929,8 @@ function renderCamRow(s) {
     `${escHtml(o.value)}</option>`).join("");
   return `<div class="cam-row">
       <label for="${id}">${label}</label>
-      <select id="${id}" data-cam-control data-key="${escHtml(s.key)}" data-cmd="${s.cmd}">${opts}</select>
       ${status}
+      <select id="${id}" data-cam-control data-key="${escHtml(s.key)}" data-cmd="${s.cmd}">${opts}</select>
     </div>`;
 }
 
@@ -3874,4 +4000,4 @@ async function onCameraSettingChange(e) {
 }
 
 document.getElementById("camera-refresh")
-  ?.addEventListener("click", loadCamera);
+  ?.addEventListener("click", refreshCamera);

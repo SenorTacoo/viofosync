@@ -144,6 +144,30 @@ input[type="checkbox"],
 input[type="radio"] {
   accent-color: var(--accent);
 }
+
+/* Reusable tooltip — positioned on <body> by the Tooltips block in app.js.
+ * pointer-events:none so it never steals hover or affects layout. */
+.tooltip {
+  position: fixed; z-index: 1000; max-width: 280px;
+  padding: 6px 9px; border-radius: 6px;
+  background: var(--panel-3); color: var(--text);
+  border: 1px solid var(--border);
+  font-size: 0.8rem; line-height: 1.35;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+.tooltip[hidden] { display: none; }
+.tooltip::after {
+  content: ""; position: absolute; left: var(--tip-arrow, 50%);
+  transform: translateX(-50%); border: 6px solid transparent;
+}
+.tooltip[data-placement="top"]::after {
+  top: 100%; border-top-color: var(--panel-3);
+}
+.tooltip[data-placement="bottom"]::after {
+  bottom: 100%; border-bottom-color: var(--panel-3);
+}
+
 .icon-btn {
   display: flex; align-items: center; justify-content: center;
   width: 34px; height: 34px; padding: 0;
@@ -1203,7 +1227,9 @@ main {
   box-shadow: 0 0 0 3px var(--accent-18);
 }
 
-.settings-pane input[type="checkbox"] {
+/* Native checkboxes get the compact 16px treatment; .switch toggles keep
+ * their own 44x24 sizing (this rule outspecifies .switch, so exclude it). */
+.settings-pane input[type="checkbox"]:not(.switch) {
   accent-color: var(--accent);
   width: 16px;
   height: 16px;
@@ -2255,21 +2281,24 @@ main {
   padding: 8px 16px 14px; margin: 0 0 16px;
 }
 .cam-group legend { padding: 0 8px; color: var(--accent); font-weight: 600; }
+/* label | status | control. The status takes the flexible middle column so
+ * the control is always the last column, flush-right. Row height comes from
+ * the label's padding, keeping rows uniform regardless of control height. */
 .cam-row {
-  display: grid; grid-template-columns: 1fr minmax(140px, 240px) auto;
-  align-items: center; gap: 12px; padding: 7px 0;
+  display: grid; grid-template-columns: auto 1fr auto;
+  align-items: center; gap: 12px;
   border-top: 1px solid var(--border);
 }
 .cam-group .cam-row:first-of-type { border-top: none; }
-.cam-row label { color: var(--text); }
-.cam-row select { width: 100%; }
-.cam-row-status { font-size: 0.82rem; min-width: 90px; }
+.cam-row label { color: var(--text); padding: 14px 0; }
+.cam-row select { width: 200px; }
+.cam-row-status { font-size: 0.82rem; justify-self: start; }
 .cam-row-status.ok { color: var(--ok); }
 .cam-row-status.error { color: var(--err-text); }
 .cam-row-status.pending { color: var(--muted); }
 @media (max-width: 560px) {
   .cam-row { grid-template-columns: 1fr; gap: 4px; }
-  .cam-row-status { min-width: 0; }
+  .cam-row select { width: 100%; }
 }
 
 /* ---------- Camera tab polish ---------- */
@@ -2283,26 +2312,31 @@ main {
 
 /* disabled (not-adjustable-now) rows: show current value + reason */
 .cam-row.disabled label { color: var(--muted); }
-.cam-current { color: var(--text); font-variant-numeric: tabular-nums; }
+.cam-current { color: var(--text); font-variant-numeric: tabular-nums; justify-self: end; }
+/* Not-adjustable reason: a small ⓘ marker after the label; the reason is
+ * revealed by the data-tip tooltip (hover/focus/tap). */
 .cam-note {
-  grid-column: 3; justify-self: start; color: var(--muted);
-  font-size: 0.8rem; font-style: italic; min-width: 0;
+  justify-self: start; color: var(--muted);
+  font-size: 0.95rem; cursor: help; line-height: 1;
 }
 .cam-row.disabled { opacity: 0.85; }
 
-/* toggle switch for ON/OFF settings */
-.cam-switch { position: relative; display: inline-block; width: 44px; height: 24px; }
-.cam-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-.cam-slider {
-  position: absolute; inset: 0; cursor: pointer; border-radius: 999px;
-  background: var(--panel-3); border: 1px solid var(--border);
-  transition: background 0.15s ease;
+/* App-wide toggle switch for ON/OFF checkboxes (settings, archive filters,
+ * camera rows). Drops onto a plain <input type="checkbox" class="switch">
+ * — no wrapper element needed. Selection checkboxes keep the native box. */
+.switch {
+  appearance: none; -webkit-appearance: none; margin: 0;
+  box-sizing: border-box; flex: 0 0 auto; vertical-align: middle;
+  position: relative; width: 44px; height: 24px; border-radius: 999px;
+  cursor: pointer; background: var(--panel-3); border: 1px solid var(--border);
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
-.cam-slider::before {
+.switch::before {
   content: ""; position: absolute; height: 18px; width: 18px; left: 2px; top: 2px;
-  border-radius: 50%; background: var(--muted); transition: transform 0.15s ease, background 0.15s ease;
+  border-radius: 50%; background: var(--muted);
+  transition: transform 0.15s ease, background 0.15s ease;
 }
-.cam-switch input:checked + .cam-slider { background: var(--accent-45); border-color: var(--accent); }
-.cam-switch input:checked + .cam-slider::before { transform: translateX(20px); background: var(--on-accent); }
-.cam-switch input:focus-visible + .cam-slider { outline: 2px solid var(--accent); outline-offset: 2px; }
-.cam-switch input:disabled + .cam-slider { opacity: 0.5; cursor: default; }
+.switch:checked { background: var(--accent-45); border-color: var(--accent); }
+.switch:checked::before { transform: translateX(20px); background: var(--on-accent); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch:disabled { opacity: 0.5; cursor: default; }
