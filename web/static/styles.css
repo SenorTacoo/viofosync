@@ -1025,7 +1025,7 @@ main {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
-  max-height: 70vh; overflow-y: auto;
+  max-height: 70vh; overflow: auto;   /* x too: long lines scroll sideways */
   padding: 6px 0;
   font-family: "SF Mono", "Menlo", monospace;
   font-size: 12px; line-height: 1.6;
@@ -1033,21 +1033,25 @@ main {
 .logs-empty { padding: 16px; color: var(--muted); font-size: 13px; }
 .logs-footer { margin-top: 10px; }
 .logs-footer button[disabled] { opacity: 0.5; cursor: default; }
-.log-line { padding: 1px 14px; }
+/* Rows grow to their content so the widest line drives the scroll
+ * width, but never shrink below the viewport (so short rows still
+ * get a full-width hover band). */
+.log-line { padding: 1px 14px; width: max-content; min-width: 100%; box-sizing: border-box; }
 .log-head {
   display: flex; gap: 10px; align-items: baseline;
   white-space: nowrap;
 }
 .log-head.has-exc { cursor: pointer; }
-.log-head.has-exc::before { content: "▸"; color: var(--muted); }
-.log-line.open .log-head.has-exc::before { content: "▾"; }
+/* Caret sits in its own column right after the timestamp; the column
+ * is always present (even on rows without an exception) so the level
+ * column stays aligned. The glyph only shows on .has-exc rows. */
+.log-caret { flex: 0 0 1em; color: var(--muted); text-align: center; }
+.log-head.has-exc .log-caret::before { content: "▸"; }
+.log-line.open .log-head.has-exc .log-caret::before { content: "▾"; }
 .log-ts { color: var(--muted); flex: 0 0 auto; }
 .log-level { flex: 0 0 70px; font-weight: 600; }
 .log-logger { color: var(--muted); flex: 0 0 auto; }
-.log-msg {
-  color: var(--text); flex: 1 1 auto;
-  overflow: hidden; text-overflow: ellipsis;
-}
+.log-msg { color: var(--text); flex: 1 1 auto; }
 .log-line.log-info    .log-level { color: var(--muted); }
 .log-line.log-warning .log-level { color: var(--warn); }
 .log-line.log-error   .log-level,
@@ -1059,6 +1063,23 @@ main {
   white-space: pre-wrap; color: var(--muted);
 }
 .log-line.open .log-exc { display: block; }
+
+/* On a narrow screen, let each entry wrap instead of forcing a
+ * sideways scroll for every line: the timestamp/caret/level/logger
+ * sit on the first line and the message wraps full-width beneath,
+ * indented. Horizontal scroll stays available (overflow:auto on the
+ * list, overflow-wrap as the break of last resort) so an unbreakable
+ * token is still reachable. */
+@media (max-width: 720px) {
+  .log-line { width: auto; min-width: 0; }
+  .log-head { flex-wrap: wrap; white-space: normal; }
+  .log-msg {
+    flex: 1 1 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    padding-left: 1.5em;
+  }
+}
 
 /* Settings */
 .settings-layout {

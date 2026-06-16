@@ -2342,7 +2342,14 @@ function renderLogRow(e) {
 
   const ts = document.createElement("span");
   ts.className = "log-ts";
-  ts.textContent = new Date(e.ts * 1000).toLocaleTimeString();
+  const when = new Date(e.ts * 1000);
+  ts.textContent = `${when.toLocaleDateString()} ${when.toLocaleTimeString()}`;
+
+  // Expand caret, immediately right of the date/time. The glyph only
+  // appears on rows carrying an exception (.has-exc, set below), but
+  // the column is always rendered so levels line up across rows.
+  const caret = document.createElement("span");
+  caret.className = "log-caret";
 
   const lvl = document.createElement("span");
   lvl.className = "log-level";
@@ -2356,7 +2363,7 @@ function renderLogRow(e) {
   msg.className = "log-msg";
   msg.textContent = e.message;
 
-  head.append(ts, lvl, logger, msg);
+  head.append(ts, caret, lvl, logger, msg);
   row.appendChild(head);
 
   if (e.exc_text) {
