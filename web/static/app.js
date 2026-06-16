@@ -276,6 +276,8 @@ function routeTo(hash) {
   if (logsView) logsView.hidden = tab !== "logs";
   const settingsView = document.getElementById("view-settings");
   if (settingsView) settingsView.hidden = tab !== "settings";
+  const cameraView = document.getElementById("view-camera");
+  if (cameraView) cameraView.hidden = tab !== "camera";
   const timelineView = document.getElementById("view-timeline");
   if (timelineView) {
     timelineView.hidden = tab !== "timeline";
@@ -290,6 +292,7 @@ function routeTo(hash) {
     refreshExportJobs();
   }
   if (tab === "downloads") loadQueue();
+  if (tab === "camera") loadCamera();
   if (tab === "logs") loadLogs();
   if (tab === "settings") loadSettings();
   if (tab === "timeline") {
@@ -3679,3 +3682,196 @@ window.addEventListener("hashchange", () => {
     }
   };
 })();
+
+// ---------- Camera control ----------
+// Reads/writes live dashcam settings via /api/camera/*. The server enforces
+// the destructive-command denylist and per-value validation; the UI only ever
+// offers the safely-writable enumerated settings the catalog returns.
+
+function cameraCategory(key) {
+  if (!key) return "Other";
+  if (/RECORD|MOVIE|HDR|EXPOSURE|BITRATE|RESOLUTION|G_SENSOR|TIME_LAPSE|LIVEVIEW|IMAGE_|MIRROR|ROTATION|FISH_EYE|VIDEO_SOURCE|VIDEO_MERGE/.test(key))
+    return "Recording & Image";
+  if (/PARKING/.test(key)) return "Parking";
+  if (/WATERMARK|PLATE|STAMP/.test(key)) return "Watermark";
+  if (/WIFI|FREQUENCY|STA_/.test(key)) return "Wi-Fi & Network";
+  return "System";
+}
+
+function settingLabel(key) {
+  if (!key) return "(unknown)";
+  return key.replace(/^CMD_/, "").replace(/_/g, " ").toLowerCase()
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function cameraErr(e) {
+  const m = String((e && e.message) || e || "");
+  if (m.startsWith("409"))
+    return "No camera address configured — set it in Settings, then Refresh.";
+  if (m.startsWith("502"))
+    return "Camera unreachable — make sure it's powered and on Wi-Fi, then Refresh.";
+  if (m.startsWith("403")) return "Refused (protected setting).";
+  return "Error: " + m;
+}
+
+async function loadCamera() {
+  const statusEl = document.getElementById("camera-status");
+  const infoEl = document.getElementById("camera-info");
+  const setEl = document.getElementById("camera-settings");
+  if (!statusEl) return;
+  statusEl.className = "camera-status";
+  statusEl.textContent = "Loading camera…";
+  infoEl.innerHTML = "";
+  setEl.innerHTML = `<div class="cam-loading">Reading settings from the camera…</div>`;
+
+  let info, cat;
+  try {
+    info = await api("/api/camera/info");
+    cat = await api("/api/camera/settings/catalog");
+  } catch (e) {
+    statusEl.className = "camera-status error";
+    statusEl.textContent = cameraErr(e);
+    setEl.innerHTML = "";
+    return;
+  }
+  renderCameraInfo(infoEl, info, cat);
+  const adjustable = cat.settings.filter((s) => s.supported !== false).length;
+  statusEl.textContent =
+    `${cat.model} · ${adjustable} of ${cat.settings.length} settings adjustable now`;
+  renderCameraSettings(setEl, cat);
+}
+
+function renderCameraInfo(el, info, cat) {
+  const free = info.free_space_bytes != null
+    ? (info.free_space_bytes / (1 << 30)).toFixed(1) + " GB free"
+    : "—";
+  const s = info.sensors || {};
+  const lenses = s.total ? `${s.total} (${info.camera_tag || "?"})` : "—";
+  const rec = cat ? cat.recording : null;
+  const recHtml = rec == null ? "—"
+    : `<span class="cam-pill ${rec ? "on" : "off"}">` +
+      `${rec ? "● Recording" : "■ Stopped"}</span>`;
+  el.innerHTML = `
+    <div class="cam-facts">
+      <div><span>Firmware</span><b>${escHtml(info.firmware || "—")}</b></div>
+      <div><span>Status</span><b>${recHtml}</b></div>
+      <div><span>SD card</span><b>${escHtml(info.card_status_label || "—")}</b></div>
+      <div><span>Storage</span><b>${escHtml(free)}</b></div>
+      <div><span>Lenses</span><b>${escHtml(lenses)}</b></div>
+    </div>`;
+}
+
+// A 2-option OFF/ON setting → render a toggle. Returns {off,on} indices or null.
+function camBool(s) {
+  if (!s.options || s.options.length !== 2) return null;
+  const off = s.options.find((o) => String(o.value).toUpperCase() === "OFF");
+  const on = s.options.find((o) => String(o.value).toUpperCase() === "ON");
+  return off && on ? { off: off.index, on: on.index } : null;
+}
+
+function renderCamRow(s) {
+  const id = `cam-${s.cmd}`;
+  const label = escHtml(settingLabel(s.key));
+  const status = `<span class="cam-row-status" id="cam-status-${s.cmd}"></span>`;
+
+  if (s.supported === false) {
+    const cur = s.current_label != null ? escHtml(s.current_label) : "—";
+    return `<div class="cam-row disabled">
+        <label>${label}</label>
+        <span class="cam-current" title="current value">${cur}</span>
+        <span class="cam-note">${escHtml(s.unsupported_reason || "Not adjustable now")}</span>
+      </div>`;
+  }
+
+  const b = camBool(s);
+  if (b) {
+    const on = s.current === b.on;
+    return `<div class="cam-row">
+        <label for="${id}">${label}</label>
+        <label class="cam-switch">
+          <input type="checkbox" id="${id}" data-cam-control
+                 data-key="${escHtml(s.key)}" data-cmd="${s.cmd}"
+                 data-on="${b.on}" data-off="${b.off}"${on ? " checked" : ""} />
+          <span class="cam-slider"></span>
+        </label>
+        ${status}
+      </div>`;
+  }
+
+  const opts = s.options.map((o) =>
+    `<option value="${o.index}"${o.index === s.current ? " selected" : ""}>` +
+    `${escHtml(o.value)}</option>`).join("");
+  return `<div class="cam-row">
+      <label for="${id}">${label}</label>
+      <select id="${id}" data-cam-control data-key="${escHtml(s.key)}" data-cmd="${s.cmd}">${opts}</select>
+      ${status}
+    </div>`;
+}
+
+function renderCameraSettings(el, cat) {
+  const groups = {};
+  for (const s of cat.settings) {
+    const g = cameraCategory(s.key);
+    (groups[g] = groups[g] || []).push(s);
+  }
+  const order = ["Recording & Image", "Parking", "Watermark",
+                 "Wi-Fi & Network", "System", "Other"];
+  let html = "";
+  for (const g of order) {
+    const items = groups[g];
+    if (!items) continue;
+    html += `<fieldset class="cam-group"><legend>${escHtml(g)}</legend>`;
+    for (const s of items) html += renderCamRow(s);
+    html += `</fieldset>`;
+  }
+  el.innerHTML = html || "<p>No adjustable settings reported.</p>";
+  el.querySelectorAll("[data-cam-control]").forEach((ctrl) => {
+    ctrl.dataset.prev = ctrl.type === "checkbox"
+      ? (ctrl.checked ? "1" : "0") : ctrl.value;
+    ctrl.addEventListener("change", onCameraSettingChange);
+  });
+}
+
+function revertCamControl(ctrl) {
+  if (ctrl.type === "checkbox") ctrl.checked = ctrl.dataset.prev === "1";
+  else ctrl.value = ctrl.dataset.prev;
+}
+
+async function onCameraSettingChange(e) {
+  const ctrl = e.target;
+  const { key, cmd } = ctrl.dataset;
+  const isToggle = ctrl.type === "checkbox";
+  const value = isToggle
+    ? (ctrl.checked ? ctrl.dataset.on : ctrl.dataset.off) : ctrl.value;
+  const st = document.getElementById("cam-status-" + cmd);
+  ctrl.disabled = true;
+  st.className = "cam-row-status pending";
+  st.textContent = "Applying…";
+  try {
+    const r = await api(`/api/camera/settings/${encodeURIComponent(key)}`, {
+      method: "POST",
+      body: JSON.stringify({ value }),
+    });
+    if (r.verified === true) {
+      st.className = "cam-row-status ok";
+      st.textContent = r.record_cycled ? "✓ Saved (paused recording)" : "✓ Saved";
+      ctrl.dataset.prev = isToggle ? (ctrl.checked ? "1" : "0") : value;
+      setTimeout(() => {
+        if (st.classList.contains("ok")) st.textContent = "";
+      }, 2500);
+    } else {
+      st.className = "cam-row-status error";
+      st.textContent = "Camera didn't accept this";
+      revertCamControl(ctrl);
+    }
+  } catch (err) {
+    st.className = "cam-row-status error";
+    st.textContent = cameraErr(err);
+    revertCamControl(ctrl);
+  } finally {
+    ctrl.disabled = false;
+  }
+}
+
+document.getElementById("camera-refresh")
+  ?.addEventListener("click", loadCamera);

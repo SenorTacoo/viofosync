@@ -2235,3 +2235,74 @@ main {
 @media (prefers-reduced-motion: reduce) {
   .toast { transition: none; transform: none; }
 }
+
+/* ---------- Camera control tab ---------- */
+.camera-status { margin: 4px 0 12px; color: var(--muted); }
+.camera-status.error { color: var(--err-text); }
+.cam-facts {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px; margin-bottom: 18px;
+}
+.cam-facts > div {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.cam-facts span { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+.cam-facts b { font-weight: 600; word-break: break-word; }
+.cam-group {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 16px 14px; margin: 0 0 16px;
+}
+.cam-group legend { padding: 0 8px; color: var(--accent); font-weight: 600; }
+.cam-row {
+  display: grid; grid-template-columns: 1fr minmax(140px, 240px) auto;
+  align-items: center; gap: 12px; padding: 7px 0;
+  border-top: 1px solid var(--border);
+}
+.cam-group .cam-row:first-of-type { border-top: none; }
+.cam-row label { color: var(--text); }
+.cam-row select { width: 100%; }
+.cam-row-status { font-size: 0.82rem; min-width: 90px; }
+.cam-row-status.ok { color: var(--ok); }
+.cam-row-status.error { color: var(--err-text); }
+.cam-row-status.pending { color: var(--muted); }
+@media (max-width: 560px) {
+  .cam-row { grid-template-columns: 1fr; gap: 4px; }
+  .cam-row-status { min-width: 0; }
+}
+
+/* ---------- Camera tab polish ---------- */
+.cam-loading { color: var(--muted); padding: 16px 2px; }
+.cam-pill {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  font-size: 0.82rem; font-weight: 600;
+}
+.cam-pill.on  { background: color-mix(in oklch, var(--ok) 22%, transparent); color: var(--ok); }
+.cam-pill.off { background: var(--panel-3); color: var(--muted); }
+
+/* disabled (not-adjustable-now) rows: show current value + reason */
+.cam-row.disabled label { color: var(--muted); }
+.cam-current { color: var(--text); font-variant-numeric: tabular-nums; }
+.cam-note {
+  grid-column: 3; justify-self: start; color: var(--muted);
+  font-size: 0.8rem; font-style: italic; min-width: 0;
+}
+.cam-row.disabled { opacity: 0.85; }
+
+/* toggle switch for ON/OFF settings */
+.cam-switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+.cam-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.cam-slider {
+  position: absolute; inset: 0; cursor: pointer; border-radius: 999px;
+  background: var(--panel-3); border: 1px solid var(--border);
+  transition: background 0.15s ease;
+}
+.cam-slider::before {
+  content: ""; position: absolute; height: 18px; width: 18px; left: 2px; top: 2px;
+  border-radius: 50%; background: var(--muted); transition: transform 0.15s ease, background 0.15s ease;
+}
+.cam-switch input:checked + .cam-slider { background: var(--accent-45); border-color: var(--accent); }
+.cam-switch input:checked + .cam-slider::before { transform: translateX(20px); background: var(--on-accent); }
+.cam-switch input:focus-visible + .cam-slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+.cam-switch input:disabled + .cam-slider { opacity: 0.5; cursor: default; }

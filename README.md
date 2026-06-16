@@ -14,6 +14,7 @@ Self-hosted web app for syncing, browsing, and exporting recordings from a Viofo
 - **Video editor** - trim clips and cut between the front and rear cameras, then export a single video.
 - **Flexible exports** - original clips, joined front/rear, picture-in-picture, or edited cuts; hardware-accelerated where your system supports it.
 - **Storage management** - set a size or age limit and the oldest footage is pruned to fit; optional auto-delete clears the camera's SD card once a clip is safely saved.
+- **Camera control** - read and adjust the dashcam's own settings (resolution-adjacent options, parking mode, watermarks, HDR, LEDs, GPS…) from a Camera tab, with destructive actions hard-blocked.
 - **Easy browser-based setup** - a first-run wizard, then a settings page.
 - **Home Assistant support** - over MQTT, with sync status, alerts, and action buttons.
 
@@ -25,6 +26,7 @@ Self-hosted web app for syncing, browsing, and exporting recordings from a Viofo
 - [Getting started](#getting-started)
 - [Configuration](#configuration)
 - [Home Assistant](#home-assistant-via-mqtt)
+- [Camera control](#camera-control)
 - [Reference](#reference)
 - [About](#about)
 
@@ -153,6 +155,29 @@ For "prioritize the last N hours", publish to `{node_id}/cmd/prioritize_recent` 
 ### Security notes
 
 - The MQTT password is stored in `config.json` in plaintext, alongside the bcrypt hash of the admin password and the session secret. The same access controls already apply to that file.
+
+## Camera control
+
+The **Camera** tab reads the dashcam's current settings and lets you change them over Wi-Fi — parking mode, watermarks, HDR, LEDs, GPS, beeps, time/date, loop length, bitrate, and so on. On/off settings are toggles; multi-choice settings are drop-downs populated with the camera's own option labels. Each change is validated, sent, and read back to confirm it applied.
+
+![The Camera tab](screenshots/camera_control.webp)
+
+This drives the undocumented Novatek **netapp** HTTP interface (`http://<cam>/?custom=1&cmd=<id>&par=<value>`). Because that protocol has no schema, the option labels and value enumerations come from a derived per-model command map (`viofosync_lib/data/command_map.json`); see [Command map data](#command-map-data).
+
+**Safety model.** On this protocol a bare command is *not* always a harmless read — some ids are destructive actions. The control layer:
+
+- **Hard-blocks destructive ids** (format SD, factory reset, firmware update, delete file, reboot, restart-Wi-Fi, SSD format/delete) — they are refused before any request is built and are never shown in the UI.
+- **Allow-lists writes** to enumerated settings only, validates the value against the camera's option list, and **verifies** by reading the setting back.
+- **Is gentle**: one request at a time with a short timeout, so it doesn't overrun the camera's single-threaded daemon.
+- **Auto-pauses recording** for the few settings the camera only accepts when stopped (loop length, bitrate), then resumes — flagged in the UI as "paused recording".
+
+**What it won't change.** Settings the camera refuses over Wi-Fi are shown read-only with the reason — e.g. *recording resolution* (changeable on the camera, not in station mode) and *exposure*. Settings for a lens that isn't attached (rear/interior HDR, video-merge, …) are read-only with "needs the rear/interior camera" and light up automatically once that lens is connected (detected via the live sensor count).
+
+Only the **A329S** has been validated against real hardware; other models are mapped from the app data but untested.
+
+### Command map data
+
+`viofosync_lib/data/command_map.json` is a plain reformatting of the *factual API data* (command ids, English keys, descriptions, and option enumerations) found in the official VIOFO Android app's `device-cmd-manager.db` asset. No app code or resources are included, and the original `.db` is not redistributed. Regenerate or extend it with `scripts/build_command_map.py` (see the script header for how to pull the asset from the APK).
 
 ## Reference
 
