@@ -21,8 +21,10 @@
     // ---- editor (Phase 3B) ----
     inTs: null,
     outTs: null,
-    segments: [],          // [{start, end, camera}] tiling [inTs, outTs]
+    segments: [],          // [{start, end, camera, pip}] tiling [inTs, outTs]
     disabledChannels: null,// Set of channel keys excluded from cut/export
+    pipPosition: "top_right", // global PIP_POSITION setting; corner for the
+                           // PiP inset (preview rect + export overlay match)
   };
   let transportWired = false;
   let editorWired = false;
@@ -75,6 +77,13 @@
       return;
     }
     state.data = data;
+    // Mirror the global PiP corner so the preview inset matches the export
+    // overlay. Best-effort: a failed/missing setting keeps the top_right
+    // default. Refreshed each open, so a settings change applies on reload.
+    try {
+      const s = await api("/api/settings");
+      state.pipPosition = (s.editable && s.editable.PIP_POSITION) || "top_right";
+    } catch { /* keep the default corner */ }
     state.channels = data.channels || [];
     state.clipsByChannel = {};
     for (const ch of state.channels) state.clipsByChannel[ch.key] = [];
@@ -104,6 +113,7 @@
     loadPreviewAt(state.playheadTs);
     updateTransport();
     renderMap();
+    wirePipOverlay();
     wireMapToggle();
   }
 
@@ -292,6 +302,10 @@
     state.playheadTs = clamp(ts, bounds().start, bounds().end);
     renderPlayhead();
     if (state.onSeek) state.onSeek(state.playheadTs);
+    // Refresh the transport (timecode + camera/PiP button labels) so clicking
+    // into a segment shows that segment's camera and PiP choice. updateTransport
+    // ends by calling renderPipOverlay, so the green inset updates too.
+    updateTransport();
   }
 
   // ---- gestures (Pointer Events: one path for mouse + touch + pen) ----
@@ -472,6 +486,7 @@
     };
     video.addEventListener("loadedmetadata", seek, { once: true });
     video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("loadedmetadata", renderPipOverlay, { once: true });
     video.addEventListener("ended", onClipEnded);
     host.appendChild(video);
     state.videoEl = video;
@@ -572,16 +587,82 @@
     el("tl-tc").textContent =
       `${fmtClock(state.playheadTs - start)} / ${fmtClock(end - start)}`;
     el("tl-play").textContent = state.playing ? "⏸" : "▶";
-    // The camera button shows the active segment's camera and cycles it.
+    // The camera button shows the active segment's camera and cycles it; the
+    // PiP button shows/cycles its inset. Both need >1 enabled camera.
     const camBtn = el("tl-cam");
+    const pipBtn = el("tl-pip");
     const active = activeChannelAt(state.playheadTs);
     if (active && enabledChannels().length > 1) {
       camBtn.hidden = false;
       camBtn.textContent = "⟳ " +
         ((state.channels.find((c) => c.key === active) || {}).label || active);
+      const seg = state.segments[segAt(state.playheadTs)];
+      const pip = seg && seg.pip && seg.pip !== seg.camera ? seg.pip : null;
+      pipBtn.hidden = false;
+      pipBtn.textContent = pip
+        ? "PiP: " +
+          ((state.channels.find((c) => c.key === pip) || {}).label || pip)
+        : "PiP: Off";
     } else {
       camBtn.hidden = true;
+      pipBtn.hidden = true;
     }
+    renderPipOverlay();
+  }
+
+  // Draw the green PiP placeholder over the *contained* video rect. The
+  // <video> is object-fit:contain, so it is letterboxed/pillarboxed inside
+  // .tl-preview; we derive the displayed video box from the intrinsic size and
+  // anchor the inset to it (¼ frame, in the corner from the global
+  // PIP_POSITION setting, margin scaled to match the export's 20px-from-edge
+  // overlay). The element is (re)created lazily because loadPreviewAt wipes
+  // .tl-preview's innerHTML on every clip load.
+  function renderPipOverlay() {
+    const host = el("tl-preview");
+    if (!host) return;
+    let ov = host.querySelector(".tl-pip-overlay");
+    const active = activeChannelAt(state.playheadTs);
+    const seg = state.segments[segAt(state.playheadTs)];
+    const pip = active && seg && seg.pip && seg.pip !== seg.camera
+      ? seg.pip : null;
+    const v = state.videoEl;
+    if (!pip || !v || !v.videoWidth || !v.videoHeight) {
+      if (ov) ov.style.display = "none";
+      return;
+    }
+    if (!ov) {
+      ov = document.createElement("div");
+      ov.className = "tl-pip-overlay";
+      host.appendChild(ov);
+    }
+    const cw = host.clientWidth, ch = host.clientHeight;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    const scale = Math.min(cw / vw, ch / vh);
+    const dw = vw * scale, dh = vh * scale;
+    const left = (cw - dw) / 2, top = (ch - dh) / 2;
+    const iw = dw / 4, ih = dh / 4;
+    const margin = 20 * scale;
+    // Mirror the export overlay corner (_PIP_OVERLAY_COORDS): an unknown
+    // value falls back to top_right, exactly as the backend does.
+    const pos = state.pipPosition || "top_right";
+    const isLeft = pos.endsWith("_left");
+    const isBottom = pos.startsWith("bottom");
+    ov.style.display = "flex";
+    ov.style.left = `${isLeft ? left + margin : left + dw - iw - margin}px`;
+    ov.style.top = `${isBottom ? top + dh - ih - margin : top + margin}px`;
+    ov.style.width = `${iw}px`;
+    ov.style.height = `${ih}px`;
+    ov.textContent =
+      (state.channels.find((c) => c.key === pip) || {}).label || pip;
+  }
+
+  let pipObserver = null;
+  function wirePipOverlay() {
+    if (pipObserver || typeof ResizeObserver === "undefined") return;
+    const host = el("tl-preview");
+    if (!host) return;
+    pipObserver = new ResizeObserver(() => renderPipOverlay());
+    pipObserver.observe(host);
   }
 
   function wireTransport() {
@@ -590,6 +671,9 @@
     el("tl-play").addEventListener("click", togglePlay);
     el("tl-cam").addEventListener("click", () => {
       cycleSegmentCamera(segAt(state.playheadTs));
+    });
+    el("tl-pip").addEventListener("click", () => {
+      cycleSegmentPip(segAt(state.playheadTs));
     });
   }
 
@@ -706,7 +790,8 @@
         inTs: state.inTs,
         outTs: state.outTs,
         segments: state.segments.map(
-          (s) => ({ start: s.start, end: s.end, camera: s.camera })),
+          (s) => ({ start: s.start, end: s.end, camera: s.camera,
+                    pip: s.pip || null })),
         disabled: [...(state.disabledChannels || [])],
       }));
     } catch { /* storage full/disabled/private mode — non-fatal */ }
@@ -734,6 +819,7 @@
       .filter((s) => chKeys.has(s.camera) && Number(s.end) > Number(s.start))
       .map((s) => ({
         start: Number(s.start), end: Number(s.end), camera: s.camera,
+        pip: chKeys.has(s.pip) ? s.pip : null,
       }));
     if (!segs.length) return;
     state.inTs = inT;
@@ -766,6 +852,7 @@
         start: Math.max(s.start, inT),
         end: Math.min(s.end, outT),
         camera: s.camera,
+        pip: s.pip || null,
       }));
     if (!segs.length) {
       segs = [{ start: inT, end: outT, camera: firstEnabledChannel() }];
@@ -799,9 +886,12 @@
     const i = segAt(t);
     const seg = state.segments[i];
     if (t - seg.start < 0.2 || seg.end - t < 0.2) return;
+    // The earlier half continues the original camera+inset; the later half is
+    // a new camera view, so it starts with no PiP inset.
     state.segments.splice(i, 1,
-      { start: seg.start, end: t, camera: seg.camera },
-      { start: t, end: seg.end, camera: nextEnabledChannel(seg.camera) });
+      { start: seg.start, end: t, camera: seg.camera, pip: seg.pip || null },
+      { start: t, end: seg.end, camera: nextEnabledChannel(seg.camera),
+        pip: null });
     renderEditor();
     loadPreviewAt(t);
   }
@@ -821,9 +911,28 @@
     const seg = state.segments[i];
     if (!seg || enabledChannels().length < 2) return;
     seg.camera = nextEnabledChannel(seg.camera);
+    if (seg.pip === seg.camera) seg.pip = null;  // inset would dup the base
     renderEditor();
     state.videoChannel = null;          // force reload onto the new camera
     loadPreviewAt(state.playheadTs);
+  }
+  // Cycle the segment's PiP inset: Off -> each enabled camera except the
+  // segment's own main camera (registry order) -> Off. PiP is preview + export
+  // and is scoped to this segment, like the main camera.
+  function cycleSegmentPip(i) {
+    const seg = state.segments[i];
+    if (!seg) return;
+    const opts = enabledChannels()
+      .map((c) => c.key)
+      .filter((k) => k !== seg.camera);
+    if (!opts.length) return;
+    if (!seg.pip) {
+      seg.pip = opts[0];
+    } else {
+      const idx = opts.indexOf(seg.pip);
+      seg.pip = (idx < 0 || idx + 1 >= opts.length) ? null : opts[idx + 1];
+    }
+    renderEditor();
   }
   function toggleChannel(key) {
     const dis = state.disabledChannels;
@@ -836,6 +945,7 @@
       const fallback = firstEnabledChannel();
       for (const s of state.segments) {
         if (s.camera === key) s.camera = fallback;
+        if (s.pip === key) s.pip = null;   // inset camera disabled -> drop it
       }
     }
     renderEditor();
@@ -955,7 +1065,11 @@
     const dis = state.disabledChannels || new Set();
     const segments = state.segments
       .filter((s) => !dis.has(s.camera))
-      .map((s) => ({ channel: s.camera, start_ts: s.start, end_ts: s.end }));
+      .map((s) => {
+        const seg = { channel: s.camera, start_ts: s.start, end_ts: s.end };
+        if (s.pip && s.pip !== s.camera && !dis.has(s.pip)) seg.pip = s.pip;
+        return seg;
+      });
     if (!segments.length) {
       toast("Nothing to export — enable a camera track first.",
         { type: "error" });
@@ -981,6 +1095,9 @@
     { keyLabel: "C", label: "Cycle segment camera", btn: "tl-cam",
       match: (e) => e.key.toLowerCase() === "c",
       run: () => cycleSegmentCamera(segAt(state.playheadTs)) },
+    { keyLabel: "P", label: "Cycle segment PiP", btn: "tl-pip",
+      match: (e) => e.key.toLowerCase() === "p",
+      run: () => cycleSegmentPip(segAt(state.playheadTs)) },
     { keyLabel: "← / →", label: "Seek 1s (Shift = 10s)",
       match: (e) => e.key === "ArrowLeft" || e.key === "ArrowRight",
       run: (e) => seekToTs(

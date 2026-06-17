@@ -1993,6 +1993,15 @@ main {
    drives the flex column taller than the viewport (it only fills its box). */
 .tl-preview video { position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: contain; }
+/* Editor-only PiP placeholder: a green box over the contained video rect,
+   positioned in JS (renderPipOverlay) so it tracks the letterboxed video
+   area, not the container box. Not real footage — just a stand-in. */
+.tl-pip-overlay { position: absolute; z-index: 2; display: none;
+  align-items: center; justify-content: center; box-sizing: border-box;
+  border: 2px solid var(--ok); background: rgba(46, 204, 113, 0.22);
+  color: #eafff2; font-size: 12px; font-weight: 700; letter-spacing: .04em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .6); border-radius: 4px;
+  pointer-events: none; overflow: hidden; }
 .tl-preview-empty { color: var(--muted); font-size: 13px; letter-spacing: .04em; }
 /* Grow into the horizontal space the letterboxed video leaves unused,
    while the preview (flex 3) stays the dominant pane. */
