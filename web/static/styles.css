@@ -1405,6 +1405,11 @@ main {
  * resizing the visible glyph. Keeps the desktop density unchanged
  * for mouse users. */
 @media (pointer: coarse) {
+  /* 16px is the threshold below which iOS Safari zooms the page in when a
+   * control gains focus (body text is 14px). Bumping touch form controls to
+   * 16px stops that auto-zoom on its own — the viewport meta's user-scalable=no
+   * is belt-and-braces for Android double-tap/pinch and is ignored by iOS. */
+  input, select, textarea { font-size: 16px; }
   .icon-btn { width: 44px; height: 44px; }
   .settings-link { width: 44px; height: 44px; }
   nav a { padding: 10px 14px; }
@@ -2354,8 +2359,24 @@ main {
 .cam-row-status.error { color: var(--err-text); }
 .cam-row-status.pending { color: var(--muted); }
 @media (max-width: 560px) {
-  .cam-row { grid-template-columns: 1fr; gap: 4px; }
-  .cam-row select { width: 100%; }
+  /* The 3-column grid doesn't stack cleanly: the (usually empty) status cell
+   * leaves dead vertical space and the control gets no breathing room. Use a
+   * wrapping flex row instead — compact controls (toggle, current value, the
+   * ⓘ note) stay on the label's line pinned right; the wide select drops to its
+   * own full-width line below. Row rhythm moves from the label's padding onto
+   * the row, so both lines sit evenly inside the row's top/bottom borders. */
+  .cam-row {
+    display: flex; flex-wrap: wrap; align-items: center;
+    justify-content: space-between; gap: 8px 12px;
+    padding: 12px 0;
+  }
+  .cam-row label { flex: 1 1 auto; padding: 0; }
+  .cam-row-status { order: 3; flex-basis: 100%; }
+  .cam-row-status:empty { display: none; }
+  .cam-row select { order: 4; width: 100%; flex: 1 1 100%; }
+  .cam-row .switch,
+  .cam-current,
+  .cam-note { flex: 0 0 auto; }
 }
 
 /* ---------- Camera tab polish ---------- */
