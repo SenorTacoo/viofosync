@@ -63,6 +63,10 @@ class Segment(BaseModel):
     channel: str = Field(pattern=f"^({'|'.join(CHANNEL_ORDER)})$")
     start_ts: float
     end_ts: float
+    pip: str | None = Field(
+        default=None,
+        pattern=f"^({'|'.join(CHANNEL_ORDER)})$",
+    )
 
 
 class CreateExport(BaseModel):

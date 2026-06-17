@@ -131,9 +131,11 @@ def build_switch_pieces(segments: list, clips: list) -> list:
     ``segments`` is ``[{channel, start_ts, end_ts}, ...]`` (in output
     order). ``clips`` is ``[{path, channel, start_ts, duration_s}, ...]``
     (``channel`` already derived via ``naming.channel_of``). Returns
-    ``[{path, ss, t}, ...]`` — each piece trims ``path`` from offset
-    ``ss`` for duration ``t`` seconds. Clips are clamped to the segment
-    window; pieces shorter than ``_MIN_PIECE_S`` are dropped.
+    ``[{path, ss, t, ts, pip}, ...]`` — each piece trims ``path`` from
+    offset ``ss`` for duration ``t`` seconds; ``ts`` is the piece's
+    absolute start timestamp (``max(segment_start, clip_start)``); ``pip``
+    is the owning segment's PiP channel, or ``None``. Clips are clamped to
+    the segment window; pieces shorter than ``_MIN_PIECE_S`` are dropped.
     """
     pieces: list = []
     for seg in segments:
@@ -159,6 +161,12 @@ def build_switch_pieces(segments: list, clips: list) -> list:
                     # float offsets (consistent ffmpeg -ss/-t strings).
                     "ss": round(float(in_), 3),
                     "t": round(float(out_ - in_), 3),
+                    # Absolute start of this piece (max of segment start and clip start) so the
+                    # runner can resolve a partner clip for the same window.
+                    "ts": round(float(max(s, cs)), 3),
+                    # The owning segment's PiP channel (or None) — drives the
+                    # overlay composite in the timeline runner.
+                    "pip": seg.get("pip"),
                 })
     return pieces
 
@@ -430,6 +438,53 @@ def _pip_filter_complex(
         f"[{inset}:v]scale=iw/4:ih/4[pip];"
         f"[{base}:v][pip]overlay={coords}"
     )
+
+
+def _timeline_pip_filter(
+    w: int, h: int, position: str, encoder: str = "software",
+) -> str:
+    """-filter_complex graph for a timeline PiP piece.
+
+    Input 0 is the segment's main camera (scaled to the export frame
+    ``w``x``h``); input 1 is the PiP camera, scaled to a quarter frame and
+    overlaid at the corner from ``_PIP_OVERLAY_COORDS`` (unknown -> top_right).
+    Scaling the base to the same ``w``x``h`` as the non-PiP pieces keeps every
+    piece concat-compatible. QSV composes on the GPU (scale_qsv/overlay_qsv,
+    which needs x=/y= coords); every other encoder uses software scale/overlay
+    and the runner appends hwupload for VAAPI via ``_with_upload``.
+    """
+    coords = _PIP_OVERLAY_COORDS.get(
+        position, _PIP_OVERLAY_COORDS["top_right"],
+    )
+    iw, ih = w // 4, h // 4
+    if encoder == "qsv":
+        x, y = coords.split(":")
+        return (
+            f"[0:v]scale_qsv=w={w}:h={h}[base];"
+            f"[1:v]scale_qsv=w={iw}:h={ih}[pip];"
+            f"[base][pip]overlay_qsv=x={x}:y={y}"
+        )
+    return (
+        f"[0:v]scale={w}:{h},setsar=1[base];"
+        f"[1:v]scale={iw}:{ih},setsar=1[pip];"
+        f"[base][pip]overlay={coords}"
+    )
+
+
+def _find_clip_at(clips: list, channel: str, ts: float) -> Optional[dict]:
+    """First clip in ``channel`` whose [start, start+duration) covers ``ts``.
+
+    Used by the timeline runner to resolve a PiP partner clip for a piece's
+    window. Returns ``None`` when no clip covers it (the runner then drops the
+    overlay for that piece rather than failing the export)."""
+    for c in clips:
+        if c["channel"] != channel:
+            continue
+        cs = c["start_ts"]
+        ce = cs + (c.get("duration_s") or 0)
+        if cs <= ts < ce:
+            return c
+    return None
 
 
 def video_codec_args(encoder: str) -> List[str]:
@@ -895,7 +950,9 @@ class ExportWorker:
 
         if job["type"] == "timeline":
             segments = raw.get("segments", []) if isinstance(raw, dict) else []
-            await self._run_timeline(job, segments, encoder, out)
+            await self._run_timeline(
+                job, segments, encoder, out, snap.pip_position,
+            )
             return
 
         clips = self._fetch_clips(clip_ids)
@@ -1106,7 +1163,9 @@ class ExportWorker:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    async def _run_timeline(self, job, segments, encoder, out) -> None:
+    async def _run_timeline(
+        self, job, segments, encoder, out, position="top_right",
+    ) -> None:
         lo = min(s["start_ts"] for s in segments)
         hi = max(s["end_ts"] for s in segments)
         with self.db.conn() as c:
@@ -1175,9 +1234,42 @@ class ExportWorker:
                     "progress": 0.6 * i / max(1, n),
                     "stage": f"video {i + 1}/{n}",
                 })
-                rc, err = await self._run_ffmpeg(
-                    job["id"],
-                    [
+                # A PiP piece composites the partner camera as a corner inset;
+                # if no partner footage covers this window, fall through to the
+                # plain single-input scale so a gap never fails the export.
+                partner = (
+                    _find_clip_at(clips, pc["pip"], pc["ts"])
+                    if pc.get("pip") else None
+                )
+                if partner is not None:
+                    partner_ss = round(float(pc["ts"] - partner["start_ts"]), 3)
+                    # Viofo records every channel as paired clips of identical
+                    # length, so the partner normally covers the whole piece.
+                    # If a partner clip is short (corrupt/partial download), the
+                    # overlay's default eof_action=repeat freezes the inset on
+                    # its last frame; the piece length is still driven by the
+                    # main input (overlay ends with input 0), so concat stays
+                    # correct — the export never truncates or fails.
+                    fc = _with_upload(
+                        _timeline_pip_filter(w, h, position, encoder), encoder,
+                    )
+                    args = [
+                        *_hw_init_args(encoder),
+                        "-y",
+                        # decode flags are per-input: repeated before each -i.
+                        *_hw_decode_args(encoder),
+                        "-ss", str(pc["ss"]), "-t", str(pc["t"]),
+                        "-i", pc["path"],
+                        *_hw_decode_args(encoder),
+                        "-ss", str(partner_ss), "-t", str(pc["t"]),
+                        "-i", partner["path"],
+                        "-an",
+                        "-filter_complex", fc,
+                        *video_codec_args(encoder),
+                        seg,
+                    ]
+                else:
+                    args = [
                         *_hw_init_args(encoder),
                         *_hw_decode_args(encoder),
                         "-y",
@@ -1188,8 +1280,9 @@ class ExportWorker:
                         "-vf", vf,
                         *video_codec_args(encoder),
                         seg,
-                    ],
-                    pc["t"],
+                    ]
+                rc, err = await self._run_ffmpeg(
+                    job["id"], args, pc["t"],
                     progress_base=0.6 * i / max(1, n),
                     progress_span=0.6 / max(1, n),
                     stage=f"video {i + 1}/{n}",

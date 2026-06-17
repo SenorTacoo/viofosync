@@ -252,6 +252,36 @@ def test_post_timeline_export_creates_job(logged_in_client, monkeypatch):
     assert "job_id" in r.json()
 
 
+def test_post_timeline_export_accepts_pip_in_segment(logged_in_client, monkeypatch):
+    monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
+    logged_in_client.app.state.export_encoders = {"software": True}
+    csrf = logged_in_client.get("/api/auth/csrf").json()["csrf"]
+    r = logged_in_client.post("/api/exports", json={
+        "type": "timeline",
+        "segments": [
+            {"channel": "front", "start_ts": 1000.0, "end_ts": 1050.0,
+             "pip": "rear"},
+        ],
+        "encoder": "software",
+    }, headers={"x-csrf-token": csrf})
+    assert r.status_code == 200, r.text
+
+
+def test_post_timeline_export_rejects_bad_pip(logged_in_client, monkeypatch):
+    monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
+    logged_in_client.app.state.export_encoders = {"software": True}
+    csrf = logged_in_client.get("/api/auth/csrf").json()["csrf"]
+    r = logged_in_client.post("/api/exports", json={
+        "type": "timeline",
+        "segments": [
+            {"channel": "front", "start_ts": 1000.0, "end_ts": 1050.0,
+             "pip": "nonsense"},
+        ],
+        "encoder": "software",
+    }, headers={"x-csrf-token": csrf})
+    assert r.status_code == 422
+
+
 def test_post_timeline_requires_segments(logged_in_client, monkeypatch):
     monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
     logged_in_client.app.state.export_encoders = {"software": True}
@@ -260,3 +290,93 @@ def test_post_timeline_requires_segments(logged_in_client, monkeypatch):
         "type": "timeline", "clip_ids": [], "encoder": "software"},
         headers={"x-csrf-token": csrf})
     assert r.status_code in (400, 422)
+
+
+async def test_run_timeline_pip_segment_emits_overlay(db, tmp_path, monkeypatch):
+    """A segment with a pip channel encodes a 2-input overlay sourced from
+    both the main and the partner camera files."""
+    monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
+    _insert_clip(db, 1, 1000, "F", 60.0, "/rec/f0.mp4")
+    _insert_clip(db, 2, 1000, "R", 60.0, "/rec/r0.mp4")
+    snap = MagicMock()
+    snap.recordings = str(tmp_path)
+    snap.pip_position = "top_right"
+    provider = MagicMock()
+    provider.get.return_value = snap
+    worker = ExportWorker(db=db, provider=provider, broadcast=_noop)
+
+    calls = []
+
+    async def fake_run_ffmpeg(job_id, args, total, **kw):
+        calls.append(list(args))
+        Path(args[-1]).write_bytes(b"\0")
+        return 0, ""
+
+    async def fake_probe_res(path):
+        return (1920, 1080)
+
+    monkeypatch.setattr(worker, "_run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr(worker, "_probe_resolution", fake_probe_res)
+    finishes = []
+    monkeypatch.setattr(worker, "_finish",
+                        lambda jid, ok, err, out: finishes.append((ok, err, out)))
+
+    segs = [{"channel": "front", "start_ts": 1000, "end_ts": 1020, "pip": "rear"}]
+    import json as _json
+    job = {"id": 8, "type": "timeline",
+           "clip_ids": _json.dumps({"segments": segs, "encoder": "software"})}
+    await worker._run_job(job)
+
+    assert finishes and finishes[-1][0] is True, finishes
+    video = [a for a in calls if "-an" in a]
+    assert len(video) == 1
+    fc = video[0][video[0].index("-filter_complex") + 1]
+    assert "overlay=" in fc
+    # Two inputs: main (front) is input 0, partner (rear) is input 1.
+    assert video[0].count("-i") == 2
+    assert "/rec/f0.mp4" in video[0]
+    assert "/rec/r0.mp4" in video[0]
+
+
+async def test_run_timeline_pip_falls_back_without_partner(db, tmp_path, monkeypatch):
+    """A pip channel with no partner footage degrades to a plain single-input
+    scale encode rather than failing the export."""
+    monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
+    _insert_clip(db, 1, 1000, "F", 60.0, "/rec/f0.mp4")
+    snap = MagicMock()
+    snap.recordings = str(tmp_path)
+    snap.pip_position = "top_right"
+    provider = MagicMock()
+    provider.get.return_value = snap
+    worker = ExportWorker(db=db, provider=provider, broadcast=_noop)
+
+    calls = []
+
+    async def fake_run_ffmpeg(job_id, args, total, **kw):
+        calls.append(list(args))
+        Path(args[-1]).write_bytes(b"\0")
+        return 0, ""
+
+    async def fake_probe_res(path):
+        return (1920, 1080)
+
+    monkeypatch.setattr(worker, "_run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr(worker, "_probe_resolution", fake_probe_res)
+    finishes = []
+    monkeypatch.setattr(worker, "_finish",
+                        lambda jid, ok, err, out: finishes.append((ok, err, out)))
+
+    # pip points at 'interior', but no interior clip exists in the window.
+    segs = [{"channel": "front", "start_ts": 1000, "end_ts": 1020,
+             "pip": "interior"}]
+    import json as _json
+    job = {"id": 9, "type": "timeline",
+           "clip_ids": _json.dumps({"segments": segs, "encoder": "software"})}
+    await worker._run_job(job)
+
+    assert finishes and finishes[-1][0] is True, finishes
+    video = [a for a in calls if "-an" in a]
+    assert len(video) == 1
+    assert "-filter_complex" not in video[0]   # plain scale, no overlay
+    assert "-vf" in video[0]
+    assert video[0].count("-i") == 1
