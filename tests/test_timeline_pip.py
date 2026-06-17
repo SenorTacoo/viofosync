@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from web.services.exporter import _find_clip_at, _timeline_pip_filter
 
-
 # --- _timeline_pip_filter (software dialect) ---
 
 def _sw(coords: str) -> str:
