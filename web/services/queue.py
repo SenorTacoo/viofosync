@@ -14,6 +14,8 @@ State machine (see the plan for rationale):
 
     pending ──▶ gone   (no longer on the dashcam)
     failed ──▶ pending (manual retry)
+    pending ──▶ skipped (user) ──▶ pending (un-skip)
+    failed  ──▶ skipped (user)
 """
 
 from __future__ import annotations
@@ -529,6 +531,7 @@ def list_days(
                 SUM(CASE WHEN state='done'        THEN 1 ELSE 0 END) AS done_count,
                 SUM(CASE WHEN state='failed'      THEN 1 ELSE 0 END) AS failed_count,
                 SUM(CASE WHEN state='gone'        THEN 1 ELSE 0 END) AS gone_count,
+                SUM(CASE WHEN state='skipped'     THEN 1 ELSE 0 END) AS skipped_count,
                 SUM(CASE WHEN {_RO_SQL} THEN 1 ELSE 0 END) AS ro_count,
                 SUM(CASE
                     WHEN NOT ({_RO_SQL}) AND {_EVT_PREFIX_SQL} = 'P' THEN 1
@@ -680,6 +683,41 @@ def retry(db: Database, filenames: List[str]) -> int:
             f"UPDATE download_queue SET state='pending', "
             f"attempts=0, last_error=NULL "
             f"WHERE filename IN ({ph}) AND state='failed'",
+            filenames,
+        )
+        return cur.rowcount
+
+
+def skip(db: Database, filenames: List[str]) -> int:
+    """Mark the given queued files ``skipped`` so the worker never
+    downloads them. Only ``pending``/``failed`` rows change; returns the
+    number updated. ``next_pending`` selects only ``pending``, so a skipped
+    row is simply never picked up."""
+    if not filenames:
+        return 0
+    with db.write() as c:
+        ph = ",".join("?" * len(filenames))
+        cur = c.execute(
+            f"UPDATE download_queue SET state='skipped' "
+            f"WHERE filename IN ({ph}) "
+            f"AND state IN ('pending', 'failed')",
+            filenames,
+        )
+        return cur.rowcount
+
+
+def unskip(db: Database, filenames: List[str]) -> int:
+    """Return ``skipped`` files to ``pending`` for downloading again,
+    resetting attempts/last_error for a fresh try (mirrors ``retry``).
+    Only ``skipped`` rows change; returns the number updated."""
+    if not filenames:
+        return 0
+    with db.write() as c:
+        ph = ",".join("?" * len(filenames))
+        cur = c.execute(
+            f"UPDATE download_queue SET state='pending', "
+            f"attempts=0, last_error=NULL "
+            f"WHERE filename IN ({ph}) AND state='skipped'",
             filenames,
         )
         return cur.rowcount

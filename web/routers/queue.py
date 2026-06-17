@@ -126,6 +126,32 @@ def retry(body: Retry, request: Request) -> dict:
     return {"ok": True, "updated": n}
 
 
+class Skip(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+@router.post("/queue/skip", dependencies=[Depends(require_csrf)])
+def skip(body: Skip, request: Request) -> dict:
+    n = q.skip(request.app.state.db, body.filenames)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    return {"ok": True, "updated": n}
+
+
+class Unskip(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+@router.post("/queue/unskip", dependencies=[Depends(require_csrf)])
+def unskip(body: Unskip, request: Request) -> dict:
+    n = q.unskip(request.app.state.db, body.filenames)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    # Un-skipped files are pending again — wake the worker to pick them up.
+    worker = getattr(request.app.state, "sync_worker", None)
+    if worker is not None:
+        worker.kick()
+    return {"ok": True, "updated": n}
+
+
 @router.get("/sync/status")
 def sync_status(request: Request) -> dict:
     worker = getattr(request.app.state, "sync_worker", None)

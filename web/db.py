@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS download_queue (
     recorded_at     INTEGER,
     camera          TEXT,
     event_type      TEXT,
-    state           TEXT NOT NULL,    -- pending|downloading|done|failed|gone
+    state           TEXT NOT NULL,    -- pending|downloading|done|failed|gone|skipped
     priority        INTEGER NOT NULL DEFAULT 0,
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
