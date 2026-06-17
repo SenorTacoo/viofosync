@@ -998,6 +998,7 @@ function renderClipPair(pair) {
                data-clip-id="${c.id}" data-ts="${pair.timestamp}">
         <img src="/api/archive/clip/${c.id}/thumb" data-id="${c.id}"
              alt="" loading="lazy" decoding="async" />
+        <div class="film-scrub" aria-hidden="true"></div>
         <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
       </div>` : `<div class="thumb empty"><div class="label">—</div></div>`;
   // Kind badge: shown for parking / read-only pairs only. Driving
@@ -1032,6 +1033,18 @@ function renderClipPair(pair) {
       const cam = thumbEl ? thumbEl.dataset.camera : "F";
       openVideo(Number(img.dataset.id), cam, thumbEl);
     });
+  });
+
+  // Lazy hover-scrub: load each clip's filmstrip the first time its tile is
+  // hovered, then scrub the overlay. The metadata endpoint generates the
+  // sprite on demand (cached), so this only does work for tiles the user
+  // actually points at. Single-frame clips (frames < 2) stay static.
+  el.querySelectorAll(".thumb[data-clip-id]").forEach((thumbEl) => {
+    const id = thumbEl.dataset.clipId;
+    const overlay = thumbEl.querySelector(".film-scrub");
+    if (!overlay) return;
+    wireLazyFilmstripScrub(
+      overlay, thumbEl, () => api(`/api/archive/clip/${id}/filmstrip`));
   });
 
   // Selection checkbox → export set. Preserve selected state
@@ -1458,6 +1471,46 @@ function formatExportRange(start, end) {
     `${e.toLocaleDateString([], dOpts)}`;
 }
 
+// ---------- Filmstrip hover-scrub (shared) ----------
+//
+// Turn `el` into a ready-to-scrub layer for an N-frame sprite. The :hover CSS
+// rule deliberately omits animation-timing-function so the per-element step
+// count set here (which CSS can't express via a custom property) wins. Returns
+// false (a no-op) when there's nothing to scrub: no sprite, or a single tile.
+function applyFilmstripScrub(el, spriteUrl, frames) {
+  if (!el || !spriteUrl || !(frames >= 2)) return false;
+  el.style.backgroundImage = `url("${spriteUrl}")`;
+  el.style.setProperty("--frames", String(frames));
+  el.style.animationTimingFunction = `steps(${frames}, jump-none)`;
+  el.classList.add("is-ready");
+  return true;
+}
+
+// Lazily load a filmstrip the first time `hoverEl` is hovered, then wire `el`
+// to scrub. `load` returns a promise of the filmstrip metadata
+// ({ sprite_url, frames }). Loading on first hover (rather than for every
+// visible tile) avoids spawning ffmpeg across a whole day just by opening it.
+// A thrown error (network/5xx) re-arms so a later hover retries; a clip that
+// can't be rendered (204, no sprite_url) is left as a permanent no-op.
+function wireLazyFilmstripScrub(el, hoverEl, load) {
+  let started = false;
+  hoverEl.addEventListener("mouseenter", () => {
+    if (started) return;
+    started = true;
+    Promise.resolve()
+      .then(load)
+      .then((meta) => {
+        if (meta && meta.sprite_url) {
+          applyFilmstripScrub(el, meta.sprite_url, meta.frames);
+        }
+      })
+      .catch(() => { started = false; });
+  });
+}
+
+// Export sprites are a fixed-length strip (mirrors export_preview.N_FRAMES).
+const EXPORT_FILMSTRIP_FRAMES = 10;
+
 function renderExportJobs(jobs) {
   updateExportsSummary(jobs);
   const el = document.getElementById("exports-list");
@@ -1553,7 +1606,7 @@ function renderExportJobs(jobs) {
       `${EXPORT_ICON_TRASH}</button>`;
 
     // Filmstrip preview. A finished job whose strip is cached shows the
-    // static first frame and scrubs through the export on hover (pure CSS).
+    // static first frame and scrubs through the export on hover via .film-scrub.
     // A finished job whose strip is still generating shows a shimmer
     // placeholder — still click-to-play, since the output already exists; it
     // swaps to the real strip on the export_preview_ready event. Non-done rows
@@ -1561,8 +1614,8 @@ function renderExportJobs(jobs) {
     let previewCell;
     if (j.state === "done" && j.has_preview) {
       previewCell =
-        `<div class="export-thumb" data-job-id="${j.id}" title="Play export" ` +
-        `style="background-image:url(/api/exports/${j.id}/filmstrip.jpg)"></div>`;
+        `<div class="export-thumb film-scrub" data-job-id="${j.id}" ` +
+        `title="Play export"></div>`;
     } else if (j.state === "done") {
       previewCell =
         `<div class="export-thumb export-thumb--loading" data-job-id="${j.id}" ` +
@@ -1596,6 +1649,12 @@ function renderExportJobs(jobs) {
   el.querySelectorAll(".export-thumb[data-job-id]").forEach((thumb) => {
     thumb.addEventListener("click",
       () => openExportVideo(Number(thumb.dataset.jobId)));
+  });
+  el.querySelectorAll(".export-thumb.film-scrub[data-job-id]").forEach((thumb) => {
+    applyFilmstripScrub(
+      thumb,
+      `/api/exports/${thumb.dataset.jobId}/filmstrip.jpg`,
+      EXPORT_FILMSTRIP_FRAMES);
   });
   el.querySelectorAll(".export-delete").forEach((btn) => {
     btn.addEventListener("click", async () => {

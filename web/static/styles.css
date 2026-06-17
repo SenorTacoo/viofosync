@@ -612,6 +612,27 @@ main {
   width: 100%; aspect-ratio: 16/9; object-fit: cover;
   background: var(--bg); border-radius: 4px; cursor: pointer;
 }
+/* Filmstrip hover-scrub overlay: sits exactly over the static thumbnail (the
+   image area only, not the filename label below it). pointer-events:none so
+   the thumbnail's own click-to-open handler still fires. Hidden until the
+   sprite has loaded (.is-ready) and the tile is hovered; the shared
+   .film-scrub rules drive the scrub animation. */
+.clip-pair .thumb { position: relative; }
+.clip-pair .thumb .film-scrub {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 4px;
+  background-color: #000;
+  opacity: 0;
+  pointer-events: none;
+}
+.clip-pair .thumb:hover .film-scrub.is-ready { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  /* No motion → no benefit; keep the static thumbnail. */
+  .clip-pair .thumb:hover .film-scrub.is-ready { opacity: 0; }
+}
 /* Filenames are debug-y data; fade them and clip to one line.
  * Hover reveals the full string via the title attribute on the
  * label element (set in the renderer). */
@@ -2166,21 +2187,44 @@ main {
 }
 #tl-shortcuts dd { margin: 0; }
 
-/* Export-job filmstrip preview: one 16:9 tile, scrubs through a 10-frame
-   sprite on hover. Sprite is 10 tiles wide, so background-size:1000% shows
-   exactly one tile; the keyframes step background-position across all 10. */
+/* ---- Filmstrip hover-scrub (shared) --------------------------------- */
+/* A filmstrip sprite is a horizontal montage of N frames. Showing one tile at
+   a time and stepping across the tiles on hover gives a scrub preview. The
+   tile count varies (export sprites are a fixed 10; clip sprites scale with
+   duration), so sizing is driven by the --frames custom property and the
+   steps(N) timing is set inline per element (CSS steps() can't read a var).
+   Shared by the export-jobs thumb and the archive clip tiles. */
+.film-scrub {
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  background-size: calc(var(--frames, 10) * 100%) 100%;
+}
+@keyframes film-scrub-anim {
+  from { background-position-x: 0%; }
+  to   { background-position-x: 100%; }
+}
+/* Scrub only once a sprite is loaded (.is-ready) and the element — or, for the
+   archive overlay, its .clip-pair .thumb ancestor — is hovered. The timing
+   function steps(N, jump-none) is supplied inline by applyFilmstripScrub(). */
+.film-scrub.is-ready:hover,
+.clip-pair .thumb:hover .film-scrub.is-ready {
+  animation-name: film-scrub-anim;
+  animation-duration: 1.2s;
+  animation-iteration-count: infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .film-scrub.is-ready:hover,
+  .clip-pair .thumb:hover .film-scrub.is-ready { animation: none; }
+}
+
+/* Export-job filmstrip preview: one 16:9 tile that scrubs through its 10-frame
+   sprite on hover via the shared .film-scrub primitive. */
 .export-preview-col { width: 136px; }
 .export-thumb {
   width: 128px;
   height: 72px;
   border-radius: 4px;
   background-color: #000;
-  background-repeat: no-repeat;
-  background-size: 1000% 100%;
-  background-position: 0 0;
-}
-.export-thumb:hover {
-  animation: export-scrub 1.2s steps(10, jump-none) infinite;
 }
 /* Only finished jobs' thumbs are clickable (they carry data-job-id and open
    the export in the player modal). */
@@ -2191,7 +2235,8 @@ main {
 /* While a finished job's filmstrip is still being generated, show a shimmer
    placeholder in the same tile. It carries data-job-id so it's click-to-play;
    it swaps to the real strip on the export_preview_ready event. Override the
-   base 1000% sprite sizing and the :hover scrub (no sprite to scrub yet). */
+   film-scrub sprite sizing and the :hover scrub (no sprite loaded yet, so
+   scrubbing would show nothing). */
 .export-thumb--loading,
 .export-thumb--loading:hover {
   background-color: var(--panel-2);
@@ -2205,16 +2250,11 @@ main {
   background-size: 200% 100%;
   animation: export-shimmer 1.3s ease-in-out infinite;
 }
-@keyframes export-scrub {
-  from { background-position-x: 0%; }
-  to   { background-position-x: 100%; }
-}
 @keyframes export-shimmer {
   from { background-position-x: 150%; }
   to   { background-position-x: -150%; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .export-thumb:hover,
   .export-thumb--loading,
   .export-thumb--loading:hover { animation: none; }
 }
