@@ -1823,7 +1823,7 @@ function groupItemsByHour(items) {
 function hourSummary(items) {
   const s = {
     clip_count: items.length, total_bytes: 0,
-    pending: 0, downloading: 0, done: 0, failed: 0, gone: 0,
+    pending: 0, downloading: 0, done: 0, failed: 0, gone: 0, skipped: 0,
   };
   for (const it of items) {
     s.total_bytes += it.remote_size || 0;
@@ -1915,6 +1915,7 @@ const fmtMB = fmtBytes;
 function renderQueueDayCard(d) {
   const el = document.createElement("div");
   const hasPending = d.pending_count > 0;
+  const hasSelectable = daySelectableCount(d) > 0;
   const isStale = !hasPending && d.downloading_count === 0;
   el.className = "day queue-day" + (isStale ? " queue-day-stale" : "");
   el.dataset.day = d.day;
@@ -1925,6 +1926,7 @@ function renderQueueDayCard(d) {
   if (d.done_count)        pieces.push(`<span class="state-done">${d.done_count} done</span>`);
   if (d.failed_count)      pieces.push(`<span class="state-failed">${d.failed_count} failed</span>`);
   if (d.gone_count)        pieces.push(`<span class="state-gone">${d.gone_count} gone</span>`);
+  if (d.skipped_count)     pieces.push(`<span class="state-skipped">${d.skipped_count} skipped</span>`);
 
   const expanded = state.queueExpanded.has(d.day);
   const selected = countSelectedInDay(d.day);
@@ -1935,7 +1937,7 @@ function renderQueueDayCard(d) {
       <span class="caret">${expanded ? "▾" : "▸"}</span>
       <input type="checkbox" class="qd-check"
              ${checkState === "checked" ? "checked" : ""}
-             ${!hasPending ? "disabled title='No pending clips'" : ""} />
+             ${!hasSelectable ? "disabled title='Nothing selectable'" : ""} />
       <h3>${d.day}</h3>
       <div class="meta">
         ${d.clip_count} clips${
@@ -2015,7 +2017,7 @@ function renderQueueHour(day, hh, items) {
   const expanded = state.queueHoursExpanded.has(key);
   const s = hourSummary(items);
   const checkState = hourCheckState(day, hh);
-  const hasPending = s.pending > 0;
+  const hasSelectable = s.pending + s.failed + (s.skipped || 0) > 0;
   const label = hh === "??" ? "Unknown time" : `${hh}:00–${hh}:59`;
 
   const pieces = [];
@@ -2024,13 +2026,14 @@ function renderQueueHour(day, hh, items) {
   if (s.done)        pieces.push(`<span class="state-done">${s.done} done</span>`);
   if (s.failed)      pieces.push(`<span class="state-failed">${s.failed} failed</span>`);
   if (s.gone)        pieces.push(`<span class="state-gone">${s.gone} gone</span>`);
+  if (s.skipped)     pieces.push(`<span class="state-skipped">${s.skipped} skipped</span>`);
 
   el.innerHTML = `
     <div class="queue-hour-header">
       <span class="caret">${expanded ? "▾" : "▸"}</span>
       <input type="checkbox" class="qh-check" data-hour="${hh}"
              ${checkState === "checked" ? "checked" : ""}
-             ${!hasPending ? "disabled title='No pending clips'" : ""} />
+             ${!hasSelectable ? "disabled title='Nothing selectable'" : ""} />
       <span class="hour-label">${label}</span>
       <span class="meta">${s.clip_count} clips · ${fmtMB(s.total_bytes)}</span>
       <div class="state-breakdown">${pieces.join("")}</div>
@@ -2108,12 +2111,12 @@ function renderHourBody(day, hh, items) {
       ? new Date(it.recorded_at * 1000).toLocaleTimeString() : "—";
     const pos = it.queue_position === 0 ? "▶" :
                 it.queue_position != null ? String(it.queue_position) : "—";
-    const isPending = it.state === "pending";
+    const selectable = isSelectable(it.state);
     const checked = state.queueSelected.has(it.filename);
     const kind = renderKindBadge(it);
     tr.innerHTML = `
       <td><input type="checkbox" class="qi-check" value="${escHtml(it.filename)}"
-            ${isPending ? "" : "disabled"}
+            ${selectable ? "" : "disabled"}
             ${checked ? "checked" : ""} /></td>
       <td>${ts}</td>
       <td>${kind}</td>
@@ -2140,32 +2143,42 @@ function renderHourBody(day, hh, items) {
   return wrap;
 }
 
+// Which queue states can be selected for a bulk action: pending (download
+// next / skip), failed (skip / retry), skipped (clear skip).
+function isSelectable(stateStr) {
+  return stateStr === "pending" || stateStr === "failed"
+      || stateStr === "skipped";
+}
+
 function countSelectedInDay(day) {
   const items = state.queueDayItems[day];
   if (!items) return 0;
   let n = 0;
   for (const it of items) {
-    if (it.state === "pending" && state.queueSelected.has(it.filename)) n++;
+    if (isSelectable(it.state) && state.queueSelected.has(it.filename)) n++;
   }
   return n;
 }
 
+function daySelectableCount(daySummary) {
+  return (daySummary.pending_count || 0) + (daySummary.failed_count || 0)
+       + (daySummary.skipped_count || 0);
+}
+
 function dayCheckState(daySummary, selectedCount) {
-  const pending = daySummary.pending_count;
-  if (!pending) return "unchecked";
-  // If we don't yet have the items cached, we can't know if
-  // selectedCount corresponds to *this* day's pendings. Treat
-  // as unchecked until expansion.
+  const selectable = daySelectableCount(daySummary);
+  if (!selectable) return "unchecked";
+  // Can't know the per-day breakdown until the items are cached.
   if (!state.queueDayItems[daySummary.day]) return "unchecked";
   if (selectedCount === 0) return "unchecked";
-  if (selectedCount >= pending) return "checked";
+  if (selectedCount >= selectable) return "checked";
   return "indeterminate";
 }
 
 function toggleDaySelection(day, select) {
   const items = state.queueDayItems[day] || [];
   for (const it of items) {
-    if (it.state !== "pending") continue;
+    if (!isSelectable(it.state)) continue;
     if (select) state.queueSelected.add(it.filename);
     else state.queueSelected.delete(it.filename);
   }
@@ -2190,32 +2203,32 @@ function itemsInHour(day, hh) {
   return items.filter((it) => hourKeyForItem(it) === hh);
 }
 
-function hourPendingCount(day, hh) {
+function hourSelectableCount(day, hh) {
   let n = 0;
-  for (const it of itemsInHour(day, hh)) if (it.state === "pending") n++;
+  for (const it of itemsInHour(day, hh)) if (isSelectable(it.state)) n++;
   return n;
 }
 
 function countSelectedInHour(day, hh) {
   let n = 0;
   for (const it of itemsInHour(day, hh)) {
-    if (it.state === "pending" && state.queueSelected.has(it.filename)) n++;
+    if (isSelectable(it.state) && state.queueSelected.has(it.filename)) n++;
   }
   return n;
 }
 
 function hourCheckState(day, hh) {
-  const pending = hourPendingCount(day, hh);
-  if (!pending) return "unchecked";
+  const selectable = hourSelectableCount(day, hh);
+  if (!selectable) return "unchecked";
   const sel = countSelectedInHour(day, hh);
   if (sel === 0) return "unchecked";
-  if (sel >= pending) return "checked";
+  if (sel >= selectable) return "checked";
   return "indeterminate";
 }
 
 function toggleHourSelection(day, hh, select) {
   for (const it of itemsInHour(day, hh)) {
-    if (it.state !== "pending") continue;
+    if (!isSelectable(it.state)) continue;
     if (select) state.queueSelected.add(it.filename);
     else state.queueSelected.delete(it.filename);
   }
@@ -2241,18 +2254,51 @@ wireKindCheckbox("q-kind-driving", "driving");
 wireKindCheckbox("q-kind-parking", "parking");
 wireKindCheckbox("q-kind-ro", "ro");
 
-async function prioritizeSelected(position) {
-  const selected = [...state.queueSelected];
-  if (!selected.length) return;
-  await api("/api/queue/prioritize", {
-    method: "POST",
-    body: JSON.stringify({ filenames: selected, position }),
-  });
-  state.queueSelected.clear();
-  await loadQueue();
+// Bulk actions on the current queue selection. Each posts the full selection;
+// the backend WHERE clause filters to the applicable source state, so a mixed
+// selection is fine and `updated` reports how many actually changed.
+const QUEUE_ACTIONS = {
+  "download-next": { url: "/api/queue/prioritize",
+                     body: (f) => ({ filenames: f, position: "top" }),
+                     label: "moved to front" },
+  "skip":          { url: "/api/queue/skip",
+                     body: (f) => ({ filenames: f }), label: "skipped" },
+  "clear-skip":    { url: "/api/queue/unskip",
+                     body: (f) => ({ filenames: f }), label: "un-skipped" },
+  "retry-failed":  { url: "/api/queue/retry",
+                     body: (f) => ({ filenames: f }), label: "re-queued" },
+};
+
+async function applyQueueAction() {
+  const sel = document.getElementById("q-action");
+  const spec = QUEUE_ACTIONS[sel.value];
+  if (!spec) { toast("Choose an action first.", { type: "error" }); return; }
+  const filenames = [...state.queueSelected];
+  if (!filenames.length) {
+    toast("Select some files first.", { type: "error" });
+    return;
+  }
+  const btn = document.getElementById("q-apply");
+  btn.disabled = true;
+  try {
+    const r = await api(spec.url, {
+      method: "POST", body: JSON.stringify(spec.body(filenames)),
+    });
+    const n = r.updated ?? 0;
+    toast(n
+      ? `${n} file${n === 1 ? "" : "s"} ${spec.label}`
+      : "No applicable items in selection.",
+          { type: n ? "success" : "error" });
+    state.queueSelected.clear();
+    sel.value = "";
+    await loadQueue();
+  } catch (e) {
+    toast(`Action failed: ${e.message || e}`, { type: "error" });
+  } finally {
+    btn.disabled = false;
+  }
 }
-document.getElementById("q-prio-top")
-  .addEventListener("click", () => prioritizeSelected("top"));
+document.getElementById("q-apply").addEventListener("click", applyQueueAction);
 
 // Download most recent X hours first
 document.getElementById("q-prio-recent").addEventListener("click", async () => {
@@ -2277,40 +2323,19 @@ document.getElementById("q-prio-recent").addEventListener("click", async () => {
 function renderQueueMeta() {
   let total = 0;
   let pending = 0;
-  let failed = 0;
+  let skipped = 0;
   for (const d of state.queueDays) {
     total += d.clip_count;
     pending += d.pending_count;
-    failed += d.failed_count || 0;
+    skipped += d.skipped_count || 0;
   }
   const sel = state.queueSelected.size;
   let text = `${total} files across ${state.queueDays.length} days · ${pending} pending`;
+  if (skipped) text += ` · ${skipped} skipped`;
   if (sel) text += ` · ${sel} selected`;
   document.getElementById("queue-meta").textContent = text;
-  updateRetryFailedButton(failed);
 }
 
-function updateRetryFailedButton(failedCount) {
-  const btn = document.getElementById("q-retry-failed");
-  if (!btn) return;
-  btn.hidden = failedCount === 0;
-  btn.textContent = `Retry failed (${failedCount})`;
-}
-
-// Re-queue every failed file. Empty body => retry all (server-side).
-document.getElementById("q-retry-failed").addEventListener("click", async () => {
-  const btn = document.getElementById("q-retry-failed");
-  if (!window.confirm(
-    "Retry all failed files? They'll be reset and re-queued for download."
-  )) return;
-  btn.disabled = true;
-  try {
-    await api("/api/queue/retry", { method: "POST", body: JSON.stringify({}) });
-    await loadQueue();  // refreshes counts; button hides itself when none remain
-  } finally {
-    btn.disabled = false;
-  }
-});
 
 function isDownloadsTabActive() {
   return !document.getElementById("view-downloads").hidden;

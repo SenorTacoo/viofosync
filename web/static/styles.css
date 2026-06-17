@@ -37,6 +37,7 @@
    * for fills and borders. */
   --ok: oklch(0.74 0.16 145);
   --warn: oklch(0.82 0.16 85);
+  --skip: oklch(0.72 0.11 300);   /* skipped: a distinct muted violet */
   --err: oklch(0.62 0.20 28);
   --err-text: oklch(0.76 0.18 28);
 }
@@ -832,6 +833,7 @@ main {
 .state-done       { color: var(--ok); }
 .state-failed     { color: var(--err-text); }
 .state-gone       { color: var(--warn); }
+.state-skipped    { color: var(--skip); }
 .order-cell { text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* Downloads — accordion by day */
@@ -905,6 +907,12 @@ main {
 }
 .state-breakdown .state-gone::before {
   background: var(--warn);
+}
+.state-breakdown .state-skipped {
+  color: var(--skip);
+}
+.state-breakdown .state-skipped::before {
+  background: var(--skip);
 }
 .queue-day-header .caret { color: var(--muted); font-size: 12px; }
 .queue-day-header .qd-check { margin: 0; cursor: pointer; }

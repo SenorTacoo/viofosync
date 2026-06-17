@@ -190,7 +190,14 @@
             <input type="checkbox" id="q-kind-ro" checked /> Read-only
           </label>
           <span class="filter-sep"></span>
-          <button type="button" id="q-prio-top">Download selected next</button>
+          <select id="q-action" aria-label="Bulk action">
+            <option value="" disabled selected>Actions…</option>
+            <option value="download-next">Download next</option>
+            <option value="skip">Skip</option>
+            <option value="clear-skip">Clear skip</option>
+            <option value="retry-failed">Retry failed</option>
+          </select>
+          <button type="button" id="q-apply">Apply</button>
           <span class="filter-sep"></span>
           <label class="recent-label">
             <input type="number" id="q-recent-hours" min="0.5" step="0.5"
@@ -198,8 +205,6 @@
                    aria-label="Recent hours to prioritise" />
             <button type="button" id="q-prio-recent">Download recent hours next</button>
           </label>
-          <span class="filter-sep"></span>
-          <button type="button" id="q-retry-failed" hidden>Retry failed</button>
         </div>
         <div id="queue-meta" class="queue-meta"></div>
         <div id="queue-days"></div>
