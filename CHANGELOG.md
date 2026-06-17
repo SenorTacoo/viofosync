@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.4 — 2026-06-17
+
+### Added
+
+#### Camera Control
+
+A new **Camera** tab reads the dashcam's current settings and lets you adjust the safely-changeable ones over Wi-Fi — on/off toggles, drop-downs, and a recording indicator — each validated against the camera's own option list and read back to confirm it stuck. Destructive commands (format SD, factory reset, firmware update, delete, reboot) are hard-blocked and never shown, and the few record-only settings auto-pause then resume recording. Settings for 29 Viofo models are mapped from the official app's command database; the A329S is validated on hardware. Contributed by [@droomurray](https://github.com/droomurray) (#21).
+
+#### Three-Camera Support (Telephoto / Interior)
+
+Telephoto (`T`) and interior/cabin (`I`) clips are now first-class alongside front and rear. They sync, index, and pair into the same capture group, so a three-camera day shows a third thumbnail in the archive and a third track on the timeline. New exports cover them: **Join Tele** / **Join Interior**, plus picture-in-picture with the third camera fullscreen and the front camera as the inset (the front clip stays the audio source, so the microphone track is preserved). The clip viewer's camera key cycles through every camera present at a timestamp. Two-camera setups are visually unchanged. Contributed by [@jusii](https://github.com/jusii) (#18).
+
+#### Background Thumbnails & Filmstrips
+
+Thumbnails and timeline filmstrips are now produced by a background worker as clips download — and existing clips are backfilled — so the archive and timeline populate as soon as footage arrives instead of after a sync cycle finishes. A new **Thumbnails** settings section controls it: thumbnail pre-generation is on by default, while the heavier filmstrip pre-generation is opt-in and otherwise falls back to generating on demand the first time a clip is viewed.
+
+#### Per-Segment Picture-in-Picture in the Editor
+
+The timeline editor's switched-camera cut can now carry a picture-in-picture inset on a per-segment basis. With a segment selected, press the PiP button (or **P**) to cycle the inset through your other cameras — it skips the segment's own camera — and a green placeholder shows where it will sit. The choice is remembered per segment and composited into the export, in the corner set by the global picture-in-picture position setting. A segment whose chosen camera has no overlapping footage simply exports without the inset.
+
+#### Skip Downloads
+
+You can now skip clips you don't want to sync. Select them in the download queue and choose **Skip** from the **Actions** menu; skipped clips get their own badge and are never downloaded. **Clear skip** returns them to the queue with a fresh set of retry attempts. Queue selection now spans pending, failed, and skipped clips, so one Actions menu — Download next / Skip / Clear skip / Retry failed — drives the whole list.
+
+### Changed
+
+- On/off controls across the app are now toggle switches, with one tooltip style used app-wide that works on hover, keyboard focus, and tap.
+- The sync **pause** state is remembered across restarts instead of resetting to running.
+- The download queue's per-action buttons are now a single **Actions** menu with **Apply**; selection-based **Retry failed** replaces the old retry-all button, while **Download recent hours next** is unchanged.
+- Archive thumbnails animate on hover, scrubbing the clip's filmstrip — the same preview the Export Jobs list already offered. They fall back to the static thumbnail when no filmstrip is available, and respect reduced-motion.
+
+### Fixed
+
+- Locking a clip on the dashcam between sync cycles moves it into the camera's `/RO` folder; the download queue now refreshes the clip's source path when the camera re-reports it there, instead of exhausting its retry budget against the stale path and never syncing the clip. The dashcam-delete lock guard benefits too, since it keys off the same refreshed `/RO` path. Contributed by [@jusii](https://github.com/jusii) (#17).
+- The Logs view now shows the date alongside the time and stays readable on a phone — long lines wrap rather than being clipped off-screen.
+
 ## v2.3 — 2026-06-10
 
 ### Added
