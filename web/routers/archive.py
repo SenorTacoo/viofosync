@@ -43,6 +43,17 @@ log = logging.getLogger("viofosync.archive")
 FALLBACK_MAX_S = 300.0
 FALLBACK_DEFAULT_S = 60.0
 
+# Journey-window buffer. GPS stop boundaries land ~STOP_RADIUS_M (50m) inside
+# the real drive, so the pull-away clip at the start and the pull-in clip at
+# the end sit outside the raw journey window — "missing the start" / "cut short
+# on arrival". Pad each edge outward, but no further than the nearest
+# parking-mode clip on that side (the genuine "car is parked" boundary) and
+# never more than this cap. The cap matters because the dashcam can be knocked
+# out of parking mode by the car's electrics waking, producing spurious driving
+# clips — so we don't trust an arbitrary parking->driving switch to mark the
+# journey edge; we only lean on a *parking* clip as a hard stop.
+MAX_JOURNEY_BUFFER_S = 120.0
+
 router = APIRouter(
     prefix="/api/archive",
     tags=["archive"],
@@ -386,6 +397,30 @@ def _effective_durations(rows) -> dict[int, float]:
     return eff
 
 
+def _expand_journey_window(
+    start_ts: float, end_ts: float,
+    parking_spans: list[tuple[float, float]],
+) -> tuple[float, float]:
+    """Pad a GPS journey window ``[start_ts, end_ts]`` outward to catch the
+    pull-away / pull-in footage that sits just outside the GPS stop radius.
+
+    Each edge expands by at most ``MAX_JOURNEY_BUFFER_S``, but stops at the
+    nearest parking-mode clip on that side so we never swallow parked footage.
+    ``parking_spans`` is ``[(start_ts, end_ts), ...]`` for the day's parking
+    clips. A parking clip straddling an edge means we're already at the
+    boundary, so that edge doesn't expand at all. See ``MAX_JOURNEY_BUFFER_S``
+    for why the cap, not the mode switch, is the backstop.
+    """
+    new_start = start_ts - MAX_JOURNEY_BUFFER_S
+    new_end = end_ts + MAX_JOURNEY_BUFFER_S
+    for ps, pe in parking_spans:
+        if ps < start_ts:          # parking (partly) before the window
+            new_start = max(new_start, min(pe, start_ts))
+        if pe > end_ts:            # parking (partly) after the window
+            new_end = min(new_end, max(ps, end_ts))
+    return new_start, new_end
+
+
 @router.get("/timeline")
 def get_timeline(
     request: Request,
@@ -422,6 +457,22 @@ def get_timeline(
             raise HTTPException(404, "journey index out of range")
         j = journeys[journey]
         start_ts, end_ts = j["start_ts"], j["end_ts"]
+        # Pad the window so the pull-away / pull-in footage isn't lost. Parking
+        # clips are queried unfiltered (the display kind-filter must not hide a
+        # boundary) and bound how far each edge may travel.
+        with db.conn() as c:
+            prk = c.execute(
+                "SELECT timestamp, duration_s FROM clip_index "
+                "WHERE group_name = ? AND event_type = 'parking'",
+                [date],
+            ).fetchall()
+        parking_spans = [
+            (r["timestamp"], r["timestamp"] + (r["duration_s"] or 0.0))
+            for r in prk
+        ]
+        start_ts, end_ts = _expand_journey_window(
+            start_ts, end_ts, parking_spans
+        )
 
     where = ["group_name = ?"]
     params: list = [date]
@@ -467,6 +518,14 @@ def get_timeline(
     if start_ts is None and clips:
         start_ts = min(c["start_ts"] for c in clips)
         end_ts = max(c["start_ts"] + c["duration_s"] for c in clips)
+    elif journey is not None and clips:
+        # Clamp the padded window to the footage that's actually there: the
+        # buffer must reach an adjacent clip, not lead into empty timeline, and
+        # a long clip overlapping an edge must not drag bounds past the cap.
+        cov_start = min(c["start_ts"] for c in clips)
+        cov_end = max(c["start_ts"] + c["duration_s"] for c in clips)
+        start_ts = max(start_ts, cov_start)
+        end_ts = min(end_ts, cov_end)
 
     # Each clip block lazy-loads a filmstrip sprite, so this count is how
     # many ffmpeg jobs the editor may kick off — the usual cause of a NAS
@@ -598,14 +657,6 @@ async def rescan(request: Request) -> JSONResponse:
         scanner.scan,
         request.app.state.db, s.recordings, s.grouping,
         request.app.state.hub, asyncio.get_running_loop(),
-    )
-    _tasks.spawn(
-        scanner.sweep_missing_thumbs(request.app.state.db, s.recordings),
-        name="rescan-thumb-sweep",
-    )
-    _tasks.spawn(
-        durations.sweep_missing_durations(request.app.state.db),
-        name="rescan-duration-sweep",
     )
     return JSONResponse({"ok": True, "indexed": n})
 

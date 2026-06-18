@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
   <title>Viofosync</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <link rel="stylesheet"
@@ -35,6 +35,7 @@
       <nav aria-label="Primary">
         <a href="#/archive" data-tab="archive">Archive</a>
         <a href="#/downloads" data-tab="downloads">Downloads</a>
+        <a href="#/camera" data-tab="camera">Camera</a>
         <a href="#/logs" data-tab="logs">Logs</a>
       </nav>
       <div class="spacer"></div>
@@ -189,7 +190,14 @@
             <input type="checkbox" id="q-kind-ro" checked /> Read-only
           </label>
           <span class="filter-sep"></span>
-          <button type="button" id="q-prio-top">Download selected next</button>
+          <select id="q-action" aria-label="Bulk action">
+            <option value="" disabled selected>Actions…</option>
+            <option value="download-next">Download next</option>
+            <option value="skip">Skip</option>
+            <option value="clear-skip">Clear skip</option>
+            <option value="retry-failed">Retry failed</option>
+          </select>
+          <button type="button" id="q-apply">Apply</button>
           <span class="filter-sep"></span>
           <label class="recent-label">
             <input type="number" id="q-recent-hours" min="0.5" step="0.5"
@@ -197,8 +205,6 @@
                    aria-label="Recent hours to prioritise" />
             <button type="button" id="q-prio-recent">Download recent hours next</button>
           </label>
-          <span class="filter-sep"></span>
-          <button type="button" id="q-retry-failed" hidden>Retry failed</button>
         </div>
         <div id="queue-meta" class="queue-meta"></div>
         <div id="queue-days"></div>
@@ -212,6 +218,7 @@
             <a href="#/settings/gps" class="settings-nav-link" data-section="gps">GPS &amp; Geocoding</a>
             <a href="#/settings/exports" class="settings-nav-link" data-section="exports">Exports</a>
             <a href="#/settings/archive" class="settings-nav-link" data-section="archive">Storage</a>
+            <a href="#/settings/thumbnails" class="settings-nav-link" data-section="thumbnails">Thumbnails</a>
             <a href="#/settings/web" class="settings-nav-link" data-section="web">Web server</a>
             <a href="#/settings/security" class="settings-nav-link" data-section="security">Security</a>
             <a href="#/settings/system" class="settings-nav-link" data-section="system">System</a>
@@ -226,6 +233,17 @@
           <button type="button" id="settings-discard">Discard</button>
           <button type="button" id="settings-save" class="primary">Save</button>
         </footer>
+      </section>
+
+      <section id="view-camera" class="tab" hidden>
+        <div class="view-header">
+          <h2>Camera</h2>
+          <div class="spacer"></div>
+          <button type="button" id="camera-refresh">Refresh</button>
+        </div>
+        <div id="camera-status" class="camera-status" aria-live="polite"></div>
+        <div id="camera-info" class="camera-info"></div>
+        <div id="camera-settings" class="camera-settings"></div>
       </section>
 
       <section id="view-logs" class="tab" hidden>
@@ -280,6 +298,7 @@
             <button type="button" id="tl-out" class="tl-abtn">Set End</button>
             <button type="button" id="tl-switch" class="tl-abtn">+ Switch Camera</button>
             <button type="button" id="tl-cam" class="tl-abtn tl-cam" hidden>Rear</button>
+            <button type="button" id="tl-pip" class="tl-abtn tl-pip" hidden>PiP: Off</button>
             <button type="button" id="tl-clear" class="tl-abtn ghost">Clear</button>
           </div>
           <span class="tl-selinfo" id="tl-selinfo"></span>

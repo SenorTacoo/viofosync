@@ -36,6 +36,11 @@ class SettingsModel(BaseModel):
     GROUPING: Literal["none", "daily", "weekly", "monthly", "yearly"] = "daily"
     HTML: bool = True
     GPS_EXTRACT: bool = True
+    DERIVE_THUMBS_EAGER: bool = True
+    # Filmstrips are ~10-25x the ffmpeg work of a thumbnail, so eager
+    # pre-generation is opt-in; off means they build on demand on first
+    # timeline view.
+    DERIVE_FILMSTRIPS_EAGER: bool = False
     DELETE_AFTER_DOWNLOAD: bool = False
     TIMEOUT: int = Field(default=10, ge=1, le=60)
     DOWNLOAD_ATTEMPTS: int = Field(default=3, ge=1, le=10)
@@ -156,6 +161,7 @@ class SettingsModel(BaseModel):
 # Public taxonomy used by the API + UI.
 EDITABLE_KEYS = {
     "ADDRESS", "ADDRESS_FALLBACK", "IMPORT_PATH", "GROUPING", "HTML", "GPS_EXTRACT",
+    "DERIVE_THUMBS_EAGER", "DERIVE_FILMSTRIPS_EAGER",
     "DELETE_AFTER_DOWNLOAD",
     "TIMEOUT", "DOWNLOAD_ATTEMPTS", "MAX_DOWNLOAD_ATTEMPTS", "SYNC_INTERVAL",
     "ENABLE_SCHEDULED_SYNC", "WEB_HOST", "WEB_PORT", "EXPORT_ENCODER",

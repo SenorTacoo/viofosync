@@ -58,6 +58,42 @@ def meta_path(recordings: str, clip_id: int) -> str:
     return os.path.join(_cache_dir(recordings), f"{clip_id}.json")
 
 
+def _fail_path(recordings: str, clip_id: int) -> str:
+    return os.path.join(_cache_dir(recordings), f"{clip_id}.filmstrip.fail")
+
+
+def mark_failed(recordings: str, clip_id: int) -> None:
+    """Record that sprite generation failed for ``clip_id`` so the derive
+    sweep doesn't re-spawn ffmpeg on the same un-renderable clip."""
+    try:
+        os.makedirs(_cache_dir(recordings), exist_ok=True)
+        with open(_fail_path(recordings, clip_id), "w") as f:
+            f.write("")
+    except OSError:
+        pass
+
+
+def _clear_failed(recordings: str, clip_id: int) -> None:
+    try:
+        os.remove(_fail_path(recordings, clip_id))
+    except OSError:
+        pass
+
+
+def failed_recently(recordings: str, clip_id: int, video_path: str) -> bool:
+    """True if generation failed and the video hasn't changed since — so a
+    corrupt/too-short clip is skipped until its file is replaced."""
+    fp = _fail_path(recordings, clip_id)
+    try:
+        fail_mtime = os.path.getmtime(fp)
+    except OSError:
+        return False
+    try:
+        return os.path.getmtime(video_path) <= fail_mtime
+    except OSError:
+        return False
+
+
 def frame_count(duration_s: float | None, interval_s: int = INTERVAL_S) -> int:
     """Number of tiles for a clip: one frame every ``interval_s``
     seconds, always at least one."""
@@ -207,6 +243,9 @@ async def ensure_filmstrip(
             log.debug("filmstrip cache hit clip=%s", clip_id)
             return cached
 
+    if failed_recently(recordings, clip_id, video_path):
+        return None
+
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         global _warned_no_ffmpeg
@@ -236,12 +275,14 @@ async def ensure_filmstrip(
             "filmstrip: clip=%s generation failed after %.1fs (frames=%d)",
             clip_id, elapsed, frames,
         )
+        mark_failed(recordings, clip_id)
         return None
     log.info(
         "filmstrip: clip=%s done in %.1fs (frames=%d)",
         clip_id, elapsed, frames,
     )
 
+    _clear_failed(recordings, clip_id)
     meta = FilmstripMeta(
         frames=frames, interval_s=INTERVAL_S,
         tile_w=TILE_W, tile_h=TILE_H,

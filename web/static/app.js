@@ -28,6 +28,7 @@ const EXTRA_CAMERAS = CAMERAS.filter(
 const state = {
   csrf: null,
   modalClip: null,         // { id, camera, dayEl, timelines }
+  camera: null,            // cached { info, cat } from the last good fetch
   autoAdvance: localStorage.getItem("vfs.autoAdvance") === "1",
   page: 1,
   perPage: 20,
@@ -276,6 +277,8 @@ function routeTo(hash) {
   if (logsView) logsView.hidden = tab !== "logs";
   const settingsView = document.getElementById("view-settings");
   if (settingsView) settingsView.hidden = tab !== "settings";
+  const cameraView = document.getElementById("view-camera");
+  if (cameraView) cameraView.hidden = tab !== "camera";
   const timelineView = document.getElementById("view-timeline");
   if (timelineView) {
     timelineView.hidden = tab !== "timeline";
@@ -290,6 +293,7 @@ function routeTo(hash) {
     refreshExportJobs();
   }
   if (tab === "downloads") loadQueue();
+  if (tab === "camera") loadCamera();
   if (tab === "logs") loadLogs();
   if (tab === "settings") loadSettings();
   if (tab === "timeline") {
@@ -314,10 +318,19 @@ function routeTo(hash) {
 // `/api/archive/rescan` (walking the whole recordings tree) from every
 // open tab — so N open archive clients meant N full rescans per tick.
 // The work is the server's to do once; the browser just reacts to it.
+// Trailing debounce: the derive worker emits `clip_derived` per clip, so a
+// boot backfill of a large archive would otherwise fire one reload per clip
+// across every open tab. Coalesce a burst into a single reload shortly after
+// it settles. Guards are evaluated at fire time (state may have changed).
+let _archiveRefreshTimer = null;
 function refreshArchiveOnIndexChange() {
-  if (document.getElementById("view-archive").hidden) return;
-  if (document.querySelector("#days .day .day-body:not([hidden])")) return;
-  loadDays();
+  if (_archiveRefreshTimer) clearTimeout(_archiveRefreshTimer);
+  _archiveRefreshTimer = setTimeout(() => {
+    _archiveRefreshTimer = null;
+    if (document.getElementById("view-archive").hidden) return;
+    if (document.querySelector("#days .day .day-body:not([hidden])")) return;
+    loadDays();
+  }, 400);
 }
 
 // ---------- Archive ----------
@@ -985,6 +998,7 @@ function renderClipPair(pair) {
                data-clip-id="${c.id}" data-ts="${pair.timestamp}">
         <img src="/api/archive/clip/${c.id}/thumb" data-id="${c.id}"
              alt="" loading="lazy" decoding="async" />
+        <div class="film-scrub" aria-hidden="true"></div>
         <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
       </div>` : `<div class="thumb empty"><div class="label">—</div></div>`;
   // Kind badge: shown for parking / read-only pairs only. Driving
@@ -1019,6 +1033,18 @@ function renderClipPair(pair) {
       const cam = thumbEl ? thumbEl.dataset.camera : "F";
       openVideo(Number(img.dataset.id), cam, thumbEl);
     });
+  });
+
+  // Lazy hover-scrub: load each clip's filmstrip the first time its tile is
+  // hovered, then scrub the overlay. The metadata endpoint generates the
+  // sprite on demand (cached), so this only does work for tiles the user
+  // actually points at. Single-frame clips (frames < 2) stay static.
+  el.querySelectorAll(".thumb[data-clip-id]").forEach((thumbEl) => {
+    const id = thumbEl.dataset.clipId;
+    const overlay = thumbEl.querySelector(".film-scrub");
+    if (!overlay) return;
+    wireLazyFilmstripScrub(
+      overlay, thumbEl, () => api(`/api/archive/clip/${id}/filmstrip`));
   });
 
   // Selection checkbox → export set. Preserve selected state
@@ -1445,6 +1471,46 @@ function formatExportRange(start, end) {
     `${e.toLocaleDateString([], dOpts)}`;
 }
 
+// ---------- Filmstrip hover-scrub (shared) ----------
+//
+// Turn `el` into a ready-to-scrub layer for an N-frame sprite. The :hover CSS
+// rule deliberately omits animation-timing-function so the per-element step
+// count set here (which CSS can't express via a custom property) wins. Returns
+// false (a no-op) when there's nothing to scrub: no sprite, or a single tile.
+function applyFilmstripScrub(el, spriteUrl, frames) {
+  if (!el || !spriteUrl || !(frames >= 2)) return false;
+  el.style.backgroundImage = `url("${spriteUrl}")`;
+  el.style.setProperty("--frames", String(frames));
+  el.style.animationTimingFunction = `steps(${frames}, jump-none)`;
+  el.classList.add("is-ready");
+  return true;
+}
+
+// Lazily load a filmstrip the first time `hoverEl` is hovered, then wire `el`
+// to scrub. `load` returns a promise of the filmstrip metadata
+// ({ sprite_url, frames }). Loading on first hover (rather than for every
+// visible tile) avoids spawning ffmpeg across a whole day just by opening it.
+// A thrown error (network/5xx) re-arms so a later hover retries; a clip that
+// can't be rendered (204, no sprite_url) is left as a permanent no-op.
+function wireLazyFilmstripScrub(el, hoverEl, load) {
+  let started = false;
+  hoverEl.addEventListener("mouseenter", () => {
+    if (started) return;
+    started = true;
+    Promise.resolve()
+      .then(load)
+      .then((meta) => {
+        if (meta && meta.sprite_url) {
+          applyFilmstripScrub(el, meta.sprite_url, meta.frames);
+        }
+      })
+      .catch(() => { started = false; });
+  });
+}
+
+// Export sprites are a fixed-length strip (mirrors export_preview.N_FRAMES).
+const EXPORT_FILMSTRIP_FRAMES = 10;
+
 function renderExportJobs(jobs) {
   updateExportsSummary(jobs);
   const el = document.getElementById("exports-list");
@@ -1540,7 +1606,7 @@ function renderExportJobs(jobs) {
       `${EXPORT_ICON_TRASH}</button>`;
 
     // Filmstrip preview. A finished job whose strip is cached shows the
-    // static first frame and scrubs through the export on hover (pure CSS).
+    // static first frame and scrubs through the export on hover via .film-scrub.
     // A finished job whose strip is still generating shows a shimmer
     // placeholder — still click-to-play, since the output already exists; it
     // swaps to the real strip on the export_preview_ready event. Non-done rows
@@ -1548,8 +1614,8 @@ function renderExportJobs(jobs) {
     let previewCell;
     if (j.state === "done" && j.has_preview) {
       previewCell =
-        `<div class="export-thumb" data-job-id="${j.id}" title="Play export" ` +
-        `style="background-image:url(/api/exports/${j.id}/filmstrip.jpg)"></div>`;
+        `<div class="export-thumb film-scrub" data-job-id="${j.id}" ` +
+        `title="Play export"></div>`;
     } else if (j.state === "done") {
       previewCell =
         `<div class="export-thumb export-thumb--loading" data-job-id="${j.id}" ` +
@@ -1583,6 +1649,12 @@ function renderExportJobs(jobs) {
   el.querySelectorAll(".export-thumb[data-job-id]").forEach((thumb) => {
     thumb.addEventListener("click",
       () => openExportVideo(Number(thumb.dataset.jobId)));
+  });
+  el.querySelectorAll(".export-thumb.film-scrub[data-job-id]").forEach((thumb) => {
+    applyFilmstripScrub(
+      thumb,
+      `/api/exports/${thumb.dataset.jobId}/filmstrip.jpg`,
+      EXPORT_FILMSTRIP_FRAMES);
   });
   el.querySelectorAll(".export-delete").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -1810,7 +1882,7 @@ function groupItemsByHour(items) {
 function hourSummary(items) {
   const s = {
     clip_count: items.length, total_bytes: 0,
-    pending: 0, downloading: 0, done: 0, failed: 0, gone: 0,
+    pending: 0, downloading: 0, done: 0, failed: 0, gone: 0, skipped: 0,
   };
   for (const it of items) {
     s.total_bytes += it.remote_size || 0;
@@ -1902,6 +1974,7 @@ const fmtMB = fmtBytes;
 function renderQueueDayCard(d) {
   const el = document.createElement("div");
   const hasPending = d.pending_count > 0;
+  const hasSelectable = daySelectableCount(d) > 0;
   const isStale = !hasPending && d.downloading_count === 0;
   el.className = "day queue-day" + (isStale ? " queue-day-stale" : "");
   el.dataset.day = d.day;
@@ -1912,6 +1985,7 @@ function renderQueueDayCard(d) {
   if (d.done_count)        pieces.push(`<span class="state-done">${d.done_count} done</span>`);
   if (d.failed_count)      pieces.push(`<span class="state-failed">${d.failed_count} failed</span>`);
   if (d.gone_count)        pieces.push(`<span class="state-gone">${d.gone_count} gone</span>`);
+  if (d.skipped_count)     pieces.push(`<span class="state-skipped">${d.skipped_count} skipped</span>`);
 
   const expanded = state.queueExpanded.has(d.day);
   const selected = countSelectedInDay(d.day);
@@ -1922,7 +1996,7 @@ function renderQueueDayCard(d) {
       <span class="caret">${expanded ? "▾" : "▸"}</span>
       <input type="checkbox" class="qd-check"
              ${checkState === "checked" ? "checked" : ""}
-             ${!hasPending ? "disabled title='No pending clips'" : ""} />
+             ${!hasSelectable ? "disabled title='Nothing selectable'" : ""} />
       <h3>${d.day}</h3>
       <div class="meta">
         ${d.clip_count} clips${
@@ -2002,7 +2076,7 @@ function renderQueueHour(day, hh, items) {
   const expanded = state.queueHoursExpanded.has(key);
   const s = hourSummary(items);
   const checkState = hourCheckState(day, hh);
-  const hasPending = s.pending > 0;
+  const hasSelectable = s.pending + s.failed + (s.skipped || 0) > 0;
   const label = hh === "??" ? "Unknown time" : `${hh}:00–${hh}:59`;
 
   const pieces = [];
@@ -2011,13 +2085,14 @@ function renderQueueHour(day, hh, items) {
   if (s.done)        pieces.push(`<span class="state-done">${s.done} done</span>`);
   if (s.failed)      pieces.push(`<span class="state-failed">${s.failed} failed</span>`);
   if (s.gone)        pieces.push(`<span class="state-gone">${s.gone} gone</span>`);
+  if (s.skipped)     pieces.push(`<span class="state-skipped">${s.skipped} skipped</span>`);
 
   el.innerHTML = `
     <div class="queue-hour-header">
       <span class="caret">${expanded ? "▾" : "▸"}</span>
       <input type="checkbox" class="qh-check" data-hour="${hh}"
              ${checkState === "checked" ? "checked" : ""}
-             ${!hasPending ? "disabled title='No pending clips'" : ""} />
+             ${!hasSelectable ? "disabled title='Nothing selectable'" : ""} />
       <span class="hour-label">${label}</span>
       <span class="meta">${s.clip_count} clips · ${fmtMB(s.total_bytes)}</span>
       <div class="state-breakdown">${pieces.join("")}</div>
@@ -2095,12 +2170,12 @@ function renderHourBody(day, hh, items) {
       ? new Date(it.recorded_at * 1000).toLocaleTimeString() : "—";
     const pos = it.queue_position === 0 ? "▶" :
                 it.queue_position != null ? String(it.queue_position) : "—";
-    const isPending = it.state === "pending";
+    const selectable = isSelectable(it.state);
     const checked = state.queueSelected.has(it.filename);
     const kind = renderKindBadge(it);
     tr.innerHTML = `
       <td><input type="checkbox" class="qi-check" value="${escHtml(it.filename)}"
-            ${isPending ? "" : "disabled"}
+            ${selectable ? "" : "disabled"}
             ${checked ? "checked" : ""} /></td>
       <td>${ts}</td>
       <td>${kind}</td>
@@ -2127,32 +2202,42 @@ function renderHourBody(day, hh, items) {
   return wrap;
 }
 
+// Which queue states can be selected for a bulk action: pending (download
+// next / skip), failed (skip / retry), skipped (clear skip).
+function isSelectable(stateStr) {
+  return stateStr === "pending" || stateStr === "failed"
+      || stateStr === "skipped";
+}
+
 function countSelectedInDay(day) {
   const items = state.queueDayItems[day];
   if (!items) return 0;
   let n = 0;
   for (const it of items) {
-    if (it.state === "pending" && state.queueSelected.has(it.filename)) n++;
+    if (isSelectable(it.state) && state.queueSelected.has(it.filename)) n++;
   }
   return n;
 }
 
+function daySelectableCount(daySummary) {
+  return (daySummary.pending_count || 0) + (daySummary.failed_count || 0)
+       + (daySummary.skipped_count || 0);
+}
+
 function dayCheckState(daySummary, selectedCount) {
-  const pending = daySummary.pending_count;
-  if (!pending) return "unchecked";
-  // If we don't yet have the items cached, we can't know if
-  // selectedCount corresponds to *this* day's pendings. Treat
-  // as unchecked until expansion.
+  const selectable = daySelectableCount(daySummary);
+  if (!selectable) return "unchecked";
+  // Can't know the per-day breakdown until the items are cached.
   if (!state.queueDayItems[daySummary.day]) return "unchecked";
   if (selectedCount === 0) return "unchecked";
-  if (selectedCount >= pending) return "checked";
+  if (selectedCount >= selectable) return "checked";
   return "indeterminate";
 }
 
 function toggleDaySelection(day, select) {
   const items = state.queueDayItems[day] || [];
   for (const it of items) {
-    if (it.state !== "pending") continue;
+    if (!isSelectable(it.state)) continue;
     if (select) state.queueSelected.add(it.filename);
     else state.queueSelected.delete(it.filename);
   }
@@ -2177,32 +2262,32 @@ function itemsInHour(day, hh) {
   return items.filter((it) => hourKeyForItem(it) === hh);
 }
 
-function hourPendingCount(day, hh) {
+function hourSelectableCount(day, hh) {
   let n = 0;
-  for (const it of itemsInHour(day, hh)) if (it.state === "pending") n++;
+  for (const it of itemsInHour(day, hh)) if (isSelectable(it.state)) n++;
   return n;
 }
 
 function countSelectedInHour(day, hh) {
   let n = 0;
   for (const it of itemsInHour(day, hh)) {
-    if (it.state === "pending" && state.queueSelected.has(it.filename)) n++;
+    if (isSelectable(it.state) && state.queueSelected.has(it.filename)) n++;
   }
   return n;
 }
 
 function hourCheckState(day, hh) {
-  const pending = hourPendingCount(day, hh);
-  if (!pending) return "unchecked";
+  const selectable = hourSelectableCount(day, hh);
+  if (!selectable) return "unchecked";
   const sel = countSelectedInHour(day, hh);
   if (sel === 0) return "unchecked";
-  if (sel >= pending) return "checked";
+  if (sel >= selectable) return "checked";
   return "indeterminate";
 }
 
 function toggleHourSelection(day, hh, select) {
   for (const it of itemsInHour(day, hh)) {
-    if (it.state !== "pending") continue;
+    if (!isSelectable(it.state)) continue;
     if (select) state.queueSelected.add(it.filename);
     else state.queueSelected.delete(it.filename);
   }
@@ -2228,18 +2313,51 @@ wireKindCheckbox("q-kind-driving", "driving");
 wireKindCheckbox("q-kind-parking", "parking");
 wireKindCheckbox("q-kind-ro", "ro");
 
-async function prioritizeSelected(position) {
-  const selected = [...state.queueSelected];
-  if (!selected.length) return;
-  await api("/api/queue/prioritize", {
-    method: "POST",
-    body: JSON.stringify({ filenames: selected, position }),
-  });
-  state.queueSelected.clear();
-  await loadQueue();
+// Bulk actions on the current queue selection. Each posts the full selection;
+// the backend WHERE clause filters to the applicable source state, so a mixed
+// selection is fine and `updated` reports how many actually changed.
+const QUEUE_ACTIONS = {
+  "download-next": { url: "/api/queue/prioritize",
+                     body: (f) => ({ filenames: f, position: "top" }),
+                     label: "moved to front" },
+  "skip":          { url: "/api/queue/skip",
+                     body: (f) => ({ filenames: f }), label: "skipped" },
+  "clear-skip":    { url: "/api/queue/unskip",
+                     body: (f) => ({ filenames: f }), label: "un-skipped" },
+  "retry-failed":  { url: "/api/queue/retry",
+                     body: (f) => ({ filenames: f }), label: "re-queued" },
+};
+
+async function applyQueueAction() {
+  const sel = document.getElementById("q-action");
+  const spec = QUEUE_ACTIONS[sel.value];
+  if (!spec) { toast("Choose an action first.", { type: "error" }); return; }
+  const filenames = [...state.queueSelected];
+  if (!filenames.length) {
+    toast("Select some files first.", { type: "error" });
+    return;
+  }
+  const btn = document.getElementById("q-apply");
+  btn.disabled = true;
+  try {
+    const r = await api(spec.url, {
+      method: "POST", body: JSON.stringify(spec.body(filenames)),
+    });
+    const n = r.updated ?? 0;
+    toast(n
+      ? `${n} file${n === 1 ? "" : "s"} ${spec.label}`
+      : "No applicable items in selection.",
+          { type: n ? "success" : "error" });
+    state.queueSelected.clear();
+    sel.value = "";
+    await loadQueue();
+  } catch (e) {
+    toast(`Action failed: ${e.message || e}`, { type: "error" });
+  } finally {
+    btn.disabled = false;
+  }
 }
-document.getElementById("q-prio-top")
-  .addEventListener("click", () => prioritizeSelected("top"));
+document.getElementById("q-apply").addEventListener("click", applyQueueAction);
 
 // Download most recent X hours first
 document.getElementById("q-prio-recent").addEventListener("click", async () => {
@@ -2264,40 +2382,19 @@ document.getElementById("q-prio-recent").addEventListener("click", async () => {
 function renderQueueMeta() {
   let total = 0;
   let pending = 0;
-  let failed = 0;
+  let skipped = 0;
   for (const d of state.queueDays) {
     total += d.clip_count;
     pending += d.pending_count;
-    failed += d.failed_count || 0;
+    skipped += d.skipped_count || 0;
   }
   const sel = state.queueSelected.size;
   let text = `${total} files across ${state.queueDays.length} days · ${pending} pending`;
+  if (skipped) text += ` · ${skipped} skipped`;
   if (sel) text += ` · ${sel} selected`;
   document.getElementById("queue-meta").textContent = text;
-  updateRetryFailedButton(failed);
 }
 
-function updateRetryFailedButton(failedCount) {
-  const btn = document.getElementById("q-retry-failed");
-  if (!btn) return;
-  btn.hidden = failedCount === 0;
-  btn.textContent = `Retry failed (${failedCount})`;
-}
-
-// Re-queue every failed file. Empty body => retry all (server-side).
-document.getElementById("q-retry-failed").addEventListener("click", async () => {
-  const btn = document.getElementById("q-retry-failed");
-  if (!window.confirm(
-    "Retry all failed files? They'll be reset and re-queued for download."
-  )) return;
-  btn.disabled = true;
-  try {
-    await api("/api/queue/retry", { method: "POST", body: JSON.stringify({}) });
-    await loadQueue();  // refreshes counts; button hides itself when none remain
-  } finally {
-    btn.disabled = false;
-  }
-});
 
 function isDownloadsTabActive() {
   return !document.getElementById("view-downloads").hidden;
@@ -2342,7 +2439,14 @@ function renderLogRow(e) {
 
   const ts = document.createElement("span");
   ts.className = "log-ts";
-  ts.textContent = new Date(e.ts * 1000).toLocaleTimeString();
+  const when = new Date(e.ts * 1000);
+  ts.textContent = `${when.toLocaleDateString()} ${when.toLocaleTimeString()}`;
+
+  // Expand caret, immediately right of the date/time. The glyph only
+  // appears on rows carrying an exception (.has-exc, set below), but
+  // the column is always rendered so levels line up across rows.
+  const caret = document.createElement("span");
+  caret.className = "log-caret";
 
   const lvl = document.createElement("span");
   lvl.className = "log-level";
@@ -2356,7 +2460,7 @@ function renderLogRow(e) {
   msg.className = "log-msg";
   msg.textContent = e.message;
 
-  head.append(ts, lvl, logger, msg);
+  head.append(ts, caret, lvl, logger, msg);
   row.appendChild(head);
 
   if (e.exc_text) {
@@ -2517,10 +2621,12 @@ function handleEvent(ev) {
   };
   switch (ev.type) {
     case "clip_indexed":
+    case "clip_derived":
       // Server re-indexed (download landed, manual rescan, import, or
-      // startup scan) and pushed this. Cheap read-only refresh — the
-      // scan already happened server-side, and this fires only on real
-      // changes, not on a timer.
+      // startup scan), or the derive worker finished a clip's
+      // thumbnail/filmstrip. Cheap read-only refresh — the work already
+      // happened server-side, and this fires only on real changes, not
+      // on a timer.
       refreshArchiveOnIndexChange();
       break;
     case "snapshot":
@@ -2737,6 +2843,7 @@ function renderSettingsSection(name) {
     gps: renderGpsSection,
     exports: renderExportsSection,
     archive: renderArchiveSection,
+    thumbnails: renderThumbnailsSection,
     web: renderWebSection,
     security: renderSecuritySection,
     system: renderSystemSection,
@@ -2815,6 +2922,7 @@ function textInput(key, opts = {}) {
 function checkbox(key) {
   const inp = document.createElement("input");
   inp.type = "checkbox";
+  inp.className = "switch";
   inp.checked = !!valueOf(key);
   inp.addEventListener("change", () => setPending(key, inp.checked));
   return inp;
@@ -2988,6 +3096,21 @@ function renderGpsSection(pane) {
               select("DISTANCE_UNITS", ["km", "miles"]));
 }
 
+function renderThumbnailsSection(pane) {
+  renderField(pane, "DERIVE_THUMBS_EAGER",
+              "Pre-generate thumbnails", checkbox("DERIVE_THUMBS_EAGER"));
+  renderField(pane, "DERIVE_FILMSTRIPS_EAGER",
+              "Pre-generate timeline filmstrips", checkbox("DERIVE_FILMSTRIPS_EAGER"));
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent =
+    "When on, these are built in the background as clips download (and " +
+    "existing clips are backfilled), so the archive and timeline feel instant. " +
+    "Without, the filmstrips are generated on demand which can be slow on " +
+    "low-power hosts.";
+  pane.appendChild(note);
+}
+
 function renderExportsSection(pane) {
   renderField(pane, "EXPORT_ENCODER", "H.264 encoder",
               select("EXPORT_ENCODER", ["auto", "software", "videotoolbox", "nvenc", "qsv", "vaapi"]));
@@ -3158,7 +3281,7 @@ function renderSecuritySection(pane) {
     <div class="form-row"><label>Current password</label><input type="password" id="pw-current" autocomplete="current-password" /></div>
     <div class="form-row"><label>New password (min 8 characters)</label><input type="password" id="pw-new" autocomplete="new-password" /></div>
     <div class="form-row"><label>Confirm new password</label><input type="password" id="pw-confirm" autocomplete="new-password" /></div>
-    <div class="form-row"><label><input type="checkbox" id="pw-logout-others" /> Log out other sessions</label></div>
+    <div class="form-row"><label><input type="checkbox" class="switch" id="pw-logout-others" /> Log out other sessions</label></div>
     <button type="button" id="pw-save">Change password</button>
     <span id="pw-result" class="hint" aria-live="polite"></span>
     <h3>Session secret</h3>
@@ -3644,3 +3767,321 @@ window.addEventListener("hashchange", () => {
     }
   };
 })();
+
+// ---------- Tooltips ----------
+// Reusable, app-wide tooltip. Any element with a `data-tip="…"` attribute
+// shows it on hover, keyboard focus, and tap/click — covering the gaps in
+// native `title` (no click, nothing on touch, unreliable timing). One shared
+// element lives on <body> and is fixed-positioned from the trigger's rect, so
+// it escapes overflow:hidden containers and flips/clamps near the viewport
+// edges. Wiring is delegated on `document`, so dynamically-rendered content
+// works with no per-element setup.
+(() => {
+  let tip = null;
+  let current = null;
+
+  function el() {
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.className = "tooltip";
+      tip.setAttribute("role", "tooltip");
+      tip.hidden = true;
+      document.body.appendChild(tip);
+    }
+    return tip;
+  }
+
+  function show(target) {
+    const text = target.getAttribute("data-tip");
+    if (!text) return;
+    current = target;
+    const t = el();
+    t.textContent = text;
+    t.hidden = false;
+    position(target, t);
+  }
+
+  function position(target, t) {
+    const r = target.getBoundingClientRect();
+    const tr = t.getBoundingClientRect();
+    const gap = 8;
+    let placement = "top";
+    let top = r.top - tr.height - gap;
+    if (top < gap) { top = r.bottom + gap; placement = "bottom"; }
+    let left = r.left + r.width / 2 - tr.width / 2;
+    left = Math.max(gap, Math.min(left, window.innerWidth - tr.width - gap));
+    t.style.left = `${Math.round(left)}px`;
+    t.style.top = `${Math.round(top)}px`;
+    t.dataset.placement = placement;
+    // Keep the arrow pointing at the trigger even after horizontal clamping.
+    const arrow = Math.max(12, Math.min(tr.width - 12,
+      r.left + r.width / 2 - left));
+    t.style.setProperty("--tip-arrow", `${Math.round(arrow)}px`);
+  }
+
+  function hide() {
+    if (tip) tip.hidden = true;
+    current = null;
+  }
+
+  document.addEventListener("mouseover", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t) show(t);
+  });
+  document.addEventListener("mouseout", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t && t === current && !t.contains(e.relatedTarget)) hide();
+  });
+  document.addEventListener("focusin", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t) show(t);
+  });
+  document.addEventListener("focusout", hide);
+  // Tap/click shows (re-shows) on the target, dismisses anywhere else. Not a
+  // toggle, so a touch's synthetic mouseover+click doesn't flash-and-hide.
+  document.addEventListener("click", (e) => {
+    const t = e.target.closest?.("[data-tip]");
+    if (t) show(t); else hide();
+  });
+  window.addEventListener("scroll", hide, true);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hide();
+  });
+})();
+
+// ---------- Camera control ----------
+// Reads/writes live dashcam settings via /api/camera/*. The server enforces
+// the destructive-command denylist and per-value validation; the UI only ever
+// offers the safely-writable enumerated settings the catalog returns.
+
+function cameraCategory(key) {
+  if (!key) return "Other";
+  if (/RECORD|MOVIE|HDR|EXPOSURE|BITRATE|RESOLUTION|G_SENSOR|TIME_LAPSE|LIVEVIEW|IMAGE_|MIRROR|ROTATION|FISH_EYE|VIDEO_SOURCE|VIDEO_MERGE/.test(key))
+    return "Recording & Image";
+  if (/PARKING/.test(key)) return "Parking";
+  if (/WATERMARK|PLATE|STAMP/.test(key)) return "Watermark";
+  if (/WIFI|FREQUENCY|STA_/.test(key)) return "Wi-Fi & Network";
+  return "System";
+}
+
+function settingLabel(key) {
+  if (!key) return "(unknown)";
+  return key.replace(/^CMD_/, "").replace(/_/g, " ").toLowerCase()
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function cameraErr(e) {
+  const m = String((e && e.message) || e || "");
+  if (m.startsWith("409"))
+    return "No camera address configured — set it in Settings, then Refresh.";
+  if (m.startsWith("502"))
+    return "Camera unreachable — make sure it's powered and on Wi-Fi, then Refresh.";
+  if (m.startsWith("403")) return "Refused (protected setting).";
+  return "Error: " + m;
+}
+
+// Disable/enable every live control in the settings table. Controls stay
+// disabled until a fetch confirms the camera is actually reachable, so we
+// never let the user write a setting against stale/unconfirmed state.
+function setCamControlsDisabled(disabled) {
+  document.querySelectorAll("#camera-settings [data-cam-control]")
+    .forEach((c) => { c.disabled = disabled; });
+}
+
+// Opening the tab renders the last-known snapshot instantly (controls
+// disabled) and refreshes in the background; controls re-enable only once
+// the camera answers.
+async function loadCamera() {
+  const statusEl = document.getElementById("camera-status");
+  const infoEl = document.getElementById("camera-info");
+  const setEl = document.getElementById("camera-settings");
+  if (!statusEl) return;
+  if (state.camera) {
+    renderCameraInfo(infoEl, state.camera.info, state.camera.cat);
+    renderCameraSettings(setEl, state.camera.cat);
+    setCamControlsDisabled(true);
+    statusEl.className = "camera-status";
+    statusEl.textContent = "Refreshing from camera…";
+  } else {
+    statusEl.className = "camera-status";
+    statusEl.textContent = "Loading camera…";
+    infoEl.innerHTML = "";
+    setEl.innerHTML =
+      `<div class="cam-loading">Reading settings from the camera…</div>`;
+  }
+  await refreshCamera();
+}
+
+async function refreshCamera() {
+  const statusEl = document.getElementById("camera-status");
+  const infoEl = document.getElementById("camera-info");
+  const setEl = document.getElementById("camera-settings");
+  if (!statusEl) return;
+  const refreshBtn = document.getElementById("camera-refresh");
+  if (refreshBtn) refreshBtn.disabled = true;
+  setCamControlsDisabled(true);
+
+  let info, cat;
+  try {
+    info = await api("/api/camera/info");
+    cat = await api("/api/camera/settings/catalog");
+  } catch (e) {
+    // Keep showing the cached snapshot (controls stay disabled) rather than
+    // blanking the page when the camera is briefly unreachable.
+    statusEl.className = "camera-status error";
+    statusEl.textContent = state.camera
+      ? cameraErr(e) + " Showing last-known settings."
+      : cameraErr(e);
+    if (!state.camera) setEl.innerHTML = "";
+    if (refreshBtn) refreshBtn.disabled = false;
+    return;
+  }
+  state.camera = { info, cat };
+  renderCameraInfo(infoEl, info, cat);
+  const adjustable = cat.settings.filter((s) => s.supported !== false).length;
+  statusEl.className = "camera-status";
+  statusEl.textContent =
+    `${cat.model} · ${adjustable} of ${cat.settings.length} settings adjustable now`;
+  // A fresh render replaces the disabled cached controls with live ones.
+  renderCameraSettings(setEl, cat);
+  if (refreshBtn) refreshBtn.disabled = false;
+}
+
+function renderCameraInfo(el, info, cat) {
+  const free = info.free_space_bytes != null
+    ? (info.free_space_bytes / (1 << 30)).toFixed(1) + " GB free"
+    : "—";
+  const s = info.sensors || {};
+  const lenses = s.total ? `${s.total} (${info.camera_tag || "?"})` : "—";
+  const rec = cat ? cat.recording : null;
+  const recHtml = rec == null ? "—"
+    : `<span class="cam-pill ${rec ? "on" : "off"}">` +
+      `${rec ? "● Recording" : "■ Stopped"}</span>`;
+  el.innerHTML = `
+    <div class="cam-facts">
+      <div><span>Firmware</span><b>${escHtml(info.firmware || "—")}</b></div>
+      <div><span>Status</span><b>${recHtml}</b></div>
+      <div><span>SD card</span><b>${escHtml(info.card_status_label || "—")}</b></div>
+      <div><span>Storage</span><b>${escHtml(free)}</b></div>
+      <div><span>Lenses</span><b>${escHtml(lenses)}</b></div>
+    </div>`;
+}
+
+// A 2-option OFF/ON setting → render a toggle. Returns {off,on} indices or null.
+function camBool(s) {
+  if (!s.options || s.options.length !== 2) return null;
+  const off = s.options.find((o) => String(o.value).toUpperCase() === "OFF");
+  const on = s.options.find((o) => String(o.value).toUpperCase() === "ON");
+  return off && on ? { off: off.index, on: on.index } : null;
+}
+
+function renderCamRow(s) {
+  const id = `cam-${s.cmd}`;
+  const label = escHtml(settingLabel(s.key));
+  const status = `<span class="cam-row-status" id="cam-status-${s.cmd}"></span>`;
+
+  // Row order is label | status | control: the status sits right after the
+  // label so the control is always the last column and right-aligned (no
+  // empty gap on the right when the status is blank).
+  if (s.supported === false) {
+    const cur = s.current_label != null ? escHtml(s.current_label) : "—";
+    const reason = escHtml(s.unsupported_reason || "Not adjustable now");
+    // A small ⓘ marker after the label; the reason is revealed by the
+    // data-tip tooltip (hover/focus/tap). The value stays right-aligned.
+    return `<div class="cam-row disabled">
+        <label>${label}</label>
+        <span class="cam-note" tabindex="0" data-tip="${reason}"
+              aria-label="${reason}">ⓘ</span>
+        <span class="cam-current">${cur}</span>
+      </div>`;
+  }
+
+  const b = camBool(s);
+  if (b) {
+    const on = s.current === b.on;
+    return `<div class="cam-row">
+        <label for="${id}">${label}</label>
+        ${status}
+        <input type="checkbox" class="switch" id="${id}" data-cam-control
+               data-key="${escHtml(s.key)}" data-cmd="${s.cmd}"
+               data-on="${b.on}" data-off="${b.off}"${on ? " checked" : ""} />
+      </div>`;
+  }
+
+  const opts = s.options.map((o) =>
+    `<option value="${o.index}"${o.index === s.current ? " selected" : ""}>` +
+    `${escHtml(o.value)}</option>`).join("");
+  return `<div class="cam-row">
+      <label for="${id}">${label}</label>
+      ${status}
+      <select id="${id}" data-cam-control data-key="${escHtml(s.key)}" data-cmd="${s.cmd}">${opts}</select>
+    </div>`;
+}
+
+function renderCameraSettings(el, cat) {
+  const groups = {};
+  for (const s of cat.settings) {
+    const g = cameraCategory(s.key);
+    (groups[g] = groups[g] || []).push(s);
+  }
+  const order = ["Recording & Image", "Parking", "Watermark",
+                 "Wi-Fi & Network", "System", "Other"];
+  let html = "";
+  for (const g of order) {
+    const items = groups[g];
+    if (!items) continue;
+    html += `<fieldset class="cam-group"><legend>${escHtml(g)}</legend>`;
+    for (const s of items) html += renderCamRow(s);
+    html += `</fieldset>`;
+  }
+  el.innerHTML = html || "<p>No adjustable settings reported.</p>";
+  el.querySelectorAll("[data-cam-control]").forEach((ctrl) => {
+    ctrl.dataset.prev = ctrl.type === "checkbox"
+      ? (ctrl.checked ? "1" : "0") : ctrl.value;
+    ctrl.addEventListener("change", onCameraSettingChange);
+  });
+}
+
+function revertCamControl(ctrl) {
+  if (ctrl.type === "checkbox") ctrl.checked = ctrl.dataset.prev === "1";
+  else ctrl.value = ctrl.dataset.prev;
+}
+
+async function onCameraSettingChange(e) {
+  const ctrl = e.target;
+  const { key, cmd } = ctrl.dataset;
+  const isToggle = ctrl.type === "checkbox";
+  const value = isToggle
+    ? (ctrl.checked ? ctrl.dataset.on : ctrl.dataset.off) : ctrl.value;
+  const st = document.getElementById("cam-status-" + cmd);
+  ctrl.disabled = true;
+  st.className = "cam-row-status pending";
+  st.textContent = "Applying…";
+  try {
+    const r = await api(`/api/camera/settings/${encodeURIComponent(key)}`, {
+      method: "POST",
+      body: JSON.stringify({ value }),
+    });
+    if (r.verified === true) {
+      st.className = "cam-row-status ok";
+      st.textContent = r.record_cycled ? "✓ Saved (paused recording)" : "✓ Saved";
+      ctrl.dataset.prev = isToggle ? (ctrl.checked ? "1" : "0") : value;
+      setTimeout(() => {
+        if (st.classList.contains("ok")) st.textContent = "";
+      }, 2500);
+    } else {
+      st.className = "cam-row-status error";
+      st.textContent = "Camera didn't accept this";
+      revertCamControl(ctrl);
+    }
+  } catch (err) {
+    st.className = "cam-row-status error";
+    st.textContent = cameraErr(err);
+    revertCamControl(ctrl);
+  } finally {
+    ctrl.disabled = false;
+  }
+}
+
+document.getElementById("camera-refresh")
+  ?.addEventListener("click", refreshCamera);

@@ -56,6 +56,10 @@ RETENTION_INTERVAL_SECONDS = 300  # 5 minutes
 # cycle is wedged in an uncancellable executor call.
 STOP_TIMEOUT = 10.0
 
+# kv key for the persisted pause toggle ("1" = paused). Survives a
+# restart so the worker resumes in the state the user last left it.
+_PAUSED_KV_KEY = "sync_paused"
+
 
 class DiskFullError(Exception):
     """Raised by _download_one on ENOSPC: the recordings volume is
@@ -317,6 +321,12 @@ class SyncWorker:
         self._cancel_current = threading.Event()
         self._kick = asyncio.Event()
         self._paused = threading.Event()    # set = paused
+        # Restore the last-used pause toggle (persisted in kv) so a
+        # restart resumes in the state the user left it. ENABLE_SCHEDULED_SYNC
+        # still gates whether the schedule runs at all. Best-effort: with
+        # no store there's simply nothing to restore (prod always has one).
+        if self.db is not None and self.db.kv_get(_PAUSED_KV_KEY) == "1":
+            self._paused.set()
         self._backoff_idx = 0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._running_cycle = False
@@ -434,6 +444,7 @@ class SyncWorker:
         picking new items. The current download is cancelled."""
         log.info("sync paused")
         self._paused.set()
+        self.db.kv_set(_PAUSED_KV_KEY, "1")
         self._cancel_current.set()
         self._broadcast_sync_state()
 
@@ -441,6 +452,7 @@ class SyncWorker:
         """Unpause and kick the worker to pick up immediately."""
         log.info("sync resumed")
         self._paused.clear()
+        self.db.kv_set(_PAUSED_KV_KEY, "0")
         self._broadcast_sync_state()
         self.kick()
 
@@ -782,9 +794,6 @@ class SyncWorker:
                     self.db, snap.recordings, snap.grouping,
                     self.hub, asyncio.get_running_loop(),
                 )
-                await scanner.sweep_missing_thumbs(
-                    self.db, snap.recordings,
-                )
                 sink = WebSink(self.hub, asyncio.get_running_loop())
                 await asyncio.to_thread(
                     _retention.sweep,
@@ -932,6 +941,16 @@ class SyncWorker:
                 await self._clear_sync_error()
             q.mark_done(self.db, item.id)
             q.emit_queue_changed(self.db, self.hub)
+            # Index this clip now so it appears immediately, then enqueue
+            # its (heavier) derive at live priority.
+            from . import derive_queue as _dq
+            _snap = self._provider.get()
+            _cid = scanner.index_one_clip(
+                self.db, _snap.recordings, _snap.grouping, item.filename,
+                source_dir=item.source_dir,
+            )
+            if _cid is not None:
+                _dq.enqueue(self.db, _cid, priority=0, now=int(time.time()))
             return True
 
         new_state = q.mark_transient_failure(

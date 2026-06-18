@@ -2,9 +2,9 @@
 
 The scanner indexes clips from filenames but never measures their
 length. ``duration_s`` drives filmstrip frame counts and the
-timeline layout, so probe any clip missing it and store the value.
-Mirrors ``scanner.sweep_missing_thumbs``: bounded concurrency,
-idempotent (only NULL/zero rows are probed), non-fatal on failure.
+timeline layout. :func:`probe_duration` / :func:`probe_and_store`
+are called per-clip by the DeriveWorker; :func:`ensure_gps` marks
+GPS extraction as examined so clips are not re-probed.
 """
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import contextlib
 import logging
 import os
 import shutil
+
+import viofosync_lib as vfs
 
 from ..db import Database
 
@@ -174,81 +176,38 @@ async def _probe_duration_ffprobe(path: str) -> float | None:
     return d if d > 0 else None
 
 
-def _flush(db: Database, batch: list[tuple[int, float]]) -> int:
-    """Persist a batch of (clip_id, duration) pairs. Returns rows written."""
-    if not batch:
-        return 0
-    with db.write() as c:
-        for clip_id, dur in batch:
+
+async def probe_and_store(db: Database, clip_id: int, path: str) -> float | None:
+    """Probe one clip's duration (probe_duration) and persist it. Returns
+    the duration or None on failure. Idempotent: callers gate on a missing
+    duration_s, so this only runs when needed."""
+    dur = await probe_duration(path)
+    if dur and dur > 0:
+        with db.write() as c:
             c.execute(
-                "UPDATE clip_index SET duration_s = ? WHERE id = ?",
-                (dur, clip_id),
+                "UPDATE clip_index SET duration_s=? WHERE id=?", (dur, clip_id)
             )
-    return len(batch)
+    return dur
 
 
-async def sweep_missing_durations(
-    db: Database, *, concurrency: int = 4, batch_size: int = 200
-) -> int:
-    """ffprobe every indexed clip with a NULL/zero ``duration_s`` and
-    store the result. Returns the number of rows updated. Idempotent.
-
-    Results are persisted in batches *as they are probed*, not all at the
-    end, so an interrupted sweep (server restart/shutdown) keeps the work
-    it has already done — successive runs whittle down the remainder
-    instead of redoing all ~N clips every boot.
-    """
+async def ensure_gps(db: Database, clip_id: int, path: str) -> None:
+    """Extract GPS if not yet examined; mark examined either way so the
+    clip isn't re-probed. Best-effort; clips without a GPS lock are normal."""
     with db.conn() as c:
-        rows = c.execute(
-            "SELECT id, path FROM clip_index "
-            "WHERE duration_s IS NULL OR duration_s <= 0"
-        ).fetchall()
-    todo = [(r["id"], r["path"]) for r in rows if os.path.isfile(r["path"])]
-    if not todo:
-        return 0
-
-    log.info(
-        "duration sweep: probing %d clip(s) via mvhd (ffprobe fallback), "
-        "concurrency=%d", len(todo), concurrency,
-    )
-    sem = asyncio.Semaphore(concurrency)
-
-    async def _one(clip_id: int, path: str) -> tuple[int, float | None, str | None]:
-        async with sem:
-            try:
-                dur, method = await _probe_with_method(path)
-                return clip_id, dur, method
-            except asyncio.CancelledError:
-                raise   # shutdown — let it propagate so we flush + stop
-            except Exception as e:  # pragma: no cover — non-fatal
-                log.warning("duration probe failed for %s: %s", path, e)
-                return clip_id, None, None
-
-    tasks = [asyncio.ensure_future(_one(cid, p)) for cid, p in todo]
-    updated = 0
-    methods = {"mvhd": 0, "ffprobe": 0}
-    batch: list[tuple[int, float]] = []
+        row = c.execute(
+            "SELECT gps_examined FROM clip_index WHERE id=?", (clip_id,)
+        ).fetchone()
+    if row and row["gps_examined"]:
+        return
     try:
-        for t in tasks:
-            clip_id, dur, method = await t
-            if dur is not None:
-                if method in methods:
-                    methods[method] += 1
-                batch.append((clip_id, dur))
-                if len(batch) >= batch_size:
-                    updated += _flush(db, batch)
-                    batch = []
-        updated += _flush(db, batch)
-        batch = []
-    finally:
-        # On interruption, abandon the rest and persist what we have so
-        # the next run resumes from here rather than starting over.
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        updated += _flush(db, batch)
-    log.info(
-        "duration sweep: %d updated (%d via mvhd, %d via ffprobe)",
-        updated, methods["mvhd"], methods["ffprobe"],
-    )
-    return updated
+        await asyncio.to_thread(vfs.extract_gps_data, path)
+    except Exception:
+        pass  # no GPS lock / unreadable atom — still mark examined
+    # scanner._iter_clips uses ``path + ".gpx"`` (appended to full path,
+    # extension included, e.g. foo.MP4.gpx) — match that exactly.
+    sidecar = path + ".gpx"
+    with db.write() as c:
+        c.execute(
+            "UPDATE clip_index SET has_gpx=?, gps_examined=1 WHERE id=?",
+            (1 if os.path.exists(sidecar) else 0, clip_id),
+        )

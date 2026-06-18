@@ -119,8 +119,9 @@ async def test_cycle_skipped_while_paused(tmp_path):
 
 # ---- lifecycle logging ----
 
-def test_pause_resume_logged(caplog):
+def test_pause_resume_logged(caplog, tmp_path):
     sw = _bare_worker()
+    sw.db = Database(str(tmp_path / "v.db"))  # pause/resume persist the toggle
     with caplog.at_level(logging.INFO, logger="viofosync.sync_worker"):
         sw.pause()
         sw.resume()

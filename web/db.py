@@ -26,7 +26,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 
 log = logging.getLogger("viofosync.db")
@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS download_queue (
     recorded_at     INTEGER,
     camera          TEXT,
     event_type      TEXT,
-    state           TEXT NOT NULL,    -- pending|downloading|done|failed|gone
+    state           TEXT NOT NULL,    -- pending|downloading|done|failed|gone|skipped
     priority        INTEGER NOT NULL DEFAULT 0,
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
@@ -148,6 +148,18 @@ CREATE TABLE IF NOT EXISTS export_jobs (
     clip_start    INTEGER,            -- min source-clip timestamp (unix s)
     clip_end      INTEGER             -- max source-clip timestamp (unix s)
 );
+
+CREATE TABLE IF NOT EXISTS derive_queue (
+    clip_id     INTEGER PRIMARY KEY,   -- clip_index.id
+    priority    INTEGER NOT NULL,      -- 0 = live (new clip), 1 = backfill
+    state       TEXT NOT NULL,         -- pending|running|done|failed
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    enqueued_at INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_derive_state
+    ON derive_queue(state, priority ASC, clip_id DESC);
 
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
@@ -268,3 +280,20 @@ class Database:
         """Serialised write connection."""
         with self._lock, self.conn() as c:
             yield c
+
+    # ---- kv: small persisted app state (string-valued) ----
+
+    def kv_get(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT value FROM kv WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else default
+
+    def kv_set(self, key: str, value: str) -> None:
+        with self.write() as c:
+            c.execute(
+                "INSERT INTO kv(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )

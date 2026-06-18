@@ -20,6 +20,7 @@ import time as _time_mod
 from typing import Optional
 
 from ..db import Database
+from . import derive_queue as _dq
 from . import filmstrip as _filmstrip
 from . import thumbs as _thumbs
 
@@ -82,6 +83,7 @@ def _delete_clip_files(rec: dict, recordings: str) -> int:
 
 
 def _delete_index_row(db: Database, clip_id: int) -> None:
+    _dq.remove_clip(db, clip_id)
     with db.write() as c:
         c.execute("DELETE FROM clip_index WHERE id = ?", (clip_id,))
 

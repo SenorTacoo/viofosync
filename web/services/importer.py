@@ -10,7 +10,6 @@ worker thread, broadcasting progress via the hub.
 """
 from __future__ import annotations
 
-import asyncio
 import datetime as _dt
 import logging
 import os
@@ -409,12 +408,8 @@ def run_folder_ingest(db: Database, snap, hub, loop, *, root: str) -> dict:
         })
 
     # Reuse the post-sync pipeline. scanner.scan handles its own
-    # broadcast + threadsafe scheduling.
+    # broadcast + threadsafe scheduling, and enqueues missing derives.
     scanner.scan(db, recordings, snap.grouping, hub, loop)
-    if loop is not None:
-        asyncio.run_coroutine_threadsafe(
-            scanner.sweep_missing_thumbs(db, recordings), loop,
-        )
     from .exporter import export_protect_ids
     _retention.sweep(
         db, recordings,

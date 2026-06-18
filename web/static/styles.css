@@ -37,6 +37,7 @@
    * for fills and borders. */
   --ok: oklch(0.74 0.16 145);
   --warn: oklch(0.82 0.16 85);
+  --skip: oklch(0.72 0.11 300);   /* skipped: a distinct muted violet */
   --err: oklch(0.62 0.20 28);
   --err-text: oklch(0.76 0.18 28);
 }
@@ -144,6 +145,30 @@ input[type="checkbox"],
 input[type="radio"] {
   accent-color: var(--accent);
 }
+
+/* Reusable tooltip — positioned on <body> by the Tooltips block in app.js.
+ * pointer-events:none so it never steals hover or affects layout. */
+.tooltip {
+  position: fixed; z-index: 1000; max-width: 280px;
+  padding: 6px 9px; border-radius: 6px;
+  background: var(--panel-3); color: var(--text);
+  border: 1px solid var(--border);
+  font-size: 0.8rem; line-height: 1.35;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+.tooltip[hidden] { display: none; }
+.tooltip::after {
+  content: ""; position: absolute; left: var(--tip-arrow, 50%);
+  transform: translateX(-50%); border: 6px solid transparent;
+}
+.tooltip[data-placement="top"]::after {
+  top: 100%; border-top-color: var(--panel-3);
+}
+.tooltip[data-placement="bottom"]::after {
+  bottom: 100%; border-bottom-color: var(--panel-3);
+}
+
 .icon-btn {
   display: flex; align-items: center; justify-content: center;
   width: 34px; height: 34px; padding: 0;
@@ -587,6 +612,27 @@ main {
   width: 100%; aspect-ratio: 16/9; object-fit: cover;
   background: var(--bg); border-radius: 4px; cursor: pointer;
 }
+/* Filmstrip hover-scrub overlay: sits exactly over the static thumbnail (the
+   image area only, not the filename label below it). pointer-events:none so
+   the thumbnail's own click-to-open handler still fires. Hidden until the
+   sprite has loaded (.is-ready) and the tile is hovered; the shared
+   .film-scrub rules drive the scrub animation. */
+.clip-pair .thumb { position: relative; }
+.clip-pair .thumb .film-scrub {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 4px;
+  background-color: #000;
+  opacity: 0;
+  pointer-events: none;
+}
+.clip-pair .thumb:hover .film-scrub.is-ready { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  /* No motion → no benefit; keep the static thumbnail. */
+  .clip-pair .thumb:hover .film-scrub.is-ready { opacity: 0; }
+}
 /* Filenames are debug-y data; fade them and clip to one line.
  * Hover reveals the full string via the title attribute on the
  * label element (set in the renderer). */
@@ -808,6 +854,7 @@ main {
 .state-done       { color: var(--ok); }
 .state-failed     { color: var(--err-text); }
 .state-gone       { color: var(--warn); }
+.state-skipped    { color: var(--skip); }
 .order-cell { text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* Downloads — accordion by day */
@@ -881,6 +928,12 @@ main {
 }
 .state-breakdown .state-gone::before {
   background: var(--warn);
+}
+.state-breakdown .state-skipped {
+  color: var(--skip);
+}
+.state-breakdown .state-skipped::before {
+  background: var(--skip);
 }
 .queue-day-header .caret { color: var(--muted); font-size: 12px; }
 .queue-day-header .qd-check { margin: 0; cursor: pointer; }
@@ -1025,7 +1078,7 @@ main {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
-  max-height: 70vh; overflow-y: auto;
+  max-height: 70vh; overflow: auto;   /* x too: long lines scroll sideways */
   padding: 6px 0;
   font-family: "SF Mono", "Menlo", monospace;
   font-size: 12px; line-height: 1.6;
@@ -1033,21 +1086,25 @@ main {
 .logs-empty { padding: 16px; color: var(--muted); font-size: 13px; }
 .logs-footer { margin-top: 10px; }
 .logs-footer button[disabled] { opacity: 0.5; cursor: default; }
-.log-line { padding: 1px 14px; }
+/* Rows grow to their content so the widest line drives the scroll
+ * width, but never shrink below the viewport (so short rows still
+ * get a full-width hover band). */
+.log-line { padding: 1px 14px; width: max-content; min-width: 100%; box-sizing: border-box; }
 .log-head {
   display: flex; gap: 10px; align-items: baseline;
   white-space: nowrap;
 }
 .log-head.has-exc { cursor: pointer; }
-.log-head.has-exc::before { content: "▸"; color: var(--muted); }
-.log-line.open .log-head.has-exc::before { content: "▾"; }
+/* Caret sits in its own column right after the timestamp; the column
+ * is always present (even on rows without an exception) so the level
+ * column stays aligned. The glyph only shows on .has-exc rows. */
+.log-caret { flex: 0 0 1em; color: var(--muted); text-align: center; }
+.log-head.has-exc .log-caret::before { content: "▸"; }
+.log-line.open .log-head.has-exc .log-caret::before { content: "▾"; }
 .log-ts { color: var(--muted); flex: 0 0 auto; }
 .log-level { flex: 0 0 70px; font-weight: 600; }
 .log-logger { color: var(--muted); flex: 0 0 auto; }
-.log-msg {
-  color: var(--text); flex: 1 1 auto;
-  overflow: hidden; text-overflow: ellipsis;
-}
+.log-msg { color: var(--text); flex: 1 1 auto; }
 .log-line.log-info    .log-level { color: var(--muted); }
 .log-line.log-warning .log-level { color: var(--warn); }
 .log-line.log-error   .log-level,
@@ -1059,6 +1116,23 @@ main {
   white-space: pre-wrap; color: var(--muted);
 }
 .log-line.open .log-exc { display: block; }
+
+/* On a narrow screen, let each entry wrap instead of forcing a
+ * sideways scroll for every line: the timestamp/caret/level/logger
+ * sit on the first line and the message wraps full-width beneath,
+ * indented. Horizontal scroll stays available (overflow:auto on the
+ * list, overflow-wrap as the break of last resort) so an unbreakable
+ * token is still reachable. */
+@media (max-width: 720px) {
+  .log-line { width: auto; min-width: 0; }
+  .log-head { flex-wrap: wrap; white-space: normal; }
+  .log-msg {
+    flex: 1 1 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    padding-left: 1.5em;
+  }
+}
 
 /* Settings */
 .settings-layout {
@@ -1182,7 +1256,9 @@ main {
   box-shadow: 0 0 0 3px var(--accent-18);
 }
 
-.settings-pane input[type="checkbox"] {
+/* Native checkboxes get the compact 16px treatment; .switch toggles keep
+ * their own 44x24 sizing (this rule outspecifies .switch, so exclude it). */
+.settings-pane input[type="checkbox"]:not(.switch) {
   accent-color: var(--accent);
   width: 16px;
   height: 16px;
@@ -1329,6 +1405,11 @@ main {
  * resizing the visible glyph. Keeps the desktop density unchanged
  * for mouse users. */
 @media (pointer: coarse) {
+  /* 16px is the threshold below which iOS Safari zooms the page in when a
+   * control gains focus (body text is 14px). Bumping touch form controls to
+   * 16px stops that auto-zoom on its own — the viewport meta's user-scalable=no
+   * is belt-and-braces for Android double-tap/pinch and is ignored by iOS. */
+  input, select, textarea { font-size: 16px; }
   .icon-btn { width: 44px; height: 44px; }
   .settings-link { width: 44px; height: 44px; }
   nav a { padding: 10px 14px; }
@@ -1946,6 +2027,15 @@ main {
    drives the flex column taller than the viewport (it only fills its box). */
 .tl-preview video { position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: contain; }
+/* Editor-only PiP placeholder: a green box over the contained video rect,
+   positioned in JS (renderPipOverlay) so it tracks the letterboxed video
+   area, not the container box. Not real footage — just a stand-in. */
+.tl-pip-overlay { position: absolute; z-index: 2; display: none;
+  align-items: center; justify-content: center; box-sizing: border-box;
+  border: 2px solid var(--ok); background: rgba(46, 204, 113, 0.22);
+  color: #eafff2; font-size: 12px; font-weight: 700; letter-spacing: .04em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .6); border-radius: 4px;
+  pointer-events: none; overflow: hidden; }
 .tl-preview-empty { color: var(--muted); font-size: 13px; letter-spacing: .04em; }
 /* Grow into the horizontal space the letterboxed video leaves unused,
    while the preview (flex 3) stays the dominant pane. */
@@ -2102,21 +2192,44 @@ main {
 }
 #tl-shortcuts dd { margin: 0; }
 
-/* Export-job filmstrip preview: one 16:9 tile, scrubs through a 10-frame
-   sprite on hover. Sprite is 10 tiles wide, so background-size:1000% shows
-   exactly one tile; the keyframes step background-position across all 10. */
+/* ---- Filmstrip hover-scrub (shared) --------------------------------- */
+/* A filmstrip sprite is a horizontal montage of N frames. Showing one tile at
+   a time and stepping across the tiles on hover gives a scrub preview. The
+   tile count varies (export sprites are a fixed 10; clip sprites scale with
+   duration), so sizing is driven by the --frames custom property and the
+   steps(N) timing is set inline per element (CSS steps() can't read a var).
+   Shared by the export-jobs thumb and the archive clip tiles. */
+.film-scrub {
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  background-size: calc(var(--frames, 10) * 100%) 100%;
+}
+@keyframes film-scrub-anim {
+  from { background-position-x: 0%; }
+  to   { background-position-x: 100%; }
+}
+/* Scrub only once a sprite is loaded (.is-ready) and the element — or, for the
+   archive overlay, its .clip-pair .thumb ancestor — is hovered. The timing
+   function steps(N, jump-none) is supplied inline by applyFilmstripScrub(). */
+.film-scrub.is-ready:hover,
+.clip-pair .thumb:hover .film-scrub.is-ready {
+  animation-name: film-scrub-anim;
+  animation-duration: 1.2s;
+  animation-iteration-count: infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .film-scrub.is-ready:hover,
+  .clip-pair .thumb:hover .film-scrub.is-ready { animation: none; }
+}
+
+/* Export-job filmstrip preview: one 16:9 tile that scrubs through its 10-frame
+   sprite on hover via the shared .film-scrub primitive. */
 .export-preview-col { width: 136px; }
 .export-thumb {
   width: 128px;
   height: 72px;
   border-radius: 4px;
   background-color: #000;
-  background-repeat: no-repeat;
-  background-size: 1000% 100%;
-  background-position: 0 0;
-}
-.export-thumb:hover {
-  animation: export-scrub 1.2s steps(10, jump-none) infinite;
 }
 /* Only finished jobs' thumbs are clickable (they carry data-job-id and open
    the export in the player modal). */
@@ -2127,7 +2240,8 @@ main {
 /* While a finished job's filmstrip is still being generated, show a shimmer
    placeholder in the same tile. It carries data-job-id so it's click-to-play;
    it swaps to the real strip on the export_preview_ready event. Override the
-   base 1000% sprite sizing and the :hover scrub (no sprite to scrub yet). */
+   film-scrub sprite sizing and the :hover scrub (no sprite loaded yet, so
+   scrubbing would show nothing). */
 .export-thumb--loading,
 .export-thumb--loading:hover {
   background-color: var(--panel-2);
@@ -2141,16 +2255,11 @@ main {
   background-size: 200% 100%;
   animation: export-shimmer 1.3s ease-in-out infinite;
 }
-@keyframes export-scrub {
-  from { background-position-x: 0%; }
-  to   { background-position-x: 100%; }
-}
 @keyframes export-shimmer {
   from { background-position-x: 150%; }
   to   { background-position-x: -150%; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .export-thumb:hover,
   .export-thumb--loading,
   .export-thumb--loading:hover { animation: none; }
 }
@@ -2214,3 +2323,98 @@ main {
 @media (prefers-reduced-motion: reduce) {
   .toast { transition: none; transform: none; }
 }
+
+/* ---------- Camera control tab ---------- */
+.camera-status { margin: 4px 0 12px; color: var(--muted); }
+.camera-status.error { color: var(--err-text); }
+.cam-facts {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px; margin-bottom: 18px;
+}
+.cam-facts > div {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.cam-facts span { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+.cam-facts b { font-weight: 600; word-break: break-word; }
+.cam-group {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 16px 14px; margin: 0 0 16px;
+}
+.cam-group legend { padding: 0 8px; color: var(--accent); font-weight: 600; }
+/* label | status | control. The status takes the flexible middle column so
+ * the control is always the last column, flush-right. Row height comes from
+ * the label's padding, keeping rows uniform regardless of control height. */
+.cam-row {
+  display: grid; grid-template-columns: auto 1fr auto;
+  align-items: center; gap: 12px;
+  border-top: 1px solid var(--border);
+}
+.cam-group .cam-row:first-of-type { border-top: none; }
+.cam-row label { color: var(--text); padding: 14px 0; }
+.cam-row select { width: 200px; }
+.cam-row-status { font-size: 0.82rem; justify-self: start; }
+.cam-row-status.ok { color: var(--ok); }
+.cam-row-status.error { color: var(--err-text); }
+.cam-row-status.pending { color: var(--muted); }
+@media (max-width: 560px) {
+  /* The 3-column grid doesn't stack cleanly: the (usually empty) status cell
+   * leaves dead vertical space and the control gets no breathing room. Use a
+   * wrapping flex row instead — compact controls (toggle, current value, the
+   * ⓘ note) stay on the label's line pinned right; the wide select drops to its
+   * own full-width line below. Row rhythm moves from the label's padding onto
+   * the row, so both lines sit evenly inside the row's top/bottom borders. */
+  .cam-row {
+    display: flex; flex-wrap: wrap; align-items: center;
+    justify-content: space-between; gap: 8px 12px;
+    padding: 12px 0;
+  }
+  .cam-row label { flex: 1 1 auto; padding: 0; }
+  .cam-row-status { order: 3; flex-basis: 100%; }
+  .cam-row-status:empty { display: none; }
+  .cam-row select { order: 4; width: 100%; flex: 1 1 100%; }
+  .cam-row .switch,
+  .cam-current,
+  .cam-note { flex: 0 0 auto; }
+}
+
+/* ---------- Camera tab polish ---------- */
+.cam-loading { color: var(--muted); padding: 16px 2px; }
+.cam-pill {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  font-size: 0.82rem; font-weight: 600;
+}
+.cam-pill.on  { background: color-mix(in oklch, var(--ok) 22%, transparent); color: var(--ok); }
+.cam-pill.off { background: var(--panel-3); color: var(--muted); }
+
+/* disabled (not-adjustable-now) rows: show current value + reason */
+.cam-row.disabled label { color: var(--muted); }
+.cam-current { color: var(--text); font-variant-numeric: tabular-nums; justify-self: end; }
+/* Not-adjustable reason: a small ⓘ marker after the label; the reason is
+ * revealed by the data-tip tooltip (hover/focus/tap). */
+.cam-note {
+  justify-self: start; color: var(--muted);
+  font-size: 0.95rem; cursor: help; line-height: 1;
+}
+.cam-row.disabled { opacity: 0.85; }
+
+/* App-wide toggle switch for ON/OFF checkboxes (settings, archive filters,
+ * camera rows). Drops onto a plain <input type="checkbox" class="switch">
+ * — no wrapper element needed. Selection checkboxes keep the native box. */
+.switch {
+  appearance: none; -webkit-appearance: none; margin: 0;
+  box-sizing: border-box; flex: 0 0 auto; vertical-align: middle;
+  position: relative; width: 44px; height: 24px; border-radius: 999px;
+  cursor: pointer; background: var(--panel-3); border: 1px solid var(--border);
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.switch::before {
+  content: ""; position: absolute; height: 18px; width: 18px; left: 2px; top: 2px;
+  border-radius: 50%; background: var(--muted);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.switch:checked { background: var(--accent-45); border-color: var(--accent); }
+.switch:checked::before { transform: translateX(20px); background: var(--on-accent); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch:disabled { opacity: 0.5; cursor: default; }

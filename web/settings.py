@@ -47,6 +47,8 @@ class Snapshot:
     grouping: str
     use_html_listing: bool
     gps_extract: bool
+    derive_thumbs_eager: bool
+    derive_filmstrips_eager: bool
     delete_after_download: bool
     timeout: float
     download_attempts: int
@@ -244,6 +246,8 @@ class SettingsProvider:
             grouping=m.GROUPING,
             use_html_listing=m.HTML,
             gps_extract=m.GPS_EXTRACT,
+            derive_thumbs_eager=m.DERIVE_THUMBS_EAGER,
+            derive_filmstrips_eager=m.DERIVE_FILMSTRIPS_EAGER,
             delete_after_download=m.DELETE_AFTER_DOWNLOAD,
             timeout=float(m.TIMEOUT),
             download_attempts=m.DOWNLOAD_ATTEMPTS,

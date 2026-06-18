@@ -58,7 +58,10 @@ def logged_in_client(tmp_config_dir, tmp_recordings_dir, monkeypatch):
     settings_mod.reset_for_tests()
 
 
-def _insert_clip(app, clip_id, ts, camera, duration_s, date="2026-06-02"):
+def _insert_clip(
+    app, clip_id, ts, camera, duration_s, date="2026-06-02",
+    event_type="normal",
+):
     with app.state.db.write() as c:
         c.execute(
             "INSERT INTO clip_index "
@@ -66,7 +69,7 @@ def _insert_clip(app, clip_id, ts, camera, duration_s, date="2026-06-02"):
             " sequence, event_type, has_gpx, gps_examined, scanned_at, duration_s) "
             "VALUES (?,?,?,?,?,?,?,?,0,0,?,?)",
             (clip_id, f"/rec/{clip_id}.MP4", f"{clip_id}.MP4", date,
-             ts, camera, clip_id, "normal", ts, duration_s),
+             ts, camera, clip_id, event_type, ts, duration_s),
         )
 
 
@@ -221,3 +224,99 @@ def test_timeline_keeps_real_duration(logged_in_client):
     _insert_clip(app, 1, 1_717_312_440, "F", 42.0)
     body = logged_in_client.get("/api/archive/timeline?date=2026-06-02").json()
     assert body["clips"][0]["duration_s"] == 42.0
+
+
+# --- journey buffer: a GPS journey window sits ~50m inside the real drive
+# (the stop radius), so the pull-away clip at the start and the pull-in clip
+# at the end fall outside it. Pad each edge outward, but no further than the
+# nearest parking-mode clip (the real "car is parked" boundary) and never more
+# than MAX_JOURNEY_BUFFER_S — the dashcam can be knocked out of parking mode by
+# the car's electrics, so an arbitrary parking->driving switch isn't trusted.
+
+
+def test_expand_journey_window_no_parking_uses_cap():
+    cap = archive.MAX_JOURNEY_BUFFER_S
+    s, e = archive._expand_journey_window(1000.0, 2000.0, [])
+    assert s == 1000.0 - cap
+    assert e == 2000.0 + cap
+
+
+def test_expand_journey_window_parking_bounds_each_side():
+    # Parking ends 30s before the window and starts 40s after it — both
+    # inside the cap, so they bound the expansion instead of the cap.
+    spans = [(800.0, 970.0), (2040.0, 2200.0)]
+    s, e = archive._expand_journey_window(1000.0, 2000.0, spans)
+    assert s == 970.0
+    assert e == 2040.0
+
+
+def test_expand_journey_window_distant_parking_falls_back_to_cap():
+    cap = archive.MAX_JOURNEY_BUFFER_S
+    # Parking is more than the cap away on both sides -> the cap wins.
+    spans = [(0.0, 100.0), (5000.0, 5100.0)]
+    s, e = archive._expand_journey_window(1000.0, 2000.0, spans)
+    assert s == 1000.0 - cap
+    assert e == 2000.0 + cap
+
+
+def test_expand_journey_window_overlapping_parking_no_expansion():
+    # A parking clip straddling an edge means we're already at the boundary;
+    # don't expand into parked footage.
+    spans = [(950.0, 1050.0), (1950.0, 2050.0)]
+    s, e = archive._expand_journey_window(1000.0, 2000.0, spans)
+    assert s == 1000.0
+    assert e == 2000.0
+
+
+def _fake_journey_route(j0, j1):
+    return {
+        "date": "2026-06-02",
+        "point_count": 5,
+        "journeys": [{"start_ts": j0, "end_ts": j1}],
+        "stops": [],
+    }
+
+
+def test_timeline_journey_buffer_includes_adjacent_clips(
+    logged_in_client, monkeypatch,
+):
+    """The pull-away and pull-in clips, which fall just outside the raw GPS
+    window, are pulled in by the buffer and the bounds grow to cover them."""
+    app = logged_in_client.app
+    j0, j1 = 1_000_000, 1_000_300
+    _insert_clip(app, 1, j0 - 60, "F", 30.0)   # pull-away [j0-60, j0-30]
+    _insert_clip(app, 2, j0, "F", 300.0)       # the journey itself [j0, j1]
+    _insert_clip(app, 3, j1 + 30, "F", 40.0)   # pull-in [j1+30, j1+70]
+    monkeypatch.setattr(
+        "web.routers.archive.build_route_payload",
+        lambda db, recordings, date, geocoder: _fake_journey_route(j0, j1),
+    )
+
+    body = logged_in_client.get(
+        "/api/archive/timeline?date=2026-06-02&journey=0"
+    ).json()
+    assert sorted(c["id"] for c in body["clips"]) == [1, 2, 3]
+    assert body["bounds"]["start_ts"] == j0 - 60   # back to pull-away start
+    assert body["bounds"]["end_ts"] == j1 + 70     # forward to pull-in end
+
+
+def test_timeline_journey_buffer_stops_at_parking_clip(
+    logged_in_client, monkeypatch,
+):
+    """A parking-mode clip caps how far the start expands — it reaches the
+    parking boundary (80s back), not the full cap."""
+    app = logged_in_client.app
+    j0, j1 = 1_000_000, 1_000_300
+    _insert_clip(app, 1, j0 - 150, "F", 70.0, event_type="parking")  # [-150,-80]
+    _insert_clip(app, 2, j0 - 80, "F", 50.0)   # pull-away [j0-80, j0-30]
+    _insert_clip(app, 3, j0, "F", 300.0)       # the journey itself
+    monkeypatch.setattr(
+        "web.routers.archive.build_route_payload",
+        lambda db, recordings, date, geocoder: _fake_journey_route(j0, j1),
+    )
+
+    body = logged_in_client.get(
+        "/api/archive/timeline?date=2026-06-02&journey=0"
+    ).json()
+    # Expansion stops at the parking boundary, not the 120s cap.
+    assert body["bounds"]["start_ts"] == j0 - 80
