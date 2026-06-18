@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.4 — 2026-06-17
+## v2.4 — 2026-06-18
 
 ### Added
 
@@ -36,6 +36,7 @@ You can now skip clips you don't want to sync. Select them in the download queue
 - Locking a clip on the dashcam between sync cycles moves it into the camera's `/RO` folder; the download queue now refreshes the clip's source path when the camera re-reports it there, instead of exhausting its retry budget against the stale path and never syncing the clip. The dashcam-delete lock guard benefits too, since it keys off the same refreshed `/RO` path. Contributed by [@jusii](https://github.com/jusii) (#17).
 - The Logs view now shows the date alongside the time and stays readable on a phone — long lines wrap rather than being clipped off-screen.
 - Tapping a drop-down or text field no longer zooms the page in on mobile, and the interface no longer pinch-zooms — it behaves like a fixed app viewport.
+- Auto-detected journeys on the timeline no longer miss the start of a drive or cut short on arrival — the journey window is padded past the GPS stop radius to take in the pull-away and pull-in clips, bounded by the surrounding parking footage.
 
 ## v2.3 — 2026-06-10
 
