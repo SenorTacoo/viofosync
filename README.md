@@ -19,6 +19,11 @@ Self-hosted web app for syncing, browsing, and exporting recordings from a Viofo
 - **Easy browser-based setup** - a first-run wizard, then a settings page.
 - **Home Assistant support** - over MQTT, with sync status, alerts, and action buttons.
 
+### Coming Soon
+
+- **GPS triage** - fetch GPS traces from the camera ahead of downloading any recordings. View journeys, set rules and organise your download queue based on the GPS.
+- **Advanced sync policies** - prioritise or skip recordings by type and location: fetch locked event clips first, deprioritise parking-mode footage, or skip anything recorded at home.
+
 ![Timeline video editor](screenshots/timeline_editor.webp)![Download manager](screenshots/download_manager.webp)
 
 ## Contents
