@@ -42,6 +42,13 @@ class DownloadCancelled(Exception):
     """
 
 
+class TruncatedRead(Exception):
+    """A byte-range read returned fewer bytes than requested while not at
+    EOF — the camera closed the body early. Distinct from a connection
+    error: the camera *was* reachable, so the caller treats this as a
+    clip-specific read failure, not a camera-offline condition."""
+
+
 # Defaults used when download_file gets no per-call override.
 socket_timeout = 10.0
 DEFAULT_DOWNLOAD_ATTEMPTS = 1
@@ -549,6 +556,15 @@ class RangeReader:
             data = self._read_range(start, end - 1)
         else:
             data = self._head[start:head_n] + self._read_range(head_n, end - 1)
+        # A range response shorter than the (EOF-clamped) request means the
+        # camera closed the body early — raise so triage doesn't commit a
+        # truncated track. `end` is already clamped to EOF, so a short slice
+        # here is never a legitimate end-of-file read.
+        if len(data) < (end - start):
+            raise TruncatedRead(
+                f"short read: got {len(data)} of {end - start} bytes "
+                f"at offset {start}"
+            )
         self._pos = start + len(data)
         return data
 

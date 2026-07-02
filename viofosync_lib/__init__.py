@@ -36,6 +36,7 @@ from ._gpx import (
 )
 from ._protocol import (
     DownloadCancelled,
+    TruncatedRead,
     download_file,
     extract_remote_gps_points,
     get_dashcam_filenames,
@@ -104,6 +105,7 @@ def delete_dashcam_file(
 
 __all__ = [
     "DownloadCancelled",
+    "TruncatedRead",
     "Recording",
     "ProgressSink",
     "delete_dashcam_file",
