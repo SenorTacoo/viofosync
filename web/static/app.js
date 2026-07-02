@@ -2329,6 +2329,24 @@ function renderKindBadge(it) {
   return parts.join(" ");
 }
 
+// GPS triage indicator for a queue row. gps_state comes from the API:
+// "ok" = fetched, "none" = no GPS / unreadable, "pending" = awaiting triage.
+const GPS_BADGE = {
+  ok:      { sym: "✓", cls: "gps-ok",      title: "GPS fetched" },
+  none:    { sym: "✗", cls: "gps-none",    title: "No GPS / unreadable" },
+  pending: { sym: "–", cls: "gps-pending", title: "Awaiting triage" },
+};
+function renderGpsBadge(it) {
+  // GPS is a pair-level fact carried by the front clip — only it is triaged
+  // (the rear shares the same track). So the badge belongs on the front row;
+  // rear (and orphan-rear) rows are left blank rather than showing a stale
+  // "pending" forever. Camera letter is the 5th char from the end.
+  const fn = it.filename || "";
+  if (fn.length < 5 || fn[fn.length - 5].toUpperCase() !== "F") return "";
+  const b = GPS_BADGE[it.gps_state] || GPS_BADGE.pending;
+  return `<span class="gps-badge ${b.cls}" title="${b.title}">${b.sym}</span>`;
+}
+
 // Kept as a thin alias so existing call sites still resolve;
 // fmtBytes is the canonical helper and auto-scales beyond MB/GB.
 const fmtMB = fmtBytes;
@@ -2516,6 +2534,7 @@ function renderHourBody(day, hh, items) {
       <th></th>
       <th>Time</th>
       <th>Kind</th>
+      <th>GPS</th>
       <th>File</th>
       <th>Size</th>
       <th>State</th>
@@ -2541,6 +2560,7 @@ function renderHourBody(day, hh, items) {
             ${checked ? "checked" : ""} /></td>
       <td>${ts}</td>
       <td>${kind}</td>
+      <td class="gps-cell">${renderGpsBadge(it)}</td>
       <td>${escHtml(it.filename)}</td>
       <td>${size}</td>
       <td class="state-${it.state}">${it.state}</td>

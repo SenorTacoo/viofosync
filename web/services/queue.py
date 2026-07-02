@@ -45,6 +45,22 @@ def _names(filenames: List[str], limit: int = 20) -> str:
     return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
+def _gps_state(d: dict) -> str:
+    """Derive the per-file GPS indicator from triage columns.
+
+    'ok'      = GPS fetched (gps_points > 0)
+    'none'    = triaged with no fix, OR gave up after MAX unreadable attempts
+    'pending' = still awaiting triage
+    """
+    if (d.get("gps_points") or 0) > 0:
+        return "ok"
+    if d.get("triaged_at") is not None:
+        return "none"            # triaged, no GPS fix
+    if (d.get("triage_attempts") or 0) >= TRIAGE_MAX_ATTEMPTS:
+        return "none"            # gave up after MAX unreadable attempts
+    return "pending"
+
+
 @dataclass
 class QueueItem:
     id: int
@@ -468,13 +484,16 @@ def list_page(
             """,
             params + [per_page, (page - 1) * per_page],
         ).fetchall()
+    items = [dict(r) for r in rows]
+    for d in items:
+        d["gps_state"] = _gps_state(d)
     return {
         "total": total,
         "page": page,
         "per_page": per_page,
         "sort_by": sort_by or "priority",
         "sort_dir": sort_dir,
-        "items": [dict(r) for r in rows],
+        "items": items,
     }
 
 
@@ -651,7 +670,10 @@ def list_day_items(
             """,
             params,
         ).fetchall()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    for d in items:
+        d["gps_state"] = _gps_state(d)
+    return items
 
 
 def pending_bytes(db: Database) -> int:
