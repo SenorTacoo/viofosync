@@ -866,9 +866,11 @@ class SyncWorker:
         while not self._stop.is_set():
             if self._paused.is_set():
                 break
+            snap = self._provider.get()
             item = q.next_pending(
                 self.db,
-                ro_only=self._provider.get().sync_ro_only,
+                ro_only=snap.sync_ro_only,
+                triage_gate=getattr(snap, "gps_triage", False),
             )
             if item is None:
                 break

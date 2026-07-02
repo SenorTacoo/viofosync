@@ -29,6 +29,7 @@ import viofosync_lib as vfs
 from viofosync_lib.cameras import CAMERA_LETTERS
 
 from ..db import Database
+from .triage import TRIAGE_MAX_ATTEMPTS
 
 # INFO-level here is persisted to the app_log table by DBLogHandler (the
 # "viofosync.*" namespace is captured at INFO) — so user-initiated archive
@@ -236,19 +237,39 @@ _EVT_PREFIX_SQL = "upper(substr(filename, -6, 1))"
 
 
 def next_pending(
-    db: Database, *, ro_only: bool = False,
+    db: Database, *, ro_only: bool = False, triage_gate: bool = False,
 ) -> Optional[QueueItem]:
-    """Highest priority, oldest enqueue time. If ``ro_only`` is
-    set, only consider rows whose source_dir is under /RO/."""
-    sql = (
-        "SELECT * FROM download_queue "
-        "WHERE state='pending'"
-    )
+    """Highest priority, oldest enqueue time. If ``ro_only`` is set, only
+    consider rows whose source_dir is under /RO/.
+
+    If ``triage_gate`` is set (GPS_TRIAGE on), a row is held back while its
+    front sibling is still awaiting triage (``triaged_at IS NULL AND
+    triage_attempts < TRIAGE_MAX_ATTEMPTS``) — so we never download a clip,
+    or its rear pair, ahead of triage. The front sibling is the same name
+    with 'F' at the camera position; a front clip is its own sibling, and an
+    orphan rear (no front) is not gated."""
+    sql = "SELECT dq.* FROM download_queue dq WHERE dq.state='pending'"
+    params: List[object] = []
     if ro_only:
-        sql += " AND (source_dir LIKE '%/RO/%' OR source_dir LIKE '%/RO')"
-    sql += " ORDER BY priority DESC, enqueued_at ASC LIMIT 1"
+        sql += (
+            " AND (dq.source_dir LIKE '%/RO/%' "
+            "OR dq.source_dir LIKE '%/RO')"
+        )
+    if triage_gate:
+        sql += (
+            " AND NOT EXISTS ("
+            "  SELECT 1 FROM download_queue f"
+            "  WHERE f.filename = substr(dq.filename, 1, length(dq.filename)-5)"
+            "                     || 'F' || substr(dq.filename, -4)"
+            "    AND f.state='pending'"
+            "    AND f.triaged_at IS NULL"
+            "    AND f.triage_attempts < ?"
+            " )"
+        )
+        params.append(TRIAGE_MAX_ATTEMPTS)
+    sql += " ORDER BY dq.priority DESC, dq.enqueued_at ASC LIMIT 1"
     with db.conn() as c:
-        row = c.execute(sql).fetchone()
+        row = c.execute(sql, params).fetchone()
     if row is None:
         return None
     return QueueItem(

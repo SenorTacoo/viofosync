@@ -164,3 +164,42 @@ async def test_triage_pass_clears_even_on_error(tmp_path, monkeypatch):
 
     await sw._run_triage_pass()   # must not raise (except-guarded)
     assert events[-1] == {"type": "triage_progress", "active": False}
+
+
+async def test_drain_passes_triage_gate(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"; rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=True)
+    snap.sync_ro_only = False
+    snap.disk_critical_pct = 95
+    sw = SyncWorker(db, _Provider(snap), Hub())
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _true(*a, **k):
+        return True
+
+    async def _addr(*a, **k):
+        return ("1.2.3.4", "primary")
+
+    # Stub everything _cycle does before the drain so it reaches next_pending.
+    monkeypatch.setattr(sw, "_emit_disk_pct", _noop)
+    monkeypatch.setattr(sw, "_check_recordings_writable", _true)
+    monkeypatch.setattr(sw, "_select_active_address", _addr)
+    monkeypatch.setattr(sw, "_refresh_listing_and_reconcile", _true)
+    monkeypatch.setattr(sw, "_run_triage_pass", _noop)
+    monkeypatch.setattr(sw, "_run_geofence_pass", _noop)
+
+    captured = {}
+    from web.services import queue as q
+
+    def spy(_db, *, ro_only=False, triage_gate=False):
+        captured["ro_only"] = ro_only
+        captured["triage_gate"] = triage_gate
+        return None          # empty queue -> drain ends immediately
+
+    monkeypatch.setattr(q, "next_pending", spy)
+
+    await sw._cycle()
+    assert captured == {"ro_only": False, "triage_gate": True}
