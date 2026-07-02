@@ -128,6 +128,73 @@ def export_download_name(
     return f"{build_basename(clips, label)}.mp4"
 
 
+# --- Filename-derived SQL fragments ---------------------------------------
+#
+# Two on-disk filename layouts exist (see docs/ARCHITECTURE.md):
+#   standard: ``YYYY_MMDD_HHMMSS_NNNN[PE]?<letter>.MP4``
+#   compact:  ``YYYYMMDDHHMMSS_NNNNNN.MP4`` — some single-channel units list
+#             recordings with no datetime separators and no camera suffix;
+#             the sole lens is the GPS-bearing one.
+# Discriminators: standard has ``_`` at position 5 and a camera letter at -5;
+# compact has digits in both places. The GPS letter is interpolated rather
+# than bound (it is a one-character registry constant, not user input) so the
+# fragments carry no SQL parameters — callers can't get param order wrong.
+
+
+def suffixless_sql(col: str = "filename") -> str:
+    """SQL: the name is compact/suffix-less (a digit where the camera
+    letter would sit)."""
+    return f"substr({col}, -5, 1) BETWEEN '0' AND '9'"
+
+
+def gps_lens_sql(col: str = "filename") -> str:
+    """SQL: the clip is the GPS-bearing lens — the registry's GPS letter,
+    or a suffix-less single-channel name (which IS that lens)."""
+    return (
+        f"(upper(substr({col}, -5, 1)) = '{GPS_CAMERA_LETTER}' "
+        f"OR {suffixless_sql(col)})"
+    )
+
+
+def camera_letter_sql(col: str = "filename") -> str:
+    """SQL: the clip's camera letter; suffix-less names default to the
+    GPS lens."""
+    return (
+        f"CASE WHEN {suffixless_sql(col)} THEN '{GPS_CAMERA_LETTER}' "
+        f"ELSE upper(substr({col}, -5, 1)) END"
+    )
+
+
+def day_key_sql(col: str = "filename") -> str:
+    """SQL: the clip's ``YYYY-MM-DD`` day key from the filename, for both
+    layouts. Derived from the name rather than ``recorded_at`` so grouping
+    is stable for rows missing a timestamp and immune to unixepoch/localtime
+    conversion drift."""
+    return (
+        f"CASE WHEN substr({col}, 5, 1) = '_' "
+        f"THEN substr({col}, 1, 4) || '-' || substr({col}, 6, 2) "
+        f"     || '-' || substr({col}, 8, 2) "
+        f"ELSE substr({col}, 1, 4) || '-' || substr({col}, 5, 2) "
+        f"     || '-' || substr({col}, 7, 2) END"
+    )
+
+
+def gps_sibling_sql(col: str = "f.filename") -> str:
+    """Correlated SQL: ``col`` names the GPS-bearing sibling of the row
+    aliased ``dq``. Same-capture lenses share the filename's 16-char
+    timestamp prefix but NOT necessarily the sequence number (parking
+    captures give each lens its own), so the sibling is matched by prefix
+    range — usable with an index on ``col`` — never by rebuilding a sibling
+    filename from the stem. For a compact name the prefix spans the
+    timestamp + first sequence digit and the only possible match is the row
+    itself: a compact clip is its own GPS sibling."""
+    return (
+        f"{col} >= substr(dq.filename, 1, 16)"
+        f" AND {col} < substr(dq.filename, 1, 16) || '~'"
+        f" AND {gps_lens_sql(col)}"
+    )
+
+
 # --- Timeline camera channels -------------------------------------------
 
 # Channel keys/labels come straight from the registry; "other" is the

@@ -18,6 +18,7 @@ from typing import Sequence
 
 from ..db import Database
 from . import triage as triage_service
+from .naming import day_key_sql
 
 
 def day_gpx_paths(
@@ -41,10 +42,7 @@ def day_gpx_paths(
     downloaded_names = {os.path.basename(r["path"]) for r in rows}
 
     placeholders = ",".join("?" * len(queue_states))
-    day_expr = (
-        "substr(filename,1,4) || '-' || substr(filename,6,2) "
-        "|| '-' || substr(filename,8,2)"
-    )
+    day_expr = day_key_sql()
     with db.conn() as c:
         q_rows = c.execute(
             f"SELECT filename FROM download_queue "
@@ -72,10 +70,7 @@ def day_parking_spans(db: Database, date: str) -> list[tuple[float, float]]:
     case under GPS triage, where the day's parking clips live only in the queue.
     Overlapping/duplicate spans are harmless: the consumer reduces with min/max.
     """
-    day_expr = (
-        "substr(filename,1,4) || '-' || substr(filename,6,2) "
-        "|| '-' || substr(filename,8,2)"
-    )
+    day_expr = day_key_sql()
     spans: list[tuple[float, float]] = []
     with db.conn() as c:
         for r in c.execute(

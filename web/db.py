@@ -113,6 +113,10 @@ CREATE INDEX IF NOT EXISTS idx_clip_index_ts
     ON clip_index(timestamp);
 CREATE INDEX IF NOT EXISTS idx_clip_index_group
     ON clip_index(group_name);
+-- basename lookups: the archive's GPS-sibling probe (prefix range) and the
+-- delete/lock paths all address clips by basename.
+CREATE INDEX IF NOT EXISTS idx_clip_index_basename
+    ON clip_index(basename);
 
 CREATE TABLE IF NOT EXISTS download_queue (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

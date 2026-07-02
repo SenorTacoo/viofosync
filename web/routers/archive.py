@@ -35,6 +35,8 @@ from ..services.naming import (
     CHANNEL_ORDER,
     GPS_CAMERA_LETTER,
     channel_of,
+    day_key_sql,
+    gps_lens_sql,
     pair_slot_of,
 )
 
@@ -317,11 +319,8 @@ def get_day(
 
 
 def _queue_day_expr() -> str:
-    # YYYY-MM-DD from a Viofo filename (YYYY_MMDD_HHMMSS_...).
-    return (
-        "substr(filename,1,4) || '-' || substr(filename,6,2) "
-        "|| '-' || substr(filename,8,2)"
-    )
+    # YYYY-MM-DD from a Viofo filename, format-aware (standard + compact).
+    return day_key_sql()
 
 
 def remote_day_summaries(db, date_from=None, date_to=None) -> list[dict]:
@@ -334,9 +333,9 @@ def remote_day_summaries(db, date_from=None, date_to=None) -> list[dict]:
         # map, so they must not be counted into the archive grid either — they'd
         # otherwise snap onto a journey. They stay visible in the Queue tab.
         "state IN ('pending','failed','downloading')",
-        "upper(substr(filename, -5, 1)) = ?",
+        gps_lens_sql(),
     ]
-    params: list = [GPS_CAMERA_LETTER]
+    params: list = []
     if date_from:
         where.append(f"{day} >= ?")
         params.append(date_from)
@@ -370,9 +369,9 @@ def geofence_skipped_by_day(db, date_from=None, date_to=None) -> dict[str, int]:
     where = [
         "state = 'skipped'",
         "skip_reason = 'geofence'",
-        "upper(substr(filename, -5, 1)) = ?",
+        gps_lens_sql(),
     ]
-    params: list = [GPS_CAMERA_LETTER]
+    params: list = []
     if date_from:
         where.append(f"{day} >= ?")
         params.append(date_from)
@@ -400,11 +399,15 @@ def remote_day_clips(db, date: str) -> list[dict]:
     (``queue.GPS_SIBLING_SQL``: same timestamp prefix, GPS letter) — the
     sibling's ``triaged_at``/``gps_points`` speak for the whole capture. The
     sibling may already be downloaded (``done`` — its real sidecar carries the
-    trace) but not ``gone`` (skeleton swept, no trace left). Track-less
-    captures (no GPS lock — e.g. garage parking — or not yet triaged) and
-    orphan non-GPS clips stay in the Queue tab until they're downloaded. This
-    mirrors ``day_tracks.day_gpx_paths``' skeleton filter so a grid tile
-    always has a matching track on the journey map."""
+    trace) but not ``gone`` (skeleton swept, no trace left). A sibling whose
+    queue row was never triaged (downloaded before triage existed, or while it
+    was off — ``purge_all`` clears the columns) still qualifies via its
+    ``clip_index`` sidecar (``has_gpx=1``), so legacy captures surface their
+    queued lenses too. Track-less captures (no GPS lock — e.g. garage
+    parking — or not yet triaged) and orphan non-GPS clips stay in the Queue
+    tab until they're downloaded. This mirrors ``day_tracks.day_gpx_paths``'
+    skeleton filter so a grid tile always has a matching track on the journey
+    map."""
     day = _queue_day_expr()
     with db.conn() as c:
         rows = c.execute(
@@ -415,15 +418,24 @@ def remote_day_clips(db, date: str) -> list[dict]:
             FROM download_queue dq
             WHERE dq.state IN ('pending','failed','downloading')
               AND {day.replace('filename', 'dq.filename')} = ?
-              AND EXISTS (
-                SELECT 1 FROM download_queue f
-                WHERE {q.GPS_SIBLING_SQL}
-                  AND f.state <> 'gone'
-                  AND f.triaged_at IS NOT NULL AND f.gps_points > 0
+              AND (
+                EXISTS (
+                  SELECT 1 FROM download_queue f
+                  WHERE {q.GPS_SIBLING_SQL}
+                    AND f.state <> 'gone'
+                    AND f.triaged_at IS NOT NULL AND f.gps_points > 0
+                )
+                OR EXISTS (
+                  SELECT 1 FROM clip_index ci
+                  WHERE ci.basename >= substr(dq.filename, 1, 16)
+                    AND ci.basename < substr(dq.filename, 1, 16) || '~'
+                    AND {gps_lens_sql('ci.basename')}
+                    AND ci.has_gpx = 1
+                )
               )
             ORDER BY dq.recorded_at DESC, dq.filename DESC
             """,
-            (date, GPS_CAMERA_LETTER),
+            (date,),
         ).fetchall()
 
     slots = [cam.channel for cam in CAMERAS]
@@ -682,11 +694,11 @@ def _apply_completion(db, date: str, payload: dict) -> None:
         ).fetchall()
         pend = c.execute(
             f"SELECT recorded_at AS ts FROM download_queue "
-            f"WHERE {qday} = ? AND upper(substr(filename, -5, 1)) = ? "
+            f"WHERE {qday} = ? AND {gps_lens_sql()} "
             f"AND state IN ('pending','failed','downloading') "
             f"AND triaged_at IS NOT NULL AND gps_points > 0 "
             f"ORDER BY recorded_at ASC",
-            (date, GPS_CAMERA_LETTER),
+            (date,),
         ).fetchall()
 
     clips = [(r["ts"], r["duration_s"], True) for r in dl if r["ts"] is not None]

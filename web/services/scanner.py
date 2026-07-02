@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Iterable, List
 
 import viofosync_lib as vfs
+from viofosync_lib.cameras import GPS_CAMERA_LETTER
 
 from ..db import Database
 
@@ -91,7 +92,10 @@ def _clip_meta_for(
     if not os.path.isfile(path):
         return None
 
-    camera_field = m.group("camera")
+    # Compact single-channel names have no camera suffix (empty group);
+    # the sole lens is the GPS-bearing one, so default to the registry's
+    # GPS letter. Event type falls out naturally: no P/E prefix → normal.
+    camera_field = m.group("camera") or GPS_CAMERA_LETTER
     return ClipMeta(
         path=path,
         basename=filename,

@@ -24,9 +24,9 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
 import viofosync_lib as vfs
-from viofosync_lib.cameras import GPS_CAMERA_LETTER
 
 from ..db import Database
+from .naming import gps_lens_sql
 
 log = logging.getLogger("viofosync.triage")
 
@@ -118,24 +118,25 @@ def select_targets(
     Only the GPS-bearing lens is triaged: Viofo embeds the GPS track in one
     stream (the front), and the other lenses of the same capture share it, so
     triaging just that one covers the whole group. Which lens that is comes
-    from the camera registry (``GPS_CAMERA_LETTER`` in viofosync_lib/cameras.py),
-    not a hard-coded letter; the sibling clips still show as placeholder tiles."""
+    from the camera registry via ``naming.gps_lens_sql`` (compact suffix-less
+    names are single-channel and count as the GPS lens), not a hard-coded
+    letter; the sibling clips still show as placeholder tiles."""
     if now is None:
         now = int(time.time())
     with db.conn() as c:
         rows = c.execute(
-            "SELECT id, filename, source_dir, remote_size, recorded_at "
-            "FROM download_queue "
-            "WHERE state='pending' AND triaged_at IS NULL "
-            "AND upper(substr(filename, -5, 1)) = ? "
-            "AND (recorded_at IS NULL OR ? - recorded_at >= "
-            "     (CASE WHEN event_type='parking' THEN ? ELSE ? END)) "
-            "AND triage_attempts < ? "
-            "AND (triage_last_attempt_at IS NULL OR ? - triage_last_attempt_at "
-            "     >= (CASE triage_attempts WHEN 1 THEN 10 WHEN 2 THEN 30 "
-            "         WHEN 3 THEN 120 ELSE 600 END)) "
-            "ORDER BY recorded_at DESC, id DESC LIMIT ?",
-            (GPS_CAMERA_LETTER, now, TRIAGE_SETTLE_PARKING_S, TRIAGE_SETTLE_S,
+            f"SELECT id, filename, source_dir, remote_size, recorded_at "
+            f"FROM download_queue "
+            f"WHERE state='pending' AND triaged_at IS NULL "
+            f"AND {gps_lens_sql()} "
+            f"AND (recorded_at IS NULL OR ? - recorded_at >= "
+            f"     (CASE WHEN event_type='parking' THEN ? ELSE ? END)) "
+            f"AND triage_attempts < ? "
+            f"AND (triage_last_attempt_at IS NULL OR ? - triage_last_attempt_at "
+            f"     >= (CASE triage_attempts WHEN 1 THEN 10 WHEN 2 THEN 30 "
+            f"         WHEN 3 THEN 120 ELSE 600 END)) "
+            f"ORDER BY recorded_at DESC, id DESC LIMIT ?",
+            (now, TRIAGE_SETTLE_PARKING_S, TRIAGE_SETTLE_S,
              TRIAGE_MAX_ATTEMPTS, now,
              -1 if limit is None else limit),
         ).fetchall()

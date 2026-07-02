@@ -19,6 +19,7 @@ import time
 from dataclasses import asdict, dataclass, field
 
 import viofosync_lib as vfs
+from viofosync_lib.cameras import GPS_CAMERA_LETTER
 
 from ..db import Database
 from . import retention as _retention
@@ -78,7 +79,9 @@ def scan_item_from_match(
         int(m.group("year")), int(m.group("month")), int(m.group("day")),
         int(m.group("hour")), int(m.group("minute")), int(m.group("second")),
     ).timestamp())
-    cam = m.group("camera")
+    # Compact suffix-less names have an empty camera group; the sole lens
+    # is the GPS-bearing one (mirrors scanner._clip_meta_for).
+    cam = m.group("camera") or GPS_CAMERA_LETTER
     return ScanItem(
         src_path=src_path, source_rel_path=source_rel_path, basename=name,
         timestamp=ts, camera=cam.upper(), sequence=int(m.group("sequence")),

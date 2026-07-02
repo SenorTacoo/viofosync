@@ -366,19 +366,65 @@ def test_get_day_merges_pending_rear_into_downloaded_pair(tmp_path):
     assert pair["rear"]["state"] == "pending"
 
 
+def test_remote_day_clips_rear_qualifies_via_downloaded_front_sidecar(tmp_path):
+    """A front downloaded before triage existed (queue row done, triaged_at
+    NULL) still proves the capture's GPS via its clip_index sidecar
+    (has_gpx=1) — the queued rear must surface in the archive."""
+    db = Database(str(tmp_path / "v.db"))
+    day = "2026-06-18"
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_clip(db, "2026_0618_203643_0001F.MP4", camera="F", day=day, ts=ts,
+               has_gpx=1)
+    _seed_queue(db, "2026_0618_203643_0001F.MP4", camera="F", recorded_at=ts,
+                state="done", triaged=False, gps_points=None)   # legacy row
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+    clips = archive.remote_day_clips(db, day)
+    assert len(clips) == 1
+    assert clips[0]["rear"]["state"] == "pending"
+
+
+def test_remote_day_clips_rear_qualifies_without_any_front_queue_row(tmp_path):
+    """Ancient captures may have no queue row for the front at all — the
+    downloaded sidecar alone must qualify the rear."""
+    db = Database(str(tmp_path / "v.db"))
+    day = "2026-06-18"
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_clip(db, "2026_0618_203643_0001F.MP4", camera="F", day=day, ts=ts,
+               has_gpx=1)
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+    clips = archive.remote_day_clips(db, day)
+    assert len(clips) == 1
+    assert clips[0]["rear"] is not None
+
+
+def test_remote_day_clips_rear_hidden_when_downloaded_front_lacks_gps(tmp_path):
+    """A downloaded front with no sidecar (has_gpx=0) proves nothing — the
+    rear stays out of the journey-organised archive."""
+    db = Database(str(tmp_path / "v.db"))
+    day = "2026-06-18"
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_clip(db, "2026_0618_203643_0001F.MP4", camera="F", day=day, ts=ts,
+               has_gpx=0)
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+    assert archive.remote_day_clips(db, day) == []
+
+
 # --- RO-7: locked flag in day payloads ---
 
 
-def _seed_clip(db, filename, *, camera, day, ts, locked=0):
+def _seed_clip(db, filename, *, camera, day, ts, locked=0, has_gpx=0):
     """Insert a clip_index row (no real file needed for payload tests)."""
     with db.write() as c:
         c.execute(
             "INSERT INTO clip_index "
             "(path, basename, group_name, timestamp, camera, sequence, "
             " event_type, size_bytes, has_gpx, gps_examined, scanned_at, locked) "
-            "VALUES (?,?,?,?,?,?,?,?,0,1,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,1,?,?)",
             (f"/rec/{day}/{filename}", filename, day, ts,
-             camera, 1, "normal", 1, ts, locked),
+             camera, 1, "normal", 1, has_gpx, ts, locked),
         )
 
 

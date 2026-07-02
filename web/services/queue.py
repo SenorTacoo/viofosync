@@ -33,6 +33,7 @@ from viofosync_lib.cameras import (
 )
 
 from ..db import Database
+from .naming import camera_letter_sql, day_key_sql, gps_sibling_sql
 from .triage import TRIAGE_MAX_ATTEMPTS
 
 # INFO-level here is persisted to the app_log table by DBLogHandler (the
@@ -240,18 +241,27 @@ def reconcile(
     }
 
 
+# Compact single-channel names (``YYYYMMDDHHMMSS_NNNNNN.MP4``) carry no
+# event prefix or camera suffix; the sole lens is the GPS-bearing one.
+_COMPACT_FILENAME_RE = r"^\d{14}_\d+\.MP4$"
+
+
 def _camera_from_filename(filename: str) -> Optional[str]:
-    # Handles both ``…_0001F.MP4`` and ``…_0001PF.MP4`` /
-    # ``…_0001EF.MP4`` — the optional prefix letter encodes the
-    # event type (P=parking, E=event); the camera letter set
-    # comes from the registry.
+    # Handles ``…_0001F.MP4`` and ``…_0001PF.MP4`` / ``…_0001EF.MP4`` —
+    # the optional prefix letter encodes the event type (P=parking,
+    # E=event); the camera letter set comes from the registry. Compact
+    # suffix-less names default to the GPS-bearing lens.
     import re as _re
     m = _re.match(
         rf"^\d{{4}}_\d{{4}}_\d{{6}}_\d+[PE]?([{CAMERA_LETTERS}])\.MP4$",
         filename,
         _re.IGNORECASE,
     )
-    return m.group(1).upper() if m else None
+    if m:
+        return m.group(1).upper()
+    if _re.match(_COMPACT_FILENAME_RE, filename, _re.IGNORECASE):
+        return GPS_CAMERA_LETTER
+    return None
 
 
 def _event_from_filename(filename: str) -> Optional[str]:
@@ -261,41 +271,36 @@ def _event_from_filename(filename: str) -> Optional[str]:
         filename,
         _re.IGNORECASE,
     )
-    if not m:
-        return None
-    prefix = (m.group(1) or "").upper()
-    return {"P": "parking", "E": "event"}.get(prefix, "normal")
+    if m:
+        prefix = (m.group(1) or "").upper()
+        return {"P": "parking", "E": "event"}.get(prefix, "normal")
+    if _re.match(_COMPACT_FILENAME_RE, filename, _re.IGNORECASE):
+        return "normal"
+    return None
 
 
 # SQL expressions for deriving camera / event type straight
 # from the filename. Used for filtering so we don't depend on
 # historical rows having ``camera`` / ``event_type`` populated.
-# Filenames end in ``…NNNNN[PE]?[FRTI].MP4`` — the camera letter
-# is the character immediately before ``.MP4``, and the byte
-# before that is either a digit (normal) or P/E.
-_CAM_SQL = "upper(substr(filename, -5, 1))"
+# The camera letter comes from naming.camera_letter_sql (format-aware:
+# suffix-less compact names default to the GPS lens); for standard names
+# the byte before the letter is either a digit (normal) or P/E, and for
+# compact names it is always a digit — which the CASE consumers already
+# read as 'normal'.
+_CAM_SQL = camera_letter_sql()
 _EVT_PREFIX_SQL = "upper(substr(filename, -6, 1))"
 
 # Correlated match for a row's GPS-bearing sibling: ``f`` is the sibling
-# candidate, ``dq`` the row being tested. Same-capture lenses share the
-# filename's 16-char timestamp prefix (``YYYY_MMDD_HHMMSS``) but NOT
-# necessarily the sequence number (parking captures give each lens its own),
-# so the sibling is found by timestamp prefix + the registry's GPS letter —
-# never by rebuilding the front's filename from the sibling's stem. Written as
-# a range on ``f.filename`` so SQLite can use the UNIQUE filename index
-# ('~' sorts above every character used in recording names). Binds one
-# parameter: the GPS camera letter.
-GPS_SIBLING_SQL = (
-    "f.filename >= substr(dq.filename, 1, 16)"
-    " AND f.filename < substr(dq.filename, 1, 16) || '~'"
-    " AND upper(substr(f.filename, -5, 1)) = ?"
-)
+# candidate, ``dq`` the row being tested. See naming.gps_sibling_sql for the
+# pairing rule (timestamp-prefix range, format-aware GPS-lens test; binds no
+# parameters — the registry letter is interpolated).
+GPS_SIBLING_SQL = gps_sibling_sql()
 
 # GPS-sibling join + columns for the listing queries: exposes the sibling's
 # triage columns as ``sib_*`` so :func:`_gps_state` can imply a non-GPS lens's
-# badge. Binds one parameter (the GPS camera letter) in the ON clause. Assumes
-# one GPS-lens file per capture timestamp — the same uniqueness every pairing
-# consumer relies on (get_day, the triage gate, remote_day_clips).
+# badge. Binds no parameters. Assumes one GPS-lens file per capture
+# timestamp — the same uniqueness every pairing consumer relies on (get_day,
+# the triage gate, remote_day_clips).
 _SIB_COLS_SQL = (
     "f.id AS sib_id, f.triaged_at AS sib_triaged_at, "
     "f.gps_points AS sib_gps_points, f.triage_attempts AS sib_triage_attempts"
@@ -334,7 +339,6 @@ def next_pending(
             f"    AND f.triage_attempts < ?"
             " )"
         )
-        params.append(GPS_CAMERA_LETTER)
         params.append(TRIAGE_MAX_ATTEMPTS)
     sql += " ORDER BY dq.priority DESC, dq.enqueued_at ASC LIMIT 1"
     with db.conn() as c:
@@ -537,7 +541,7 @@ def list_page(
             ORDER BY {order}
             LIMIT ? OFFSET ?
             """,
-            [GPS_CAMERA_LETTER] + params + [per_page, (page - 1) * per_page],
+            params + [per_page, (page - 1) * per_page],
         ).fetchall()
     items = [dict(r) for r in rows]
     for d in items:
@@ -553,15 +557,11 @@ def list_page(
 
 
 def _day_expr() -> str:
-    """SQL expression for the YYYY-MM-DD day key derived from
-    the filename (``YYYY_MMDD_HHMMSS_NN<cam>.MP4``). Uses the
-    filename rather than ``recorded_at`` so grouping is
-    consistent even for rows missing a timestamp."""
-    return (
-        "substr(filename,1,4) || '-' || "
-        "substr(filename,6,2) || '-' || "
-        "substr(filename,8,2)"
-    )
+    """SQL expression for the YYYY-MM-DD day key derived from the filename
+    (format-aware — see naming.day_key_sql). Uses the filename rather than
+    ``recorded_at`` so grouping is consistent even for rows missing a
+    timestamp."""
+    return day_key_sql()
 
 
 _RO_SQL = "source_dir LIKE '%/RO/%'"
@@ -725,7 +725,7 @@ def list_day_items(
             {where}
             ORDER BY dq.filename DESC
             """,
-            [GPS_CAMERA_LETTER] + params,
+            params,
         ).fetchall()
     items = [dict(r) for r in rows]
     for d in items:
