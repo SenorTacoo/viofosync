@@ -44,6 +44,13 @@ const state = {
   archiveSelected: new Map(),  // pair_id → { ts, front, rear, tele, interior }
   archiveExpanded: new Set(),  // open archive day keys ("YYYY-MM-DD"); persists
                                // open days across in-app navigation (re-render)
+  archiveStale: false,         // a change event arrived while the archive was
+                               // hidden; reload the day list on next tab entry
+  journeyExpanded: new Set(),  // open journey/stop card keys ("date|kind|ts");
+                               // restores expansion across day-body re-renders
+  journeyMapViews: new Map(),  // card key → {center, zoom}; restores a map's
+                               // view across re-renders instead of re-running
+                               // the animated fitBounds (a visible zoom jump)
   map: null,
   routeLayer: null,
   ws: null,
@@ -312,7 +319,13 @@ function routeTo(hash) {
     }
   }
   if (tab === "archive") {
-    loadDays();
+    // Rebuild the day list only when something actually changed while the
+    // view was hidden (archiveStale, set by the WS handlers below) or it was
+    // never rendered. Skipping the reload preserves open days, expanded
+    // journey cards and their live Leaflet maps — switching to the timeline
+    // and back should feel instant, not re-fetch the world.
+    const days = document.getElementById("days");
+    if (state.archiveStale || !days.children.length) loadDays();
     refreshExportJobs();
   }
   if (tab === "downloads") loadQueue();
@@ -350,10 +363,87 @@ function refreshArchiveOnIndexChange() {
   if (_archiveRefreshTimer) clearTimeout(_archiveRefreshTimer);
   _archiveRefreshTimer = setTimeout(() => {
     _archiveRefreshTimer = null;
-    if (document.getElementById("view-archive").hidden) return;
+    if (document.getElementById("view-archive").hidden) {
+      // Don't drop the event: remember the list is out of date so the
+      // next visit to the tab reloads it (routeTo checks this flag).
+      state.archiveStale = true;
+      return;
+    }
     if (document.querySelector("#days .day .day-body:not([hidden])")) return;
     loadDays();
   }, 400);
+}
+
+// ---- FLIP animation for day-body re-renders --------------------------
+// A day-body refresh (skip, download-next, WS queue_changed) rebuilds its
+// DOM, which reads as an abrupt snap: tiles vanish and neighbours teleport.
+// FLIP smooths it: capture each keyed element's position before the swap,
+// then animate survivors from their old position to the new one; elements
+// that only exist in the new DOM fade in. Keys live in data-flip-key
+// (clip pairs, journey/stop/ungrouped cards). Positions are stored relative
+// to the day body so a page-scroll shift between capture and play can't
+// skew the deltas. Disabled under prefers-reduced-motion.
+const _REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)");
+const FLIP_MS = 220;
+
+function flipCapture(body) {
+  if (_REDUCED_MOTION.matches) return null;
+  const ref = body.getBoundingClientRect();
+  const rects = new Map();
+  for (const el of body.querySelectorAll("[data-flip-key]")) {
+    const r = el.getBoundingClientRect();
+    rects.set(el.dataset.flipKey,
+      { x: r.left - ref.left, y: r.top - ref.top });
+  }
+  return rects.size ? rects : null;   // null = first render, nothing to play
+}
+
+function flipPlay(body, prev) {
+  if (!prev) return;
+  const ref = body.getBoundingClientRect();
+  for (const el of body.querySelectorAll("[data-flip-key]")) {
+    const r = el.getBoundingClientRect();
+    const was = prev.get(el.dataset.flipKey);
+    if (!was) {
+      // Newcomer (e.g. a clip that just finished downloading).
+      el.animate(
+        [{ opacity: 0, transform: "scale(0.97)" },
+         { opacity: 1, transform: "none" }],
+        { duration: FLIP_MS, easing: "ease-out" });
+      continue;
+    }
+    const dx = was.x - (r.left - ref.left);
+    const dy = was.y - (r.top - ref.top);
+    if (dx || dy) {
+      el.animate(
+        [{ transform: `translate(${dx}px, ${dy}px)` },
+         { transform: "none" }],
+        { duration: FLIP_MS, easing: "ease-in-out" });
+    }
+  }
+}
+
+// Fade the selected clip tiles out before an action that removes them from
+// the archive (skip, delete), so the removal reads as intentional rather
+// than a glitch. Resolves when the fade completes; the follow-up re-render
+// then FLIPs the surviving neighbours into the freed space.
+function animateOutSelectedPairs() {
+  if (_REDUCED_MOTION.matches) return Promise.resolve();
+  const anims = [];
+  for (const pairId of state.archiveSelected.keys()) {
+    document
+      .querySelectorAll(`.clip-pair[data-pair-id="${CSS.escape(pairId)}"]`)
+      .forEach((el) => {
+        anims.push(
+          el.animate(
+            [{ opacity: 1, transform: "none" },
+             { opacity: 0, transform: "scale(0.95)" }],
+            { duration: 160, easing: "ease-in", fill: "forwards" }
+          ).finished.catch(() => {})
+        );
+      });
+  }
+  return Promise.all(anims);
 }
 
 // Re-render any currently-open archive day so per-clip status icons reflect
@@ -371,7 +461,10 @@ function scheduleOpenArchiveRefresh() {
   if (_openDayRefreshTimer) clearTimeout(_openDayRefreshTimer);
   _openDayRefreshTimer = setTimeout(() => {
     _openDayRefreshTimer = null;
-    if (document.getElementById("view-archive").hidden) return;
+    if (document.getElementById("view-archive").hidden) {
+      state.archiveStale = true;   // reload on next tab entry instead
+      return;
+    }
     refreshOpenArchiveDays();
   }, 300);
 }
@@ -504,6 +597,7 @@ async function loadDays() {
 
   const data = await api("/api/archive/days?" + q);
   if (reqId !== state.daysRequestId) return; // superseded
+  state.archiveStale = false;                // rendering fresh data
   const container = document.getElementById("days");
   destroyJourneyMaps(container);
   container.innerHTML = "";
@@ -573,7 +667,10 @@ function renderDayCard(d) {
 // all populate the body the same way and mark it loaded for refreshDayCheck.
 async function loadDayBody(dayEl) {
   const body = dayEl.querySelector(".day-body");
-  body.innerHTML = "<p>Loading…</p>";
+  // Only show the placeholder on a body that has never rendered; a refresh
+  // of an already-populated day keeps the old content on screen until the
+  // new payload arrives (renderDayBody swaps it in one go).
+  if (!body.dataset.loaded) body.innerHTML = "<p>Loading…</p>";
   await renderDayBody(body, dayEl.dataset.day);
   body.dataset.loaded = "1";
   refreshDayCheck(dayEl);
@@ -635,6 +732,9 @@ async function renderDayBody(body, date) {
     return;
   }
 
+  // FLIP: snapshot keyed positions before the swap, animate after (below).
+  const flipPrev = flipCapture(body);
+
   destroyJourneyMaps(body);
   body.innerHTML = "";
 
@@ -660,6 +760,7 @@ async function renderDayBody(body, date) {
       note.textContent = "No GPS data for this day.";
       body.appendChild(note);
     }
+    flipPlay(body, flipPrev);
     return;
   }
 
@@ -726,7 +827,7 @@ async function renderDayBody(body, date) {
     if (ev.kind === "journey") {
       body.appendChild(renderJourneyCard(ev.data, ev.clips, ev.idx, date));
     } else {
-      body.appendChild(renderStopCard(ev.data, ev.clips, ev.idx));
+      body.appendChild(renderStopCard(ev.data, ev.clips, ev.idx, date));
     }
   }
 
@@ -734,10 +835,11 @@ async function renderDayBody(body, date) {
     // The Ungrouped pile isn't tied to a place, so it's hidden while filtering.
     if (!shown.length) body.appendChild(renderNoLocationActivity(locFilter));
   } else if (ungrouped.length) {
-    body.appendChild(renderUngroupedCard(ungrouped));
+    body.appendChild(renderUngroupedCard(ungrouped, date));
   }
 
   wireClipPairMapClicks(body);
+  flipPlay(body, flipPrev);
 }
 
 // Clicking anywhere on a clip-pair (except the thumbnail image,
@@ -827,7 +929,7 @@ function fmtEta(seconds) {
   return fmtDuration(seconds);
 }
 
-function renderStopCard(stop, clips, idx) {
+function renderStopCard(stop, clips, idx, date) {
   const startT = new Date(stop.start_time).toLocaleTimeString();
   const endT = new Date(stop.end_time).toLocaleTimeString();
   const hasClips = clips && clips.length > 0;
@@ -838,6 +940,7 @@ function renderStopCard(stop, clips, idx) {
   if (!hasClips) {
     const el = document.createElement("div");
     el.className = "stop-banner";
+    el.dataset.flipKey = `${date}|sb|${stop.start_ts}`;
     el.innerHTML = `
       <span class="stop-icon" aria-hidden="true">⏸</span>
       <span>Stopped for <strong>${fmtDuration(stop.duration_s)}</strong>
@@ -884,6 +987,8 @@ function renderStopCard(stop, clips, idx) {
   const grid = el.querySelector(".clip-grid");
   for (const pair of clips) grid.appendChild(renderClipPair(pair));
 
+  const cardKey = `${date}|s|${stop.start_ts}`;
+  el.dataset.flipKey = cardKey;
   let mapInited = false;
   const initMap = () => {
     if (mapInited) return;
@@ -903,18 +1008,27 @@ function renderStopCard(stop, clips, idx) {
     }).addTo(map).bindTooltip(
       `Parked ${fmtDuration(stop.duration_s)}`
     );
-    map.setView(center, 16);
+    // Restore the pre-re-render view (see the journey card's initMap for
+    // why the save listener is attached before the initial view is set).
+    map.on("moveend zoomend", () => {
+      state.journeyMapViews.set(cardKey,
+        { center: map.getCenter(), zoom: map.getZoom() });
+    });
+    const saved = state.journeyMapViews.get(cardKey);
+    if (saved) map.setView(saved.center, saved.zoom, { animate: false });
+    else map.setView(center, 16, { animate: false });
     mapDiv._journeyMap = { map };
   };
 
-  wireJourneyToggle(el, initMap);
+  wireJourneyToggle(el, initMap, cardKey);
   wireJourneyCheck(el);
   return el;
 }
 
-function renderUngroupedCard(clips) {
+function renderUngroupedCard(clips, date) {
   const el = document.createElement("div");
   el.className = "journey-card stop-card collapsible";
+  el.dataset.flipKey = `${date}|u`;
   el.innerHTML = `
     <div class="journey-header">
       <span class="caret">▸</span>
@@ -931,7 +1045,7 @@ function renderUngroupedCard(clips) {
   `;
   const grid = el.querySelector(".clip-grid");
   for (const pair of clips) grid.appendChild(renderClipPair(pair));
-  wireJourneyToggle(el, () => {});
+  wireJourneyToggle(el, () => {}, `${date}|u`);
   wireJourneyCheck(el);
   return el;
 }
@@ -1014,6 +1128,8 @@ function renderJourneyCard(j, clips, idx, date) {
   // Lazy Leaflet init: defer until the journey is first opened.
   // With many journeys per day this saves mounting a dozen maps
   // upfront.
+  const cardKey = `${date}|j|${j.start_ts}`;
+  el.dataset.flipKey = cardKey;
   let mapInited = false;
   const initMap = () => {
     if (mapInited) return;
@@ -1065,7 +1181,24 @@ function renderJourneyCard(j, clips, idx, date) {
       if (pairEl) flashClip(pairEl);
     });
 
-    map.fitBounds(line.getBounds(), { padding: [20, 20] });
+    // Restore the view a re-render tore down (day-body refresh after a
+    // queue action) — an animated re-fit reads as an unprompted zoom jump
+    // and loses the user's pan/zoom. Fresh cards fit the trace as before.
+    // The save listener is attached BEFORE the initial view is set:
+    // fitBounds fires moveend synchronously, and capturing that first fit
+    // is what lets an untouched map survive a re-render (otherwise the
+    // fallback re-fit runs against a not-yet-laid-out container and lands
+    // on a garbage zoom).
+    map.on("moveend zoomend", () => {
+      state.journeyMapViews.set(cardKey,
+        { center: map.getCenter(), zoom: map.getZoom() });
+    });
+    const saved = state.journeyMapViews.get(cardKey);
+    if (saved) {
+      map.setView(saved.center, saved.zoom, { animate: false });
+    } else {
+      map.fitBounds(line.getBounds(), { padding: [20, 20], animate: false });
+    }
 
     mapDiv._journeyMap = {
       map, coords, times, showPin,
@@ -1074,7 +1207,7 @@ function renderJourneyCard(j, clips, idx, date) {
     };
   };
 
-  wireJourneyToggle(el, initMap);
+  wireJourneyToggle(el, initMap, cardKey);
   wireJourneyCheck(el);
   const tlBtn = el.querySelector(".journey-open-tl");
   if (tlBtn) {
@@ -1090,13 +1223,14 @@ function renderJourneyCard(j, clips, idx, date) {
 // First expansion triggers Leaflet init; subsequent expansions
 // call invalidateSize() so the map re-measures after the body
 // goes from display:none back to visible.
-function wireJourneyToggle(el, initMap) {
+// ``key`` (optional) persists the expansion in state.journeyExpanded so a
+// day-body re-render (queue refresh, stale reload on tab return) restores
+// the card instead of collapsing it.
+function wireJourneyToggle(el, initMap, key) {
   const header = el.querySelector(".journey-header");
   const body = el.querySelector(".journey-body");
   const caret = el.querySelector(".caret");
-  header.addEventListener("click", (e) => {
-    if (e.target.closest("input, a, button")) return;
-    const opening = body.hidden;
+  const setOpen = (opening) => {
     body.hidden = !opening;
     caret.textContent = opening ? "▾" : "▸";
     if (opening) {
@@ -1108,7 +1242,25 @@ function wireJourneyToggle(el, initMap) {
         requestAnimationFrame(() => bundle.map.invalidateSize());
       }
     }
+  };
+  header.addEventListener("click", (e) => {
+    if (e.target.closest("input, a, button")) return;
+    const opening = body.hidden;
+    if (key) {
+      if (opening) state.journeyExpanded.add(key);
+      else state.journeyExpanded.delete(key);
+    }
+    setOpen(opening);
   });
+  // Restore an expansion remembered across re-renders. Unhide immediately
+  // (no visual pop-in), but defer the map init a frame: this runs while the
+  // card is still detached (the renderer hasn't appended it yet), and
+  // Leaflet reading a zero-size container computes a garbage zoom.
+  if (key && state.journeyExpanded.has(key)) {
+    body.hidden = false;
+    caret.textContent = "▾";
+    requestAnimationFrame(() => setOpen(true));
+  }
 }
 
 function nearestCoordIdx(coords, latlng) {
@@ -1198,6 +1350,7 @@ function renderClipPair(pair) {
   const el = document.createElement("div");
   el.className = "clip-pair";
   el.dataset.pairId = `${pair.timestamp}_${pair.sequence}`;
+  el.dataset.flipKey = `p|${el.dataset.pairId}`;
   el.dataset.ts = pair.timestamp;
   const time = new Date(pair.iso).toLocaleTimeString();
   const thumb = (c, cam) => {
@@ -1598,6 +1751,10 @@ const QUEUE_ENDPOINT = {
 
 async function runQueueAction(action, filenames) {
   try {
+    // Skipping removes the tiles from the archive — fade them out first so
+    // the removal reads as intentional; the re-render below then FLIPs the
+    // surviving neighbours into the freed space.
+    if (action === "skip") await animateOutSelectedPairs();
     let res;
     if (action === "retry") {
       // Retry also clears any user/geofence skip on the selection first.
@@ -1618,6 +1775,7 @@ async function runQueueAction(action, filenames) {
 
 async function runQueueDelete(filenames) {
   try {
+    await animateOutSelectedPairs();
     const res = await api("/api/queue/delete", { method: "POST", body: JSON.stringify({ filenames }) });
     toast(`Deleted ${res.deleted}, skipped ${res.skipped}`);
     clearSelection();
@@ -3131,8 +3289,10 @@ function handleEvent(ev) {
     case "gps_extract_done":
       // The Extract GPS toolbar button was removed; a force re-extract can
       // still be triggered via the API, so refresh the open archive when one
-      // finishes.
-      if (!document.getElementById("view-archive").hidden) {
+      // finishes (or mark it stale for the next visit).
+      if (document.getElementById("view-archive").hidden) {
+        state.archiveStale = true;
+      } else {
         loadDays();
       }
       break;
