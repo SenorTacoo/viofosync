@@ -284,20 +284,32 @@ def get_day(
         })
 
     # GPS Triage: only when enabled, append queued (not-downloaded) clips as
-    # placeholder pairs (respecting the same kind + time-range filters), skipping
-    # any (timestamp, event_type) already covered by a downloaded pair.
+    # placeholder pairs (respecting the same kind + time-range filters).
     # remote_day_clips only returns clips with a known GPS trace, so track-less
     # footage never snaps onto a journey — it stays in the Queue tab until
-    # downloaded. With triage off, the day view shows downloaded clips only.
+    # downloaded. When a (timestamp, event_type) is already covered by a
+    # downloaded pair, the remote pair's slots are merged into that pair's
+    # EMPTY slots (a half-downloaded capture: front done, rear still queued)
+    # rather than dropped — dropping would make the queued rear invisible and
+    # undownloadable from the archive. Occupied slots always win, so a
+    # downloaded clip never regresses to a ghost placeholder. With triage off,
+    # the day view shows downloaded clips only.
     if _settings(request).gps_triage:
         kind_ok = {"normal": driving, "parking": parking, "ro": ro}
-        have_keys = {(cl["timestamp"], cl["event_type"]) for cl in clips}
+        by_key = {(cl["timestamp"], cl["event_type"]): cl for cl in clips}
         for rc in remote_day_clips(_db(request), date):
             if not kind_ok.get(rc["event_type"], True):
                 continue
             if not _in_range(rc["timestamp"]):
                 continue
-            if (rc["timestamp"], rc["event_type"]) in have_keys:
+            have = by_key.get((rc["timestamp"], rc["event_type"]))
+            if have is not None:
+                for s in slots:
+                    if have[s] is None and rc[s] is not None:
+                        have[s] = rc[s]
+                have["locked"] = 1 if any(
+                    have[s] and have[s].get("locked") for s in slots
+                ) else 0
                 continue
             clips.append(rc)
         clips.sort(key=lambda cl: cl["timestamp"], reverse=True)
@@ -322,9 +334,9 @@ def remote_day_summaries(db, date_from=None, date_to=None) -> list[dict]:
         # map, so they must not be counted into the archive grid either — they'd
         # otherwise snap onto a journey. They stay visible in the Queue tab.
         "state IN ('pending','failed','downloading')",
-        "upper(substr(filename, -5, 1)) = 'F'",
+        "upper(substr(filename, -5, 1)) = ?",
     ]
-    params: list = []
+    params: list = [GPS_CAMERA_LETTER]
     if date_from:
         where.append(f"{day} >= ?")
         params.append(date_from)
@@ -358,9 +370,9 @@ def geofence_skipped_by_day(db, date_from=None, date_to=None) -> dict[str, int]:
     where = [
         "state = 'skipped'",
         "skip_reason = 'geofence'",
-        "upper(substr(filename, -5, 1)) = 'F'",
+        "upper(substr(filename, -5, 1)) = ?",
     ]
-    params: list = []
+    params: list = [GPS_CAMERA_LETTER]
     if date_from:
         where.append(f"{day} >= ?")
         params.append(date_from)
@@ -381,26 +393,37 @@ def remote_day_clips(db, date: str) -> list[dict]:
     remote. Mirrors get_day's pair shape so the frontend renders them in the
     same grid/journey layout.
 
-    Only clips with a known GPS trace (``triaged_at IS NOT NULL AND
-    gps_points > 0``) are returned: the archive is journey-organised, so a clip
-    with no track has nowhere to sit and would land in "Ungrouped" (or snap onto
-    the wrong journey). Track-less queued clips (no GPS lock — e.g. garage
-    parking — or not yet triaged) stay in the Queue tab until they're
-    downloaded. This mirrors ``day_tracks.day_gpx_paths``' skeleton filter so a
-    grid tile always has a matching track on the journey map."""
+    Only captures with a known GPS trace are returned: the archive is
+    journey-organised, so a clip with no track has nowhere to sit and would
+    land in "Ungrouped" (or snap onto the wrong journey). Only the GPS-bearing
+    lens is ever triaged, so every lens qualifies via its GPS *sibling*
+    (``queue.GPS_SIBLING_SQL``: same timestamp prefix, GPS letter) — the
+    sibling's ``triaged_at``/``gps_points`` speak for the whole capture. The
+    sibling may already be downloaded (``done`` — its real sidecar carries the
+    trace) but not ``gone`` (skeleton swept, no trace left). Track-less
+    captures (no GPS lock — e.g. garage parking — or not yet triaged) and
+    orphan non-GPS clips stay in the Queue tab until they're downloaded. This
+    mirrors ``day_tracks.day_gpx_paths``' skeleton filter so a grid tile
+    always has a matching track on the journey map."""
     day = _queue_day_expr()
     with db.conn() as c:
         rows = c.execute(
             f"""
-            SELECT filename, source_dir, camera, event_type, recorded_at,
-                   triaged_at, gps_points, state, skip_reason, locked
-            FROM download_queue
-            WHERE state IN ('pending','failed','downloading')
-              AND triaged_at IS NOT NULL AND gps_points > 0
-              AND {day} = ?
-            ORDER BY recorded_at DESC, filename DESC
+            SELECT dq.filename, dq.source_dir, dq.camera, dq.event_type,
+                   dq.recorded_at, dq.triaged_at, dq.gps_points, dq.state,
+                   dq.skip_reason, dq.locked
+            FROM download_queue dq
+            WHERE dq.state IN ('pending','failed','downloading')
+              AND {day.replace('filename', 'dq.filename')} = ?
+              AND EXISTS (
+                SELECT 1 FROM download_queue f
+                WHERE {q.GPS_SIBLING_SQL}
+                  AND f.state <> 'gone'
+                  AND f.triaged_at IS NOT NULL AND f.gps_points > 0
+              )
+            ORDER BY dq.recorded_at DESC, dq.filename DESC
             """,
-            (date,),
+            (date, GPS_CAMERA_LETTER),
         ).fetchall()
 
     slots = [cam.channel for cam in CAMERAS]

@@ -2351,9 +2351,10 @@ const GPS_BADGE = {
 };
 function renderGpsBadge(it) {
   // GPS is a capture-level fact carried by one lens (the front). The server
-  // (driven by the camera registry) sets gps_state only on that lens and
-  // leaves it null on the others, so the badge shows on the GPS-bearing clip
-  // and the paired lenses stay blank — no camera logic needed here.
+  // (driven by the camera registry) derives gps_state from that lens's own
+  // triage columns and *implies* the same state onto its sibling lenses, so
+  // every clip of a capture shows the badge; only an orphan non-GPS clip
+  // (no front at its timestamp) stays blank — no camera logic needed here.
   if (!it.gps_state) return "";
   const b = GPS_BADGE[it.gps_state] || GPS_BADGE.pending;
   return `<span class="gps-badge ${b.cls}" title="${b.title}">${b.sym}</span>`;

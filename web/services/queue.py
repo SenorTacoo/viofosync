@@ -55,19 +55,33 @@ def _gps_state(d: dict) -> Optional[str]:
     'ok'      = GPS fetched (gps_points > 0)
     'none'    = triaged with no fix, OR gave up after MAX unreadable attempts
     'pending' = still awaiting triage
-    None      = not the GPS-bearing lens (rear/tele/interior) — GPS is carried
-                by the front clip, so only it shows an indicator
+    None      = non-GPS lens with no GPS sibling at its timestamp (orphan) —
+                there is no capture-level GPS fact to imply
+
+    GPS is a capture-level fact carried by one lens (the front): that row's
+    own triage columns speak for it, and the other lenses (rear/tele/interior,
+    which are never triaged themselves) *inherit* the state from their GPS
+    sibling's columns — selected as ``sib_*`` by the listing queries via
+    ``GPS_SIBLING_SQL``.
 
     Camera identity is taken from the filename via the registry, not the
     ``camera`` column, so historical rows with a NULL ``camera`` still resolve.
     """
-    if not is_gps_camera(_camera_from_filename(d.get("filename") or "")):
+    if is_gps_camera(_camera_from_filename(d.get("filename") or "")):
+        triaged_at = d.get("triaged_at")
+        gps_points = d.get("gps_points")
+        attempts = d.get("triage_attempts")
+    elif d.get("sib_id") is not None:
+        triaged_at = d.get("sib_triaged_at")
+        gps_points = d.get("sib_gps_points")
+        attempts = d.get("sib_triage_attempts")
+    else:
         return None
-    if (d.get("gps_points") or 0) > 0:
+    if (gps_points or 0) > 0:
         return "ok"
-    if d.get("triaged_at") is not None:
+    if triaged_at is not None:
         return "none"            # triaged, no GPS fix
-    if (d.get("triage_attempts") or 0) >= TRIAGE_MAX_ATTEMPTS:
+    if (attempts or 0) >= TRIAGE_MAX_ATTEMPTS:
         return "none"            # gave up after MAX unreadable attempts
     return "pending"
 
@@ -262,6 +276,32 @@ def _event_from_filename(filename: str) -> Optional[str]:
 _CAM_SQL = "upper(substr(filename, -5, 1))"
 _EVT_PREFIX_SQL = "upper(substr(filename, -6, 1))"
 
+# Correlated match for a row's GPS-bearing sibling: ``f`` is the sibling
+# candidate, ``dq`` the row being tested. Same-capture lenses share the
+# filename's 16-char timestamp prefix (``YYYY_MMDD_HHMMSS``) but NOT
+# necessarily the sequence number (parking captures give each lens its own),
+# so the sibling is found by timestamp prefix + the registry's GPS letter —
+# never by rebuilding the front's filename from the sibling's stem. Written as
+# a range on ``f.filename`` so SQLite can use the UNIQUE filename index
+# ('~' sorts above every character used in recording names). Binds one
+# parameter: the GPS camera letter.
+GPS_SIBLING_SQL = (
+    "f.filename >= substr(dq.filename, 1, 16)"
+    " AND f.filename < substr(dq.filename, 1, 16) || '~'"
+    " AND upper(substr(f.filename, -5, 1)) = ?"
+)
+
+# GPS-sibling join + columns for the listing queries: exposes the sibling's
+# triage columns as ``sib_*`` so :func:`_gps_state` can imply a non-GPS lens's
+# badge. Binds one parameter (the GPS camera letter) in the ON clause. Assumes
+# one GPS-lens file per capture timestamp — the same uniqueness every pairing
+# consumer relies on (get_day, the triage gate, remote_day_clips).
+_SIB_COLS_SQL = (
+    "f.id AS sib_id, f.triaged_at AS sib_triaged_at, "
+    "f.gps_points AS sib_gps_points, f.triage_attempts AS sib_triage_attempts"
+)
+_SIB_JOIN_SQL = f"LEFT JOIN download_queue f ON {GPS_SIBLING_SQL}"
+
 
 def next_pending(
     db: Database, *, ro_only: bool = False, triage_gate: bool = False,
@@ -272,10 +312,11 @@ def next_pending(
     If ``triage_gate`` is set (GPS_TRIAGE on), a row is held back while its
     GPS-bearing sibling is still awaiting triage (``triaged_at IS NULL AND
     triage_attempts < TRIAGE_MAX_ATTEMPTS``) — so we never download a clip, or
-    its paired lenses, ahead of triage. The sibling is the same name with the
-    GPS-bearing camera letter (from the registry) at the camera position; that
-    lens is its own sibling, and an orphan non-GPS clip (no GPS sibling) is not
-    gated."""
+    its paired lenses, ahead of triage. The sibling is the GPS-bearing lens
+    (letter from the registry) sharing the filename's timestamp prefix — NOT
+    the full stem: same-capture lenses share the recording second but can carry
+    different sequence numbers (see ``GPS_SIBLING_SQL``). The GPS lens is its
+    own sibling, and an orphan non-GPS clip (no GPS sibling) is not gated."""
     sql = "SELECT dq.* FROM download_queue dq WHERE dq.state='pending'"
     params: List[object] = []
     if ro_only:
@@ -286,12 +327,11 @@ def next_pending(
     if triage_gate:
         sql += (
             " AND NOT EXISTS ("
-            "  SELECT 1 FROM download_queue f"
-            "  WHERE f.filename = substr(dq.filename, 1, length(dq.filename)-5)"
-            "                     || ? || substr(dq.filename, -4)"
-            "    AND f.state='pending'"
-            "    AND f.triaged_at IS NULL"
-            "    AND f.triage_attempts < ?"
+            f"  SELECT 1 FROM download_queue f"
+            f"  WHERE {GPS_SIBLING_SQL}"
+            f"    AND f.state='pending'"
+            f"    AND f.triaged_at IS NULL"
+            f"    AND f.triage_attempts < ?"
             " )"
         )
         params.append(GPS_CAMERA_LETTER)
@@ -488,14 +528,16 @@ def list_page(
                    CASE
                        WHEN dq.state = 'downloading' THEN 0
                        ELSE p.queue_position
-                   END AS queue_position
+                   END AS queue_position,
+                   {_SIB_COLS_SQL}
             FROM download_queue dq
             LEFT JOIN positions p ON dq.id = p.id
+            {_SIB_JOIN_SQL}
             {where.replace("filename", "dq.filename") if where else ""}
             ORDER BY {order}
             LIMIT ? OFFSET ?
             """,
-            params + [per_page, (page - 1) * per_page],
+            [GPS_CAMERA_LETTER] + params + [per_page, (page - 1) * per_page],
         ).fetchall()
     items = [dict(r) for r in rows]
     for d in items:
@@ -636,7 +678,7 @@ def list_day_items(
     download order (priority + enqueued_at) so the client can
     show "next up" cues independent of display order.
     """
-    day_expr = _day_expr()
+    day_expr = _day_expr().replace("filename", "dq.filename")
     clauses = [f"{day_expr} = ?"]
     params: List[object] = [day]
     if query:
@@ -675,13 +717,15 @@ def list_day_items(
                        WHEN 'E' THEN 'event'
                        ELSE 'normal'
                    END AS kind_event,
-                   CASE WHEN {ro_dq} THEN 1 ELSE 0 END AS kind_ro
+                   CASE WHEN {ro_dq} THEN 1 ELSE 0 END AS kind_ro,
+                   {_SIB_COLS_SQL}
             FROM download_queue dq
             LEFT JOIN positions p ON dq.id = p.id
+            {_SIB_JOIN_SQL}
             {where}
             ORDER BY dq.filename DESC
             """,
-            params,
+            [GPS_CAMERA_LETTER] + params,
         ).fetchall()
     items = [dict(r) for r in rows]
     for d in items:

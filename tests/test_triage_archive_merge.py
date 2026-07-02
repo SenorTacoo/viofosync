@@ -85,7 +85,10 @@ def test_day_includes_remote_clip_placeholder(tmp_path):
     db = Database(str(tmp_path / "v.db"))
     ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
     _seed_queue(db, "2026_0618_203643_0001F.MP4", camera="F", recorded_at=ts)
-    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts)
+    # Only the GPS-bearing lens is ever triaged — the rear row realistically
+    # keeps triaged_at NULL and must inherit its front sibling's triage.
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
     clips = archive.remote_day_clips(db, "2026-06-18")
     assert len(clips) == 1                      # F+R paired
     pair = clips[0]
@@ -271,6 +274,96 @@ def test_remote_day_summaries_excludes_skipped(tmp_path):
     rows = archive.remote_day_summaries(db, "2026-06-18", "2026-06-18")
     assert len(rows) == 1
     assert rows[0]["remote_count"] == 1   # only the pending clip counted
+
+
+# --- Sibling lenses inherit triage from the GPS-bearing clip ---
+
+
+def test_remote_day_clips_rear_hidden_when_front_has_no_gps(tmp_path):
+    """No trace on the front → the whole capture stays out of the archive
+    (it has no journey to sit on); the rear must not leak in either."""
+    db = Database(str(tmp_path / "v.db"))
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_queue(db, "2026_0618_203643_0001F.MP4", camera="F", recorded_at=ts,
+                gps_points=0)                        # triaged, no GPS fix
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+    assert archive.remote_day_clips(db, "2026-06-18") == []
+
+
+def test_remote_day_clips_orphan_rear_hidden(tmp_path):
+    """A rear with no GPS-bearing sibling at its timestamp has no trace to
+    inherit — it stays in the Queue tab (and is not gated from download)."""
+    db = Database(str(tmp_path / "v.db"))
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_queue(db, "2026_0618_203643_0009R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+    assert archive.remote_day_clips(db, "2026-06-18") == []
+
+
+def test_remote_day_clips_pairs_differing_sequences(tmp_path):
+    """Real captures can give each lens its own sequence number (observed on
+    parking clips: …_020753PF + …_020755PR); siblings share the timestamp."""
+    db = Database(str(tmp_path / "v.db"))
+    ts = int(_dt.datetime(2026, 5, 15, 2, 36, 53).timestamp())
+    _seed_queue(db, "2026_0515_023653_020753PF.MP4", camera="PF",
+                recorded_at=ts)
+    _seed_queue(db, "2026_0515_023653_020755PR.MP4", camera="PR",
+                recorded_at=ts, triaged=False, gps_points=None)
+    clips = archive.remote_day_clips(db, "2026-05-15")
+    assert len(clips) == 1
+    assert clips[0]["front"] is not None
+    assert clips[0]["rear"] is not None
+
+
+def test_remote_day_clips_rear_survives_front_download(tmp_path):
+    """Front already downloaded (state done; its real sidecar now carries the
+    trace) with the rear still pending: the rear placeholder must remain, or
+    it can never be downloaded from the archive screen."""
+    db = Database(str(tmp_path / "v.db"))
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_queue(db, "2026_0618_203643_0001F.MP4", camera="F", recorded_at=ts,
+                state="done")
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+    clips = archive.remote_day_clips(db, "2026-06-18")
+    assert len(clips) == 1
+    assert clips[0]["front"] is None            # done → not a placeholder
+    assert clips[0]["rear"]["state"] == "pending"
+
+
+def test_remote_day_clips_rear_hidden_when_front_gone(tmp_path):
+    """A front that rotated off the card untriaged leaves no trace source at
+    all (its skeleton is swept) — the rear must not surface as a placeholder."""
+    db = Database(str(tmp_path / "v.db"))
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_queue(db, "2026_0618_203643_0001F.MP4", camera="F", recorded_at=ts,
+                state="gone")
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+    assert archive.remote_day_clips(db, "2026-06-18") == []
+
+
+def test_get_day_merges_pending_rear_into_downloaded_pair(tmp_path):
+    """When the front of a capture is downloaded but the rear is still queued,
+    get_day must merge the rear placeholder into the downloaded pair's empty
+    slot instead of dropping it with the ghost-placeholder de-dup."""
+    db = Database(str(tmp_path / "v.db"))
+    day = "2026-06-18"
+    ts = int(_dt.datetime(2026, 6, 18, 20, 36, 43).timestamp())
+    _seed_clip(db, "2026_0618_203643_0001F.MP4", camera="F", day=day, ts=ts)
+    _seed_queue(db, "2026_0618_203643_0001F.MP4", camera="F", recorded_at=ts,
+                state="done")
+    _seed_queue(db, "2026_0618_203643_0002R.MP4", camera="R", recorded_at=ts,
+                triaged=False, gps_points=None)
+
+    kw = dict(time_from=None, time_to=None, driving=True, parking=True, ro=True)
+    out = archive.get_day(_req(db, gps_triage=True), day, **kw)
+    assert len(out["clips"]) == 1
+    pair = out["clips"][0]
+    assert pair["front"]["id"]                  # downloaded slot intact
+    assert pair["rear"]["remote"] is True       # queued rear merged in
+    assert pair["rear"]["state"] == "pending"
 
 
 # --- RO-7: locked flag in day payloads ---

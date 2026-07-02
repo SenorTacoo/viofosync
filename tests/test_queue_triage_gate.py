@@ -40,9 +40,8 @@ def test_rear_sibling_is_gated_with_front(tmp_path):
 
 
 def test_prefixed_parking_pair_is_gated_then_released(tmp_path):
-    # Parking/event prefixes (PF/PR) must reconstruct correctly: the gate's
-    # substr() rebuilds the GPS sibling as `…0001PF.MP4`, so the prefixed rear
-    # is held until the prefixed front is triaged.
+    # Parking/event prefixes (PF/PR) must not confuse the sibling match: the
+    # prefixed rear is held until the prefixed front is triaged.
     db = Database(str(tmp_path / "v.db"))
     _seed(db, "2026_0618_203643_0001PF.MP4")         # parking front, pending
     _seed(db, "2026_0618_203643_0001PR.MP4")         # parking rear of pair
@@ -52,6 +51,23 @@ def test_prefixed_parking_pair_is_gated_then_released(tmp_path):
         c.execute(
             "UPDATE download_queue SET triaged_at=? WHERE filename=?",
             (int(time.time()), "2026_0618_203643_0001PF.MP4"),
+        )
+    assert q.next_pending(db, triage_gate=True) is not None
+
+
+def test_differing_sequence_pair_is_gated_then_released(tmp_path):
+    # Real captures can give each lens its own sequence number (observed on
+    # parking clips: …_020753PF + …_020755PR) — siblings share the timestamp,
+    # not the full stem. The gate must pair by timestamp, not by rebuilding
+    # the front's filename from the rear's stem.
+    db = Database(str(tmp_path / "v.db"))
+    _seed(db, "2026_0515_023653_020753PF.MP4")       # front pending-triage
+    _seed(db, "2026_0515_023653_020755PR.MP4")       # rear, its own sequence
+    assert q.next_pending(db, triage_gate=True) is None
+    with db.write() as c:
+        c.execute(
+            "UPDATE download_queue SET triaged_at=? WHERE filename=?",
+            (int(time.time()), "2026_0515_023653_020753PF.MP4"),
         )
     assert q.next_pending(db, triage_gate=True) is not None
 
