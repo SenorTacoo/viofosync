@@ -390,6 +390,13 @@ class SyncWorker:
         self._geofence_task = asyncio.run_coroutine_threadsafe(
             self._geofence_loop(), self._loop
         )
+        # Report in immediately so the hub's sync_state (and the computed
+        # status badge) reflect the real running/paused state from the first
+        # snapshot. Without this, a running-but-idle worker never emits a
+        # sync_state until its first download, so compute_sync_status falls back
+        # to its "worker hasn't reported yet → paused" default — which made the
+        # toggle's first click pause for real (two clicks to resume).
+        self._broadcast_sync_state()
 
     def _is_running(self) -> bool:
         if self._task is None:
