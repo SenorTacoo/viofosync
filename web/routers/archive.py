@@ -512,6 +512,7 @@ def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
         route_cache.store(recordings, date, sig, payload)
 
     _apply_group_windows(db, date, payload)
+    _trim_stops_to_journeys(payload)
     _reframe_journeys(payload)
     _apply_completion(db, date, payload)
     payload.pop("points", None)  # server-only scratch; don't ship it to clients
@@ -595,6 +596,45 @@ def _apply_labels(payload: dict, geocoder, places=()) -> None:
         j["end_label"], j["end_home"], j["end_named"] = _lookup(j["end_lat"], j["end_lon"])
     for s in payload.get("stops", []):
         s["label"], s["home"], s["named"] = _lookup(s["lat"], s["lon"])
+
+
+def _trim_stops_to_journeys(payload: dict) -> None:
+    """Shrink each parking stop's window so it no longer overlaps an adjacent
+    journey's PADDED window (``group_start_ts``/``group_end_ts`` from
+    :func:`_apply_group_windows`). The padding claims the pull-away/pull-in
+    clips at a drive's edges, so the stop must not also advertise that time —
+    otherwise a card reads "stopped for 20 min" while its clips start a couple
+    minutes in (the arrival clips render on the drive). Run AFTER
+    ``_apply_group_windows``; mutates ``payload['stops']`` in place.
+
+    A stop entirely absorbed by journey padding (trimmed to a non-positive
+    span) is dropped: its clips, if any, belong to the flanking drive(s). The
+    displayed duration and ISO times are recomputed to match the trimmed
+    window, so the card and its clips agree."""
+    windows = [
+        (j.get("group_start_ts", j["start_ts"]),
+         j.get("group_end_ts", j["end_ts"]))
+        for j in payload.get("journeys", [])
+    ]
+    if not windows:
+        return
+    kept = []
+    for s in payload.get("stops", []):
+        ss0, se0 = s["start_ts"], s["end_ts"]
+        ss, se = ss0, se0
+        for gs, ge in windows:
+            if gs <= ss0 < ge:        # padded drive covers the stop's start
+                ss = max(ss, ge)
+            if gs < se0 <= ge:        # padded drive covers the stop's end
+                se = min(se, gs)
+        if ss >= se:                  # fully absorbed by the drive(s) — drop it
+            continue
+        if ss != ss0 or se != se0:
+            s["start_ts"], s["end_ts"] = ss, se
+            s["start_time"], s["end_time"] = _iso_utc(ss), _iso_utc(se)
+            s["duration_s"] = int(se - ss)
+        kept.append(s)
+    payload["stops"] = kept
 
 
 def _apply_group_windows(db, date: str, payload: dict) -> None:
