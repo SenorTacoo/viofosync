@@ -33,7 +33,7 @@ from viofosync_lib.cameras import (
 )
 
 from ..db import Database
-from .naming import camera_letter_sql, day_key_sql, gps_sibling_sql
+from .naming import camera_letter_sql, capture_key_sql, day_key_sql, gps_sibling_sql
 from .triage import TRIAGE_MAX_ATTEMPTS
 
 # INFO-level here is persisted to the app_log table by DBLogHandler (the
@@ -307,9 +307,18 @@ _SIB_COLS_SQL = (
 )
 _SIB_JOIN_SQL = f"LEFT JOIN download_queue f ON {GPS_SIBLING_SQL}"
 
+# The capture key of the newest non-gone queue row — the only capture that
+# can still be actively recording. Its lenses are held until remote_complete=1.
+_CAPTURE_KEY_SQL = capture_key_sql("dq.filename")
+_NEWEST_CAPTURE_SQL = (
+    "SELECT MAX(" + capture_key_sql("filename") + ") "
+    "FROM download_queue WHERE state <> 'gone'"
+)
+
 
 def next_pending(
     db: Database, *, ro_only: bool = False, triage_gate: bool = False,
+    active_guard: bool = False,
 ) -> Optional[QueueItem]:
     """Highest priority, oldest enqueue time. If ``ro_only`` is set, only
     consider rows whose source_dir is under /RO/.
@@ -321,7 +330,10 @@ def next_pending(
     (letter from the registry) sharing the filename's timestamp prefix — NOT
     the full stem: same-capture lenses share the recording second but can carry
     different sequence numbers (see ``GPS_SIBLING_SQL``). The GPS lens is its
-    own sibling, and an orphan non-GPS clip (no GPS sibling) is not gated."""
+    own sibling, and an orphan non-GPS clip (no GPS sibling) is not gated.
+    If ``active_guard`` is set, every lens of the newest capture group is held
+    until its ``remote_complete`` flag is set, since that capture may still be
+    recording."""
     sql = "SELECT dq.* FROM download_queue dq WHERE dq.state='pending'"
     params: List[object] = []
     if ro_only:
@@ -340,6 +352,11 @@ def next_pending(
             " )"
         )
         params.append(TRIAGE_MAX_ATTEMPTS)
+    if active_guard:
+        sql += (
+            f" AND NOT ({_CAPTURE_KEY_SQL} = ({_NEWEST_CAPTURE_SQL})"
+            f"          AND dq.remote_complete IS NULL)"
+        )
     sql += " ORDER BY dq.priority DESC, dq.enqueued_at ASC LIMIT 1"
     with db.conn() as c:
         row = c.execute(sql, params).fetchone()

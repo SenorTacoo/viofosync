@@ -30,17 +30,21 @@ from ._archive import (
     get_group_name,
 )
 from ._gpx import (
+    IncompleteRecording,
     extract_gps_data,
     generate_gpx,
+    has_final_moov,
     parse_moov,
 )
 from ._protocol import (
     DownloadCancelled,
+    DownloadDeferred,
     TruncatedRead,
     download_file,
     extract_remote_gps_points,
     get_dashcam_filenames,
     get_dashcam_filenames_html,
+    remote_moov_reachable,
 )
 from .progress import ProgressSink
 
@@ -105,6 +109,8 @@ def delete_dashcam_file(
 
 __all__ = [
     "DownloadCancelled",
+    "DownloadDeferred",
+    "IncompleteRecording",
     "TruncatedRead",
     "Recording",
     "ProgressSink",
@@ -120,5 +126,7 @@ __all__ = [
     "get_downloaded_recordings",
     "get_filepath",
     "get_group_name",
+    "has_final_moov",
     "parse_moov",
+    "remote_moov_reachable",
 ]

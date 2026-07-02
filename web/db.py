@@ -139,7 +139,8 @@ CREATE TABLE IF NOT EXISTS download_queue (
     geofence_released_at INTEGER,     -- set when a geofence-skip is manually released
     locked          INTEGER NOT NULL DEFAULT 0, -- user "retain indefinitely"
     triage_attempts INTEGER NOT NULL DEFAULT 0,  -- failed-triage retry counter
-    triage_last_attempt_at INTEGER               -- last triage attempt (backoff)
+    triage_last_attempt_at INTEGER,              -- last triage attempt (backoff)
+    remote_complete INTEGER                      -- 1 = finalized moov seen; NULL = unconfirmed
 );
 CREATE INDEX IF NOT EXISTS idx_queue_state
     ON download_queue(state, priority DESC, enqueued_at ASC);
@@ -290,6 +291,11 @@ class Database:
         # (dashcam-locked): a user pin that retention always honours.
         _add_column("clip_index", "locked", "INTEGER NOT NULL DEFAULT 0")
         _add_column("download_queue", "locked", "INTEGER NOT NULL DEFAULT 0")
+
+        # Active-recording guard: 1 once a finalized moov is confirmed on the
+        # camera; NULL = unconfirmed (newest capture may still be recording).
+        # One-way — finalization is irreversible, so it never needs clearing.
+        _add_column("download_queue", "remote_complete", "INTEGER")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:

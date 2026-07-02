@@ -15,6 +15,13 @@ import struct
 
 logger = logging.getLogger("viofosync_lib.gpx")
 
+
+class IncompleteRecording(Exception):
+    """A clip has no reachable top-level ``moov`` atom — the camera is still
+    recording it (or it was truncated). Raised by the remote GPS path so the
+    caller can defer the clip instead of caching a bogus "no GPS" result."""
+
+
 # GPS sanity bounds for the spike filter.
 GPS_MAX_REASONABLE_SPEED_MPS = 85.0
 GPS_OUTLIER_MIN_JUMP_M = 2000.0
@@ -293,6 +300,42 @@ def get_gps_atom(gps_atom_info, f):
         return None
 
     return get_gps_data(data[12:])
+
+
+def has_final_moov(in_fh) -> bool:
+    """True if a top-level ``moov`` atom is reachable by walking the atom
+    chain from the start.
+
+    WARNING — this does NOT prove a clip is finalized on current A229/A329
+    firmware. Field-verified 2026-07-02: these cameras write the ``moov`` at
+    the FRONT (``ftyp,skip,moov,skip,mdat``), inside a fixed ~65 KB reserved
+    region, and keep growing it in place while recording — so a
+    still-recording clip has a reachable, populated ``moov`` and this returns
+    True mid-recording. Use the camera's ``cmd=3014`` record flag
+    (``viofosync_lib._control.record_state``) to decide "is it still
+    recording?"; see the active-recording guard docs. What this function
+    genuinely tells you: a ``moov`` atom is present and walkable (still useful
+    for the GPS path — no ``moov`` means no GPS box to parse yet). A
+    short/garbage/zero-size header returns False (treat "can't confirm" as
+    not-final), as does a ``TruncatedRead`` from the reader."""
+    from ._protocol import TruncatedRead
+    try:
+        while True:
+            header = in_fh.read(8)
+            if len(header) < 8:
+                return False
+            atom_size, atom_type = get_atom_info(header)
+            if atom_type == 'moov':
+                return True
+            # size==1 (64-bit extended size) also lands here and returns
+            # False. Parity with parse_moov: these cameras don't emit 64-bit
+            # atoms (clips are well under 4 GB). See the "out of scope" note in
+            # docs/superpowers/specs/2026-07-02-active-recording-guard-design.md.
+            if atom_size < 8:            # zero/garbage/64-bit header — stop
+                return False
+            in_fh.seek(atom_size - 8, 1)  # skip this atom's payload
+    except TruncatedRead:
+        return False
 
 
 def parse_moov(in_fh):

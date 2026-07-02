@@ -42,11 +42,25 @@ class DownloadCancelled(Exception):
     """
 
 
+class DownloadDeferred(Exception):
+    """Raised when ``download_file`` aborts because the file is still being
+    recorded (the stream outgrew its expected size — the stale-size firmware
+    under-reports the active file). Like :class:`DownloadCancelled`, this is
+    NOT a failed attempt: the caller must requeue the item without burning a
+    retry, so the completeness guard can hold it until the segment finalizes."""
+
+
 class TruncatedRead(Exception):
     """A byte-range read returned fewer bytes than requested while not at
     EOF — the camera closed the body early. Distinct from a connection
     error: the camera *was* reachable, so the caller treats this as a
     clip-specific read failure, not a camera-offline condition."""
+
+
+class _StillRecording(Exception):
+    """Internal: the file grew past its expected size mid-download (active
+    recording). Caught in download_file and re-raised as the public
+    :class:`DownloadDeferred` so the caller refunds the attempt."""
 
 
 # Defaults used when download_file gets no per-call override.
@@ -412,6 +426,17 @@ def download_file(base_url, recording, destination, group_name,
                             break
                         out.write(chunk)
                         bytes_done += len(chunk)
+                        # Defense-in-depth for the stale-size firmware: if the
+                        # stream outgrows the expected size by more than the
+                        # MB-rounding slack, the file is still being recorded.
+                        # Abort and defer rather than loop on "Incomplete
+                        # download" (the camera under-reports the active file).
+                        if (expected_size is not None
+                                and bytes_done > expected_size + 2 * 1024 * 1024):
+                            raise _StillRecording(
+                                f"file still growing: streamed "
+                                f"{bytes_done} > expected {expected_size}"
+                            )
                         if sink is not None:
                             now = time.perf_counter()
                             if now - last_emit >= 0.25:
@@ -434,6 +459,14 @@ def download_file(base_url, recording, destination, group_name,
                     f"Download of {recording.filename} cancelled"
                 )
                 raise
+            except _StillRecording as e:
+                logger.info(f"Deferring {recording.filename}: {e}")
+                # Treat like a cancellation: no attempt burned, partial cleaned
+                # up by the finally. Propagate as the public DownloadDeferred so
+                # the caller requeues without penalty (a plain False return
+                # would be counted as a failed attempt). The completeness guard
+                # holds it until the segment finalizes.
+                raise DownloadDeferred(str(e)) from e
             except Exception as e:
                 if isinstance(e, OSError) and e.errno == errno.ENOSPC:
                     # Full disk: retrying can only fail the same way
@@ -610,11 +643,27 @@ def open_remote_reader(base_url, recording, *, timeout=None, head_len=65536):
 def extract_remote_gps_points(base_url, recording, *, timeout=None, head_len=65536):
     """Decode a remote clip's embedded GPS track without downloading it.
 
-    Returns the raw point dicts from :func:`parse_moov` (empty list if the
-    clip has no ``gps `` box or no fix). The caller turns these into a
-    spike-filtered GPX via the existing ``generate_gpx``."""
-    from ._gpx import parse_moov
+    Raises :class:`IncompleteRecording` if the clip has no reachable top-level
+    ``moov`` (still recording / truncated) — the caller must defer, not cache
+    a bogus empty track. A present ``moov`` with no ``gps `` box or no fix
+    returns ``[]`` (a real "no GPS" result)."""
+    from ._gpx import parse_moov, has_final_moov, IncompleteRecording
     reader = open_remote_reader(
         base_url, recording, timeout=timeout, head_len=head_len
     )
+    if not has_final_moov(reader):
+        raise IncompleteRecording(recording.filename)
+    reader.seek(0)
     return parse_moov(reader)
+
+
+def remote_moov_reachable(base_url, recording, *, timeout=None, head_len=65536):
+    """True if a finalized ``moov`` is reachable on the remote clip (proof the
+    segment has closed). Costs one HEAD + a few small range reads. Camera-
+    offline errors propagate so the caller can treat them as "unknown" rather
+    than "incomplete"."""
+    from ._gpx import has_final_moov
+    reader = open_remote_reader(
+        base_url, recording, timeout=timeout, head_len=head_len
+    )
+    return has_final_moov(reader)

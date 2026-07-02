@@ -11,14 +11,16 @@ from web.db import Database
 from web.services import triage
 
 
-def _seed(db, filename, *, camera, source="/DCIM/Movie", state="pending"):
+def _seed(db, filename, *, camera, source="/DCIM/Movie", state="pending",
+          remote_complete=1):
     now = int(time.time())
     with db.write() as c:
         c.execute(
             "INSERT INTO download_queue "
-            "(filename, source_dir, camera, event_type, state, enqueued_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (filename, source, camera, "normal", state, now),
+            "(filename, source_dir, camera, event_type, state, enqueued_at, "
+            " remote_complete) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (filename, source, camera, "normal", state, now, remote_complete),
         )
 
 

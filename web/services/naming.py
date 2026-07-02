@@ -195,6 +195,19 @@ def gps_sibling_sql(col: str = "f.filename") -> str:
     )
 
 
+def capture_key_sql(col: str = "filename") -> str:
+    """SQL: the clip's 14-digit ``YYYYMMDDHHMMSS`` capture key, normalized
+    across both filename layouts so ``MAX()`` and grouping are layout-safe
+    (raw prefixes don't collate — ``'_'`` sorts after ``'9'``). Same-capture
+    lenses share this key; sequence numbers do not affect it."""
+    return (
+        f"CASE WHEN substr({col}, 5, 1) = '_' "
+        f"THEN substr({col}, 1, 4) || substr({col}, 6, 2) "
+        f"     || substr({col}, 8, 2) || substr({col}, 11, 6) "
+        f"ELSE substr({col}, 1, 14) END"
+    )
+
+
 # --- Timeline camera channels -------------------------------------------
 
 # Channel keys/labels come straight from the registry; "other" is the

@@ -33,6 +33,7 @@ import urllib.request
 from typing import Optional
 
 import viofosync_lib as vfs
+from viofosync_lib import _control as control
 
 from ..db import Database
 from ..settings import SettingsProvider
@@ -43,6 +44,7 @@ from . import geofence as _geofence
 from . import locations as _locations
 from . import triage as _triage
 from .hub import Hub
+from .naming import capture_key_sql as _capture_key_sql
 
 log = logging.getLogger("viofosync.sync_worker")
 
@@ -307,6 +309,37 @@ class _ArgsShim:
     def __init__(self, use_html: bool, gps_extract: bool) -> None:
         self.html = use_html
         self.gps_extract = gps_extract
+
+
+def run_recording_status_release(db, *, recording_state) -> int:
+    """Release the newest capture group for triage + download when the camera
+    reports it is NOT recording.
+
+    ``recording_state`` is the camera's record flag: ``0`` stopped, ``1``
+    recording, ``None`` unknown (no/unsupported status command, camera
+    unreachable, or unparseable). Only an explicit ``0`` releases — it sets
+    ``remote_complete=1`` on every still-unconfirmed lens of the newest capture
+    group. ``1`` or ``None`` release nothing, so the newest segment stays held
+    by default; a later supersession (a newer capture appears, so the held one
+    is no longer ``MAX(capture_key)``) frees the previous one via
+    ``next_pending``'s guard. Returns the number of rows released.
+
+    Why not per-file: the record flag is camera-global, and on this firmware
+    every lens of the newest capture is the one being written, so the whole
+    newest group is released together. Belt-and-suspenders against a stopped
+    read landing mid-finalize: the download drain's outgrows-expected-size
+    abort still defers a clip that turns out to still be growing."""
+    if recording_state != 0:
+        return 0
+    with db.write() as c:
+        cur = c.execute(
+            "UPDATE download_queue SET remote_complete=1 "
+            "WHERE state IN ('pending','failed') AND remote_complete IS NULL "
+            "  AND " + _capture_key_sql("filename") + " = ("
+            "     SELECT MAX(" + _capture_key_sql("filename") + ") "
+            "     FROM download_queue WHERE state <> 'gone')"
+        )
+        return cur.rowcount
 
 
 class SyncWorker:
@@ -678,6 +711,22 @@ class SyncWorker:
             await self.hub.broadcast({"type": "triage_progress", "active": False})
         return triaged
 
+    async def _run_recording_status_pass(self) -> None:
+        """Release the newest capture group once the camera reports it is no
+        longer recording, so triage + the drain can pick it up. Runs
+        unconditionally each cycle. A camera with no/unknown record command
+        yields ``None`` and the newest capture stays held (safe default); a
+        newer segment later supersedes and frees it. See
+        docs/superpowers/specs/2026-07-02-active-recording-guard-design.md."""
+        if not self._active_address:
+            return
+        state = await asyncio.to_thread(
+            control.record_state, self._active_address
+        )
+        await asyncio.to_thread(
+            run_recording_status_release, self.db, recording_state=state,
+        )
+
     async def _run_geofence_pass(self, *, seen: dict | None = None) -> None:
         """Auto-skip queued clips dwelling in a location flagged for exclusion.
         Runs after the triage pass, on the periodic loop while triage fills in
@@ -862,6 +911,11 @@ class SyncWorker:
             })
             return False
 
+        # Release the newest capture for triage + the drain once the camera
+        # reports record=0; hold it otherwise (it may still be recording, and
+        # the camera lies about size). See _run_recording_status_pass.
+        await self._run_recording_status_pass()
+
         # Triage queued clips (if enabled) before downloading any, so the
         # journey view shows where clips were recorded first.
         triaged_n = await self._run_triage_pass()
@@ -896,6 +950,7 @@ class SyncWorker:
                 self.db,
                 ro_only=snap.sync_ro_only,
                 triage_gate=getattr(snap, "gps_triage", False),
+                active_guard=True,
             )
             if item is None:
                 break
@@ -1054,6 +1109,12 @@ class SyncWorker:
             except vfs.DownloadCancelled:
                 # Deliberate abort (pause/stop/unreachable): not a
                 # failure, so the caller must not burn an attempt.
+                return False, None, True, False
+            except vfs.DownloadDeferred:
+                # The file is still recording (stream outgrew its expected
+                # size). Like a cancellation: requeue without burning an
+                # attempt — the completeness guard holds it until it finalizes,
+                # so it must never exhaust max_attempts and get stuck 'failed'.
                 return False, None, True, False
             except OSError as e:
                 if e.errno == _errno.ENOSPC:

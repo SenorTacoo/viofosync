@@ -470,6 +470,25 @@ def _record_state(address: str) -> int | None:
     return None
 
 
+def record_state(address: str) -> int | None:
+    """Public, resilient record-flag read for the active-recording guard.
+
+    Returns ``1`` (recording) or ``0`` (stopped) from the camera's
+    ``cmd=3014`` dump (pair ``2001``); returns ``None`` for ANY uncertainty —
+    camera unreachable, ``cmd=3014`` unsupported, the ``2001`` pair absent from
+    this model's dump, or an unparseable response. Callers MUST treat ``None``
+    as "assume recording" and hold the newest capture, so cameras with
+    different or unknown command sets stay safe by default."""
+    try:
+        return _record_state(address)
+    except Exception:
+        # Deliberately broad: a malformed/garbage cmd=3014 response can raise
+        # beyond CameraUnreachable (e.g. ValueError from int() on a bad pair).
+        # Any uncertainty must degrade to None so the guard holds the newest
+        # capture — never narrow this to CameraUnreachable.
+        return None
+
+
 def _apply_and_verify(address: str, cmd: int, index: int):
     """Send ``cmd&par=index`` then poll cmd=3014 to confirm it applied.
 

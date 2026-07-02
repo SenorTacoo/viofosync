@@ -88,17 +88,20 @@ def test_importer_scan_item_defaults_front():
 
 
 def _seed(db, filename, *, state="pending", recorded_at=None,
-          triaged_at=None, gps_points=None, triage_attempts=0):
+          triaged_at=None, gps_points=None, triage_attempts=0,
+          remote_complete=1):
     now = int(time.time())
     with db.write() as c:
         c.execute(
             "INSERT INTO download_queue "
             "(filename, source_dir, camera, event_type, state, enqueued_at, "
-            " recorded_at, triaged_at, gps_points, triage_attempts) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " recorded_at, triaged_at, gps_points, triage_attempts, "
+            " remote_complete) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (filename, "/DCIM/Movie", q._camera_from_filename(filename),
              q._event_from_filename(filename), state, now,
-             recorded_at, triaged_at, gps_points, triage_attempts),
+             recorded_at, triaged_at, gps_points, triage_attempts,
+             remote_complete),
         )
 
 

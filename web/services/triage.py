@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import viofosync_lib as vfs
 
 from ..db import Database
-from .naming import gps_lens_sql
+from .naming import gps_lens_sql, capture_key_sql
 
 log = logging.getLogger("viofosync.triage")
 
@@ -129,6 +129,10 @@ def select_targets(
             f"FROM download_queue "
             f"WHERE state='pending' AND triaged_at IS NULL "
             f"AND {gps_lens_sql()} "
+            f"AND NOT ({capture_key_sql('filename')} = ("
+            f"     SELECT MAX({capture_key_sql('filename')}) "
+            f"     FROM download_queue WHERE state <> 'gone') "
+            f"  AND remote_complete IS NULL) "
             f"AND (recorded_at IS NULL OR ? - recorded_at >= "
             f"     (CASE WHEN event_type='parking' THEN ? ELSE ? END)) "
             f"AND triage_attempts < ? "
@@ -190,6 +194,36 @@ def triage_one(
     )
     try:
         points = vfs.extract_remote_gps_points(base_url, rec, timeout=timeout)
+    except vfs.IncompleteRecording:
+        # No finalized moov yet. If this is the unconfirmed newest capture it
+        # is still recording — defer without burning an attempt (attempts stay
+        # 0 so the backoff CASE rechecks in ~600 s and has_pending_targets
+        # stays quiet). An older clip with no moov is truncated-final: mark it
+        # no-GPS so its pair's download gate releases.
+        now = int(time.time())
+        with db.conn() as c:
+            newest = c.execute(
+                f"SELECT MAX({capture_key_sql('filename')}) FROM "
+                f"download_queue WHERE state <> 'gone'"
+            ).fetchone()[0]
+            key = c.execute(
+                f"SELECT {capture_key_sql('filename')} FROM download_queue "
+                f"WHERE id=?", (row["id"],)
+            ).fetchone()[0]
+        is_unconfirmed_newest = (key == newest and not row.get("remote_complete"))
+        with db.write() as c:
+            if is_unconfirmed_newest:
+                c.execute(
+                    "UPDATE download_queue SET triage_last_attempt_at=? "
+                    "WHERE id=?", (now, row["id"]),
+                )
+            else:
+                c.execute(
+                    "UPDATE download_queue SET triaged_at=?, gps_points=0 "
+                    "WHERE id=?", (now, row["id"]),
+                )
+        log.info("triage deferred (recording in progress) for %s", filename)
+        return -1
     except Exception as e:
         if _is_offline_error(e):
             # Camera unreachable (car drove away) — not the clip's fault.
