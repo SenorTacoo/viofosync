@@ -252,6 +252,12 @@ class Database:
         _add_column("export_jobs", "output_size", "INTEGER")
         _add_column("export_jobs", "output_duration_s", "REAL")
 
+        # GPS Triage: skeleton-track state for queued, not-yet-downloaded
+        # clips. triaged_at NULL = not triaged; gps_points NULL = not
+        # triaged, 0 = triaged but no fix (never retried), >0 = points found.
+        _add_column("download_queue", "triaged_at", "INTEGER")
+        _add_column("download_queue", "gps_points", "INTEGER")
+
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:
         """Yield a connection with row-factory set.

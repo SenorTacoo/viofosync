@@ -108,6 +108,21 @@ def prioritize(body: Prioritize, request: Request) -> dict:
     return {"ok": True, "updated": n}
 
 
+class DownloadNext(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+@router.post("/queue/download-next", dependencies=[Depends(require_csrf)])
+def download_next(body: DownloadNext, request: Request) -> dict:
+    n = q.download_next(request.app.state.db, body.filenames)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    # Kick the worker so the prioritized clips download right away.
+    worker = getattr(request.app.state, "sync_worker", None)
+    if worker is not None:
+        worker.kick()
+    return {"ok": True, "updated": n}
+
+
 class Retry(BaseModel):
     # Omit/empty to retry every failed file; otherwise retry just these.
     filenames: List[str] = Field(default_factory=list)

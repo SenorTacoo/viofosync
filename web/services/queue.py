@@ -723,6 +723,19 @@ def unskip(db: Database, filenames: List[str]) -> int:
         return cur.rowcount
 
 
+def download_next(db: Database, filenames: List[str]) -> int:
+    """Re-queue the given clips for immediate download: un-skip and retry any
+    that were skipped/failed (both → ``pending``), then bump all of them to the
+    top of the queue. Returns the number prioritized. ``done`` clips are
+    untouched (``prioritize`` only affects ``pending``). Order matters: the
+    state moves must run before ``prioritize`` so the rows are ``pending``."""
+    if not filenames:
+        return 0
+    unskip(db, filenames)
+    retry(db, filenames)
+    return prioritize(db, filenames, "top")
+
+
 def retry_failed(db: Database) -> int:
     """Move every queue item in state ``failed`` back to ``pending``,
     resetting attempts. Returns the count updated."""

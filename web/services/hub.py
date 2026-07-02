@@ -81,6 +81,9 @@ class Hub:
             # is "error".
             "sync_status": None,
             "sync_status_reason": None,
+            # GPS triage progress substate (see triage.py / sync_status.py).
+            # active=False when no pass is running.
+            "triage": {"active": False},
         }
 
     async def connect(self, ws: WebSocket) -> None:
@@ -154,6 +157,16 @@ class Hub:
             pct = event.get("pct")
             if isinstance(pct, (int, float)):
                 self.last_state["disk_pct"] = float(pct)
+        elif t == "triage_progress":
+            if event.get("active"):
+                self.last_state["triage"] = {
+                    "active": True,
+                    "triaged": event.get("triaged"),
+                    "total": event.get("total"),
+                    "eta_s": event.get("eta_s"),
+                }
+            else:
+                self.last_state["triage"] = {"active": False}
 
         # Feed the session tracker (reads the event; mutates the tracker).
         self._feed_session(t, event)

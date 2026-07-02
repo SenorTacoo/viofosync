@@ -1,0 +1,166 @@
+# tests/test_triage_sync_worker.py
+"""SyncWorker runs the triage pass only when GPS_TRIAGE is on."""
+from __future__ import annotations
+
+import time
+
+from web.db import Database
+from web.services.hub import Hub
+from web.services.sync_worker import SyncWorker
+
+
+class _Provider:
+    def __init__(self, snap):
+        self._snap = snap
+
+    def get(self):
+        return self._snap
+
+
+class _Snap:
+    def __init__(self, recordings, gps_triage):
+        self.recordings = recordings
+        self.gps_triage = gps_triage
+        self.timeout = 5.0
+
+
+def _seed(db, fn, camera="F"):
+    with db.write() as c:
+        c.execute(
+            "INSERT INTO download_queue "
+            "(filename, source_dir, camera, event_type, state, enqueued_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (fn, "/DCIM/Movie", camera, "normal", "pending", int(time.time())),
+        )
+
+
+async def test_pass_runs_when_enabled(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    _seed(db, "2026_0618_203643_0001F.MP4")
+    snap = _Snap(str(rec), gps_triage=True)
+    sw = SyncWorker(db, _Provider(snap), Hub())
+    sw._active_address = "1.2.3.4"
+
+    called = {"n": 0}
+    from web.services import triage
+    monkeypatch.setattr(
+        triage, "run_pass",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"triaged": 1},
+    )
+    await sw._run_triage_pass()
+    assert called["n"] == 1
+
+
+async def test_pass_skipped_when_disabled(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=False)
+    sw = SyncWorker(db, _Provider(snap), Hub())
+    sw._active_address = "1.2.3.4"
+    from web.services import triage
+    monkeypatch.setattr(
+        triage, "run_pass",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    await sw._run_triage_pass()   # no exception = skipped
+
+
+async def test_pass_skipped_when_no_active_address(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=True)   # enabled, but no address
+    sw = SyncWorker(db, _Provider(snap), Hub())
+    # _active_address defaults to None; do NOT set it.
+    from web.services import triage
+    monkeypatch.setattr(
+        triage, "run_pass",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    await sw._run_triage_pass()   # no exception = skipped at the address guard
+
+
+async def test_triage_pass_clears_stale_cancel(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=True)
+    sw = SyncWorker(db, _Provider(snap), Hub())
+    sw._active_address = "1.2.3.4"
+    sw._cancel_current.set()   # stale cancel left over from a prior pause/skip
+    from web.services import triage
+    monkeypatch.setattr(triage, "run_pass", lambda *a, **k: {"triaged": 0})
+    await sw._run_triage_pass()
+    assert not sw._cancel_current.is_set()   # pass cleared the stale flag
+
+
+async def test_triage_pass_emits_progress_and_always_clears(tmp_path, monkeypatch):
+    import asyncio
+
+    from web.services import triage as triage_module
+
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=True)
+    sw = SyncWorker(db, _Provider(snap), Hub())
+    sw._active_address = "1.2.3.4"
+    sw.bind_loop(asyncio.get_running_loop())
+
+    events = []
+
+    async def _bcast(ev):
+        events.append(ev)
+
+    def _sched(loop, ev):
+        events.append(ev)
+
+    monkeypatch.setattr(sw.hub, "broadcast", _bcast)
+    monkeypatch.setattr(sw.hub, "schedule_broadcast", _sched)
+
+    def _fake_run_pass(db_, base, recordings, *, timeout, cancel_check,
+                       progress_cb):
+        progress_cb(0, 5, None)      # start
+        progress_cb(5, 5, 0)         # progress
+        return {"triaged": 5, "with_gps": 5}
+
+    monkeypatch.setattr(triage_module, "run_pass", _fake_run_pass)
+
+    await sw._run_triage_pass()
+
+    tp = [e for e in events if e.get("type") == "triage_progress"]
+    assert any(e.get("active") is True for e in tp)        # start/progress fired
+    assert tp[-1] == {"type": "triage_progress", "active": False}  # always clears
+
+
+async def test_triage_pass_clears_even_on_error(tmp_path, monkeypatch):
+    import asyncio
+
+    from web.services import triage as triage_module
+
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=True)
+    sw = SyncWorker(db, _Provider(snap), Hub())
+    sw._active_address = "1.2.3.4"
+    sw.bind_loop(asyncio.get_running_loop())
+
+    events = []
+
+    async def _bcast(ev):           # hub.broadcast is a coroutine
+        events.append(ev)
+
+    monkeypatch.setattr(sw.hub, "broadcast", _bcast)
+    monkeypatch.setattr(sw.hub, "schedule_broadcast", lambda loop, ev: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("triage blew up")
+
+    monkeypatch.setattr(triage_module, "run_pass", _boom)
+
+    await sw._run_triage_pass()   # must not raise (except-guarded)
+    assert events[-1] == {"type": "triage_progress", "active": False}

@@ -36,6 +36,9 @@ class SettingsModel(BaseModel):
     GROUPING: Literal["none", "daily", "weekly", "monthly", "yearly"] = "daily"
     HTML: bool = True
     GPS_EXTRACT: bool = True
+    # Pre-download GPS triage: extract a skeleton track for queued clips so
+    # the journey view can show where they were recorded before downloading.
+    GPS_TRIAGE: bool = False
     DERIVE_THUMBS_EAGER: bool = True
     # Filmstrips are ~10-25x the ffmpeg work of a thumbnail, so eager
     # pre-generation is opt-in; off means they build on demand on first
@@ -161,6 +164,7 @@ class SettingsModel(BaseModel):
 # Public taxonomy used by the API + UI.
 EDITABLE_KEYS = {
     "ADDRESS", "ADDRESS_FALLBACK", "IMPORT_PATH", "GROUPING", "HTML", "GPS_EXTRACT",
+    "GPS_TRIAGE",
     "DERIVE_THUMBS_EAGER", "DERIVE_FILMSTRIPS_EAGER",
     "DELETE_AFTER_DOWNLOAD",
     "TIMEOUT", "DOWNLOAD_ATTEMPTS", "MAX_DOWNLOAD_ATTEMPTS", "SYNC_INTERVAL",

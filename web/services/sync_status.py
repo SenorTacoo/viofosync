@@ -1,6 +1,6 @@
-"""Single source of truth for the four-state sync status.
+"""Single source of truth for the sync status.
 
-State precedence (highest wins): error > paused > downloading > waiting.
+State precedence (highest wins): error > paused > triaging > downloading > waiting.
 
 Inputs come from ``hub.last_state`` (populated by the Hub.broadcast
 side-effects in ``hub.py``) and from the settings ``Snapshot``.
@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 
-STATES = ("downloading", "waiting", "paused", "error")
+STATES = ("triaging", "downloading", "waiting", "paused", "error")
 
 
 def compute_sync_status(hub, db, snapshot) -> Tuple[str, Optional[str]]:
@@ -66,6 +66,13 @@ def _compute(hub, snapshot) -> Tuple[str, Optional[str]]:
         return "paused", None
     if sync_state.get("paused"):
         return "paused", None
+
+    # ---- triaging ----
+    # GPS triage runs (running, not paused) before the download drain. Surface
+    # it as its own state so the UI doesn't read as "waiting"/stalled.
+    triage = last.get("triage")
+    if isinstance(triage, dict) and triage.get("active"):
+        return "triaging", None
 
     # ---- downloading ----
 

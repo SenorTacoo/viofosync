@@ -128,6 +128,14 @@ async def lifespan(app: FastAPI):
     except Exception:  # pragma: no cover — non-fatal
         log.exception("export orphan sweep failed")
 
+    # GPS Triage: drop skeleton sidecars orphaned by a crash (clip since
+    # downloaded / rotated off / row gone).
+    try:
+        from .services import triage as _triage_mod
+        _triage_mod.sweep_orphans(app.state.db, s.recordings)
+    except Exception:  # pragma: no cover — non-fatal
+        log.exception("triage startup sweep failed")
+
     log.info(
         "viofosync web UI ready on http://%s:%d", s.host, s.port
     )
@@ -277,6 +285,20 @@ async def lifespan(app: FastAPI):
 
     app.state.settings_unsubscribes.append(
         provider.subscribe(_on_derive_settings_changed)
+    )
+
+    def _on_triage_settings_changed(keys, snap) -> None:
+        # When GPS triage is turned off, drop the .triage skeleton cache and
+        # clear the triage columns so stale skeletons don't linger.
+        if "GPS_TRIAGE" in keys and not snap.gps_triage:
+            from .services import triage as _triage_mod
+            try:
+                _triage_mod.purge_all(app.state.db, snap.recordings)
+            except Exception:  # pragma: no cover — non-fatal
+                log.exception("triage purge on disable failed")
+
+    app.state.settings_unsubscribes.append(
+        provider.subscribe(_on_triage_settings_changed)
     )
 
     app.state.mqtt = MqttService(

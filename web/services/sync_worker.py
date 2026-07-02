@@ -39,6 +39,7 @@ from ..settings import SettingsProvider
 from . import queue as q
 from . import retention as _retention
 from . import scanner
+from . import triage as _triage
 from .hub import Hub
 
 log = logging.getLogger("viofosync.sync_worker")
@@ -605,6 +606,46 @@ class SyncWorker:
             except asyncio.TimeoutError:
                 pass
 
+    async def _run_triage_pass(self) -> None:
+        """Extract skeleton GPS tracks for queued clips (GPS_TRIAGE). Triages
+        the whole un-triaged backlog before the download drain so the journey
+        map is complete first; results are cached on the queue row, so
+        steady-state cost is only newly-listed clips."""
+        snap = self._provider.get()
+        if not getattr(snap, "gps_triage", False):
+            return
+        if not self._active_address:
+            return
+        # Clear any stale cancel from a prior pause/skip so a resumed cycle's
+        # triage pass isn't suppressed (the flag is otherwise only cleared by
+        # _download_one, which may not run if the queue has nothing to download).
+        self._cancel_current.clear()
+        base = f"http://{self._active_address}"
+
+        def _progress(triaged: int, total: int, eta_s) -> None:
+            # Called from the triage worker thread; schedule_broadcast hops back
+            # onto the loop thread-safely.
+            self.hub.schedule_broadcast(
+                self._loop,
+                {"type": "triage_progress", "active": True,
+                 "triaged": triaged, "total": total, "eta_s": eta_s},
+            )
+
+        try:
+            await asyncio.to_thread(
+                _triage.run_pass,
+                self.db, base, snap.recordings,
+                timeout=snap.timeout,
+                cancel_check=self._cancel_current.is_set,
+                progress_cb=_progress,
+            )
+        except Exception:  # pragma: no cover — never kill the cycle
+            log.exception("triage pass failed")
+        finally:
+            # Always clear the triaging substate (completion, pause-abort, or
+            # error) so the status never gets stuck on "triaging".
+            await self.hub.broadcast({"type": "triage_progress", "active": False})
+
     async def _run_retention_sweep(self) -> None:
         """Run one retention pass against the live settings, then
         refresh the broadcast disk %. Offloaded to a thread because
@@ -738,6 +779,10 @@ class SyncWorker:
                 "error": "listing failed",
             })
             return False
+
+        # Triage queued clips (if enabled) before downloading any, so the
+        # journey view shows where clips were recorded first.
+        await self._run_triage_pass()
 
         # Drain the queue. After each successful download the
         # loop re-checks ``next_pending`` so a priority update
@@ -894,6 +939,8 @@ class SyncWorker:
                                 "gpx extract failed for %s: %s",
                                 item.filename, e,
                             )
+                    # The real sidecar supersedes any triage skeleton.
+                    _triage.remove_skeleton(snap.recordings, item.filename)
                     _maybe_delete_from_dashcam(
                         item=item,
                         dest_path=dest_path,

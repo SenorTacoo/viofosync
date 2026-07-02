@@ -24,6 +24,7 @@ from ..auth import require_csrf, require_session
 from ..services import durations, filmstrip, route_cache, scanner, thumbs
 from ..services import tasks as _tasks
 from ..services import gps as gps_service
+from ..services import triage as triage_service
 from ..services.naming import (
     CAMERAS,
     CHANNEL_LABELS,
@@ -152,12 +153,37 @@ def list_days(
             params + [per_page, offset],
         ).fetchall()
 
-    return {
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "days": [dict(r) for r in rows],
-    }
+    days = [dict(r) for r in rows]
+    # GPS Triage: only fold in queued (not-downloaded) clips when triage is on.
+    # With triage off, the archive shows downloaded clips only — no placeholder
+    # tiles and no remote-only day cards.
+    if _settings(request).gps_triage:
+        # Annotate every page's days with a remote (queued) count, and on page 1
+        # fold in days that ONLY have queued clips (so brand-new footage gets a
+        # card to open). Page-1-only keeps remote-only days from repeating on
+        # every page; with the default newest-first sort they belong at the top.
+        # NOTE: remote-only days are injected/counted only on page 1, so `total`
+        # is page-1-inclusive only — the frontend must not derive an exact page
+        # count from it across pages. A fully paginated clip_index + queue union
+        # is deliberately out of scope (see the plan).
+        by_day = {d["day"]: d for d in days}
+        for rd in remote_day_summaries(_db(request), date_from, date_to):
+            d = by_day.get(rd["day"])
+            if d is not None:
+                d["remote_count"] = rd["remote_count"]
+                d["remote_gps_count"] = rd["remote_gps_count"]
+            elif page == 1:
+                days.append({
+                    "day": rd["day"], "clip_count": 0,
+                    "driving_count": 0, "parking_count": 0, "ro_count": 0,
+                    "gpx_count": 0, "first_ts": rd["first_ts"],
+                    "last_ts": rd["last_ts"], "total_bytes": 0,
+                    "remote_count": rd["remote_count"],
+                    "remote_gps_count": rd["remote_gps_count"],
+                })
+                total += 1
+        days.sort(key=lambda dd: dd["day"], reverse=(sort == "desc"))
+    return {"total": total, "page": page, "per_page": per_page, "days": days}
 
 
 @router.get("/day/{date}")
@@ -247,7 +273,122 @@ def get_day(
             **{s: pair[s] for s in slots},
         })
 
+    # GPS Triage: only when enabled, append queued (not-downloaded) clips as
+    # placeholder pairs (respecting the same kind + time-range filters), skipping
+    # any (timestamp, event_type) already covered by a downloaded pair. With
+    # triage off, the day view shows downloaded clips only — no GPS-less
+    # placeholder pairs snapping onto the nearest journey.
+    if _settings(request).gps_triage:
+        kind_ok = {"normal": driving, "parking": parking, "ro": ro}
+        have_keys = {(cl["timestamp"], cl["event_type"]) for cl in clips}
+        for rc in remote_day_clips(_db(request), date):
+            if not kind_ok.get(rc["event_type"], True):
+                continue
+            if not _in_range(rc["timestamp"]):
+                continue
+            if (rc["timestamp"], rc["event_type"]) in have_keys:
+                continue
+            clips.append(rc)
+        clips.sort(key=lambda cl: cl["timestamp"], reverse=True)
     return {"date": date, "clips": clips}
+
+
+def _queue_day_expr() -> str:
+    # YYYY-MM-DD from a Viofo filename (YYYY_MMDD_HHMMSS_...).
+    return (
+        "substr(filename,1,4) || '-' || substr(filename,6,2) "
+        "|| '-' || substr(filename,8,2)"
+    )
+
+
+def remote_day_summaries(db, date_from=None, date_to=None) -> list[dict]:
+    """Per-day counts of queued, not-yet-downloaded clips, so a day with no
+    downloaded clips still gets a card. Counts pairs by front clips only,
+    matching the archive's pair-oriented view."""
+    day = _queue_day_expr()
+    where = [
+        "state IN ('pending','failed','skipped','downloading')",
+        "upper(substr(filename, -5, 1)) = 'F'",
+    ]
+    params: list = []
+    if date_from:
+        where.append(f"{day} >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append(f"{day} <= ?")
+        params.append(date_to)
+    with db.conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT {day} AS day,
+                   COUNT(*) AS remote_count,
+                   SUM(CASE WHEN triaged_at IS NOT NULL AND gps_points > 0
+                            THEN 1 ELSE 0 END) AS remote_gps_count,
+                   MIN(recorded_at) AS first_ts,
+                   MAX(recorded_at) AS last_ts
+            FROM download_queue
+            WHERE {' AND '.join(where)}
+            GROUP BY {day}
+            """,
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def remote_day_clips(db, date: str) -> list[dict]:
+    """Queued, not-downloaded clips for a day, paired front+rear and flagged
+    remote. Mirrors get_day's pair shape so the frontend renders them in the
+    same grid/journey layout."""
+    day = _queue_day_expr()
+    with db.conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT filename, source_dir, camera, event_type, recorded_at,
+                   triaged_at, gps_points, state
+            FROM download_queue
+            WHERE state IN ('pending','failed','skipped','downloading') AND {day} = ?
+            ORDER BY recorded_at DESC, filename DESC
+            """,
+            (date,),
+        ).fetchall()
+
+    slots = [cam.channel for cam in CAMERAS]
+    pairs: dict = defaultdict(lambda: dict.fromkeys(slots))
+    for r in rows:
+        src = (r["source_dir"] or "").upper()
+        raw = r["event_type"] or "normal"
+        # Match scanner._event_type_for, which classifies downloaded clips as
+        # only 'ro' / 'parking' / 'normal' (impact 'event' clips collapse to
+        # 'normal'). Aligning here keeps get_day's (ts, event_type) de-dup key
+        # matching so a downloaded clip never leaves a ghost placeholder.
+        kind = "ro" if "/RO/" in src or src.endswith("/RO") else (
+            "parking" if raw == "parking" else "normal")
+        ts = r["recorded_at"] or 0
+        key = (ts, kind)
+        slot = pair_slot_of(r["camera"] or "")
+        if slot not in slots:
+            continue
+        pairs[key][slot] = {
+            "remote": True,
+            "filename": r["filename"],
+            "basename": r["filename"],
+            "camera": r["camera"],
+            "triaged": r["triaged_at"] is not None,
+            "gps_points": r["gps_points"] or 0,
+            "state": r["state"],
+        }
+
+    out = []
+    for (ts, kind), pair in sorted(pairs.items(), reverse=True):
+        out.append({
+            "remote": True,
+            "timestamp": ts,
+            "sequence": 0,
+            "event_type": kind,
+            "iso": _dt.datetime.fromtimestamp(ts).isoformat() if ts else "",
+            **{s: pair[s] for s in slots},
+        })
+    return out
 
 
 def build_route_payload(db, recordings, date: str, geocoder) -> dict:
@@ -274,6 +415,29 @@ def build_route_payload(db, recordings, date: str, geocoder) -> dict:
         ).fetchall()
 
     gpx_paths = [r["path"] + ".gpx" for r in rows]
+
+    # GPS Triage: add skeleton sidecars for clips queued on this day that
+    # aren't downloaded yet. De-dup against clip_index by basename so a stale
+    # skeleton for an already-downloaded clip never double-counts.
+    downloaded_names = {os.path.basename(r["path"]) for r in rows}
+    with db.conn() as c:
+        q_rows = c.execute(
+            """
+            SELECT filename FROM download_queue
+            WHERE state IN ('pending','failed')
+              AND triaged_at IS NOT NULL AND gps_points > 0
+              AND substr(filename,1,4) || '-' || substr(filename,6,2)
+                  || '-' || substr(filename,8,2) = ?
+            """,
+            (date,),
+        ).fetchall()
+    for qr in q_rows:
+        if qr["filename"] in downloaded_names:
+            continue
+        sk = triage_service.skeleton_path(recordings, qr["filename"])
+        if os.path.exists(sk):
+            gpx_paths.append(sk)
+
     sig = route_cache.signature(gpx_paths)
     payload = route_cache.load(recordings, date, sig)
     if payload is None:

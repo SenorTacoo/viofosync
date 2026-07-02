@@ -179,9 +179,14 @@ input[type="radio"] {
 /* Waiting: match the sync-status badge's amber so the button and badge
  * read as the same state. */
 .icon-btn.waiting { color: var(--warn); border-color: var(--warn); }
+.icon-btn.triaging { color: var(--accent); border-color: var(--accent); }
 /* When the syncing icon is the visible one, give it a gentle
  * continuous spin so the button reads as "in progress". */
 .icon-btn.active #sync-icon-sync:not([hidden]) {
+  animation: vfs-spin 1.6s linear infinite;
+  transform-origin: 50% 50%;
+}
+.icon-btn.triaging #sync-icon-sync:not([hidden]) {
   animation: vfs-spin 1.6s linear infinite;
   transform-origin: 50% 50%;
 }
@@ -309,6 +314,7 @@ nav a.active { background: var(--panel-2); }
  * dark/light themes stay coherent — extend the palette only if a
  * future revision adds new accent tokens. */
 .status.downloading { color: var(--ok); border-color: var(--ok); }
+.status.triaging    { color: var(--accent); border-color: var(--accent); }
 .status.waiting     { color: var(--warn); border-color: var(--warn); }
 .status.paused      { color: var(--err-text); border-color: var(--err); }
 .status.error {
@@ -636,16 +642,32 @@ main {
 /* Filenames are debug-y data; fade them and clip to one line.
  * Hover reveals the full string via the title attribute on the
  * label element (set in the renderer). */
-.clip-pair .label {
-  font-size: 10px;
-  color: var(--muted);
-  font-family: "SF Mono", "Menlo", monospace;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  opacity: 0.75;
+/* Per-clip filename labels are noise in the archive grid — the new
+ * Download Actions selection + journey context identify clips instead. */
+.clip-pair .label { display: none; }
+.clip-pair .thumb.remote {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 16 / 9;            /* match a real thumb's footprint */
+  background: repeating-linear-gradient(
+    45deg, var(--panel), var(--panel) 8px, var(--bg) 8px, var(--bg) 16px);
+  opacity: 0.85;
 }
-.clip-pair:hover .label { opacity: 1; }
+.clip-pair .thumb.remote .remote-badge {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 14px;
+  opacity: 0.8;
+}
+.clip-pair .thumb.remote .remote-badge svg { display: block; }
+.clip-pair .thumb.remote.state-pending     .remote-badge { color: var(--accent); }
+.clip-pair .thumb.remote.state-downloading .remote-badge { color: var(--accent); }
+.clip-pair .thumb.remote.state-failed      .remote-badge { color: var(--err); }
+.clip-pair .thumb.remote.state-skipped     .remote-badge { color: var(--muted); }
+.clip-pair .thumb.remote.state-skipped { opacity: 0.5; }
+.clip-pair .thumb.remote .remote-badge .spin { animation: vfs-spin 1.6s linear infinite; transform-origin: 50% 50%; }
 .clip-pair.flash {
   outline: 2px solid var(--accent);
   animation: flash-pulse 1.5s ease-out;
@@ -1670,6 +1692,7 @@ main {
     border: none;
   }
   .status.downloading { background: var(--ok); }
+  .status.triaging    { background: var(--accent); }
   .status.waiting     { background: var(--warn); }
   .status.paused      { background: var(--err); }
   .status.error       { background: #7f1d1d; }

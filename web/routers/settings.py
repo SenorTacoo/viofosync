@@ -38,6 +38,7 @@ def _editable_values(snap) -> dict[str, Any]:
         "GROUPING": snap.grouping,
         "HTML": snap.use_html_listing,
         "GPS_EXTRACT": snap.gps_extract,
+        "GPS_TRIAGE": snap.gps_triage,
         "DERIVE_THUMBS_EAGER": snap.derive_thumbs_eager,
         "DERIVE_FILMSTRIPS_EAGER": snap.derive_filmstrips_eager,
         "DELETE_AFTER_DOWNLOAD": snap.delete_after_download,

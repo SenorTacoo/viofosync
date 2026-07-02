@@ -49,6 +49,7 @@ const state = {
   ws: null,
   syncRunning: false,
   syncPaused: false,
+  triage: { active: false },   // GPS triage progress: {active, triaged, total, eta_s}
   currentFilename: null,
   // Mirrored from /api/settings on login + on Save so display
   // helpers (fmtDistance) don't need to read from settingsState
@@ -208,6 +209,26 @@ document.getElementById("sync-toggle").addEventListener("click", async () => {
   // updateSyncState here — the server-computed status is the truth.
 });
 
+// Format a seconds-remaining estimate for the triage badge.
+function fmtTriageEta(s) {
+  if (s == null || !isFinite(s) || s < 0) return "";
+  if (s < 60) return `~${Math.round(s)}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `~${m} min`;
+  const h = Math.floor(m / 60);
+  return `~${h}h ${m % 60}m`;
+}
+
+// Build the "Triaging GPS 40/876 · ~12 min left" badge text from state.triage.
+function triageBadgeText() {
+  const t = state.triage || {};
+  let s = "Triaging GPS";
+  if (t.total) s += ` ${t.triaged || 0}/${t.total}`;
+  const eta = fmtTriageEta(t.eta_s);
+  if (eta) s += ` · ${eta} left`;
+  return s;
+}
+
 // state.syncStatus is one of: "downloading", "waiting", "paused", "error", null
 // state.syncStatusReason is a short human-readable string (only set in error)
 function updateSyncState(status) {
@@ -228,6 +249,8 @@ function updateSyncState(status) {
   let show, title, klass;
   if (status === "downloading") {
     show = iconSync; title = "Pause downloading"; klass = "active";
+  } else if (status === "triaging") {
+    show = iconSync; title = "Pause"; klass = "triaging";
   } else if (status === "waiting") {
     show = iconSync; title = "Pause downloading"; klass = "waiting";
   } else if (status === "paused") {
@@ -249,7 +272,7 @@ function updateSyncState(status) {
   setVisible(iconPause, show === iconPause);
   setVisible(iconSync, show === iconSync);
   setVisible(iconWarn, show === iconWarn);
-  btn.classList.remove("active", "paused", "waiting", "error");
+  btn.classList.remove("active", "paused", "waiting", "error", "triaging");
   if (klass) btn.classList.add(klass);
   btn.title = title;
 }
@@ -331,6 +354,26 @@ function refreshArchiveOnIndexChange() {
     if (document.querySelector("#days .day .day-body:not([hidden])")) return;
     loadDays();
   }, 400);
+}
+
+// Re-render any currently-open archive day so per-clip status icons reflect
+// the latest queue state. Unlike refreshArchiveOnIndexChange (which skips open
+// days to avoid disrupting browsing), this targets the open day directly —
+// used after a Download Action and on queue_changed.
+let _openDayRefreshTimer = null;
+function refreshOpenArchiveDays() {
+  document.querySelectorAll("#days .day").forEach((dayEl) => {
+    const body = dayEl.querySelector(".day-body");
+    if (body && !body.hidden) renderDayBody(body, dayEl.dataset.day);
+  });
+}
+function scheduleOpenArchiveRefresh() {
+  if (_openDayRefreshTimer) clearTimeout(_openDayRefreshTimer);
+  _openDayRefreshTimer = setTimeout(() => {
+    _openDayRefreshTimer = null;
+    if (document.getElementById("view-archive").hidden) return;
+    refreshOpenArchiveDays();
+  }, 300);
 }
 
 // ---------- Archive ----------
@@ -482,7 +525,9 @@ function renderDayCard(d) {
             d.parking_count ? `${d.parking_count} parking` : null,
             d.ro_count ? `${d.ro_count} read-only` : null,
           ].filter(Boolean).map((s) => ` · ${s}`).join("")
-        } · ${fmtBytes(d.total_bytes)}${d.gpx_count ? " · GPS" : ""}
+        } · ${fmtBytes(d.total_bytes)}${d.gpx_count ? " · GPS" : ""}${
+          d.remote_count ? ` · ${d.remote_count} on camera` : ""
+        }
       </div>
     </div>
     <div class="day-body" ${open ? "" : "hidden"}></div>
@@ -987,20 +1032,44 @@ function flashClip(el) {
   });
 }
 
+// Small inline SVG status icons for not-yet-downloaded clips (no emoji).
+const TRIAGE_STATE_ICON = {
+  pending: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8M5 7l3 3 3-3M3 13h10"/></svg>',
+  downloading: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" class="spin"><path d="M8 2a6 6 0 1 1-6 6"/></svg>',
+  failed: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5 15 14H1zM8 6v3.5M8 11.5h.01"/></svg>',
+  skipped: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="6"/><path d="M4 4l8 8"/></svg>',
+};
+const TRIAGE_STATE_TITLE = {
+  pending: "Queued for download",
+  downloading: "Downloading",
+  failed: "Download failed",
+  skipped: "Skipped (excluded from download)",
+};
+
 function renderClipPair(pair) {
   const el = document.createElement("div");
   el.className = "clip-pair";
   el.dataset.pairId = `${pair.timestamp}_${pair.sequence}`;
   el.dataset.ts = pair.timestamp;
   const time = new Date(pair.iso).toLocaleTimeString();
-  const thumb = (c, cam) =>
-    c ? `<div class="thumb" data-camera="${cam}"
+  const thumb = (c, cam) => {
+    if (c && c.remote) {
+      const st = c.state || "pending";
+      const icon = TRIAGE_STATE_ICON[st] || TRIAGE_STATE_ICON.pending;
+      const title = TRIAGE_STATE_TITLE[st] || TRIAGE_STATE_TITLE.pending;
+      return `<div class="thumb remote state-${st}" data-camera="${cam}">
+        <div class="remote-badge" title="${title}">${icon}</div>
+        <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
+      </div>`;
+    }
+    return c ? `<div class="thumb" data-camera="${cam}"
                data-clip-id="${c.id}" data-ts="${pair.timestamp}">
         <img src="/api/archive/clip/${c.id}/thumb" data-id="${c.id}"
              alt="" loading="lazy" decoding="async" />
         <div class="film-scrub" aria-hidden="true"></div>
         <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
       </div>` : `<div class="thumb empty"><div class="label">—</div></div>`;
+  };
   // Kind badge: shown for parking / read-only pairs only. Driving
   // pairs are the common case so we leave them un-badged to keep
   // the grid quiet — absence of a chip reads as "driving".
@@ -1060,6 +1129,9 @@ function renderClipPair(pair) {
       };
       state.archiveSelected.set(pairId, {
         ts: Number(el.dataset.ts),
+        filenames: CAMERAS
+          .map((c) => pair[c.channel] && pair[c.channel].basename)
+          .filter(Boolean),
         ...Object.fromEntries(
           CAMERAS.map((c) => [c.channel, clipId(c.letter)]),
         ),
@@ -1083,6 +1155,7 @@ function renderClipPair(pair) {
 function setCardSelection(cardEl, select) {
   cardEl.querySelectorAll('.clip-pair input[type="checkbox"]')
     .forEach((cb) => {
+      if (cb.disabled) return;            // skip any explicitly-disabled checkbox
       if (cb.checked !== select) {
         cb.checked = select;
         // Reuse the per-clip change handler to update
@@ -1097,7 +1170,8 @@ function setCardSelection(cardEl, select) {
 function refreshCardCheck(cardEl) {
   const headerCb = cardEl.querySelector(".journey-check");
   if (!headerCb) return;
-  const pairs = cardEl.querySelectorAll('.clip-pair input[type="checkbox"]');
+  const pairs = cardEl.querySelectorAll(
+    '.clip-pair input[type="checkbox"]:not([disabled])');
   const total = pairs.length;
   if (total === 0) {
     headerCb.disabled = true;
@@ -1310,6 +1384,42 @@ for (const c of CAMERAS) {
 }
 document.getElementById("clear-selection")
   .addEventListener("click", clearSelection);
+
+const DOWNLOAD_ACTION_ENDPOINT = {
+  "download-next": "/api/queue/download-next",
+  "skip": "/api/queue/skip",
+  "clear-skip": "/api/queue/unskip",
+  "retry": "/api/queue/retry",
+};
+
+async function applyDownloadAction() {
+  const action = document.getElementById("download-action").value;
+  const endpoint = DOWNLOAD_ACTION_ENDPOINT[action];
+  if (!endpoint) return;
+  const filenames = [
+    ...new Set(
+      [...state.archiveSelected.values()].flatMap((v) => v.filenames || []),
+    ),
+  ];
+  if (!filenames.length) {
+    toast("Select some clips first.", { type: "error" });
+    return;
+  }
+  try {
+    const res = await api(endpoint, {
+      method: "POST",
+      body: JSON.stringify({ filenames }),
+    });
+    toast(`${action.replaceAll("-", " ")}: ${res.updated} updated`);
+    clearSelection();
+    refreshOpenArchiveDays();
+  } catch (e) {
+    toast(`Action failed: ${e.message || e}`, { type: "error" });
+  }
+}
+
+document.getElementById("download-action-apply")
+  .addEventListener("click", applyDownloadAction);
 
 async function refreshExportJobs() {
   try {
@@ -2600,6 +2710,7 @@ function handleEvent(ev) {
   const statusEl = document.getElementById("sync-status");
   const STATUS_LABEL = {
     downloading: "Downloading",
+    triaging: "Triaging GPS",
     waiting: "Waiting",
     paused: "Paused",
     error: "Error",
@@ -2613,6 +2724,8 @@ function handleEvent(ev) {
     let badgeText = STATUS_LABEL[status] || "";
     if (status === "error" && reason) {
       badgeText = "Error: " + reason;
+    } else if (status === "triaging") {
+      badgeText = triageBadgeText();
     }
     statusEl.textContent = badgeText;
     statusEl.className = "status " + (status || "");
@@ -2629,7 +2742,25 @@ function handleEvent(ev) {
       // on a timer.
       refreshArchiveOnIndexChange();
       break;
+    case "triage_progress":
+      state.triage = ev.active
+        ? { active: true, triaged: ev.triaged, total: ev.total, eta_s: ev.eta_s }
+        : { active: false };
+      if (ev.active) {
+        if (state.syncStatus === "triaging") {
+          document.getElementById("sync-status").textContent = triageBadgeText();
+        }
+        document.getElementById("current-download").textContent = triageBadgeText();
+        refreshArchiveOnIndexChange();
+      } else {
+        document.getElementById("current-download").textContent = "";
+        refreshArchiveOnIndexChange();
+      }
+      break;
     case "snapshot":
+      if (ev.state.triage) {
+        state.triage = ev.state.triage;
+      }
       if (ev.state.sync_status) {
         applyStatus(ev.state.sync_status, ev.state.sync_status_reason);
       }
@@ -2672,6 +2803,10 @@ function handleEvent(ev) {
       break;
     case "session_stats":
       updateSessionStats(ev);
+      break;
+    case "queue_changed":
+      refreshQueueIfVisible();
+      scheduleOpenArchiveRefresh();
       break;
     case "queue_reconciled":
     case "sync_done":
@@ -3089,6 +3224,15 @@ function renderSyncSection(pane) {
 
 function renderGpsSection(pane) {
   renderField(pane, "GPS_EXTRACT", "Extract GPX after each download", checkbox("GPS_EXTRACT"));
+  renderField(pane, "GPS_TRIAGE",
+              "GPS triage queued clips before download", checkbox("GPS_TRIAGE"));
+  const tnote = document.createElement("p");
+  tnote.className = "hint";
+  tnote.textContent =
+    "Reads each queued clip's GPS track straight off the camera (a few KB per " +
+    "clip) before downloading it, so the journey map shows where clips were " +
+    "recorded with placeholder thumbnails — letting you pick what to download.";
+  pane.appendChild(tnote);
   renderField(pane, "GEOCODE_ENABLED", "Reverse-geocode journey endpoints", checkbox("GEOCODE_ENABLED"));
   renderField(pane, "NOMINATIM_EMAIL", "Contact email for Nominatim (optional)",
               textInput("NOMINATIM_EMAIL"));

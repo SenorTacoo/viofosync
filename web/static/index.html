@@ -89,6 +89,15 @@
           <span class="filter-sep"></span>
           <button type="button" id="rescan">Rescan</button>
           <button type="button" id="extract-gps">Extract GPS</button>
+          <span class="filter-sep"></span>
+          <label class="kind-label" for="download-action">Download actions</label>
+          <select id="download-action">
+            <option value="download-next">Download next</option>
+            <option value="skip">Skip</option>
+            <option value="clear-skip">Clear skip</option>
+            <option value="retry">Retry failed</option>
+          </select>
+          <button type="button" id="download-action-apply">Apply</button>
         </div>
         <div id="archive-actions" class="archive-actions">
           <button type="button" id="exports-toggle" class="exports-toggle"

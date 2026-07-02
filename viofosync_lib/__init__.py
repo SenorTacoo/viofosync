@@ -37,6 +37,7 @@ from ._gpx import (
 from ._protocol import (
     DownloadCancelled,
     download_file,
+    extract_remote_gps_points,
     get_dashcam_filenames,
     get_dashcam_filenames_html,
 )
@@ -110,6 +111,7 @@ __all__ = [
     "download_file_with",
     "downloaded_filename_re",
     "extract_gps_data",
+    "extract_remote_gps_points",
     "generate_gpx",
     "get_dashcam_filenames",
     "get_dashcam_filenames_html",
