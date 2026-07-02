@@ -13,11 +13,14 @@ real per-clip sidecar written on download supersedes them.
 """
 from __future__ import annotations
 
+import http.client
 import logging
 import os
 import shutil
+import socket
 import threading
 import time
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
 import viofosync_lib as vfs
@@ -36,6 +39,37 @@ PROGRESS_EVERY = 20
 # read would otherwise block to timeout. The skipped clips stay un-triaged and
 # retry on the next cycle once the camera is back.
 ABORT_AFTER_FAILURES = 8
+
+# Give up triaging a single clip after this many *unreadable* read failures
+# (camera answered but the clip can't be decoded). Camera-offline failures
+# never count, so a car that drove away does not exhaust this budget.
+TRIAGE_MAX_ATTEMPTS = 5
+
+# Per-clip backoff between unreadable retries, indexed by prior attempt count
+# (1st retry waits steps[0], etc.). Mirrors the download backoff schedule.
+# IMPORTANT: these values are duplicated in the SQL CASE in select_targets —
+# update both together.
+_TRIAGE_BACKOFF_S = (10, 30, 120, 600)
+
+
+def _is_offline_error(exc: Exception) -> bool:
+    """True if the failure is a camera-unreachable condition (no completed
+    HTTP exchange) rather than a clip-specific read problem. An HTTPError
+    means the camera answered with a status, so it is NOT offline."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    # A mid-transfer short body (http.client.IncompleteRead, and our own
+    # TruncatedRead) is deliberately treated as *unreadable* (returns False
+    # here), not offline — the camera did respond, so crediting one attempt
+    # per mid-transfer drop is acceptable.
+    return isinstance(exc, (
+        urllib.error.URLError,
+        socket.timeout,
+        TimeoutError,
+        http.client.RemoteDisconnected,
+        ConnectionError,
+    ))
+
 
 # Don't triage a clip until its recording window has surely closed, or we read
 # a half-written file with no GPS yet and cache a wrong gps_points=0 that's
@@ -71,6 +105,10 @@ def select_targets(
     gps_points=0 that is never revisited (``triaged_at IS NULL`` prevents
     re-triage). NULL ``recorded_at`` bypasses the gate (legacy rows).
 
+    Clips at or past ``TRIAGE_MAX_ATTEMPTS`` unreadable failures are excluded
+    (they have given up); clips that failed recently wait out a per-attempt
+    backoff mirroring ``_TRIAGE_BACKOFF_S`` before they are selected again.
+
     ``limit=None`` (the default) returns the entire un-triaged backlog so one
     pass can triage everything before the download drain runs — otherwise the
     long drain starves triage and the journey map never fills in. SQLite
@@ -88,8 +126,13 @@ def select_targets(
             "AND upper(substr(filename, -5, 1)) = 'F' "
             "AND (recorded_at IS NULL OR ? - recorded_at >= "
             "     (CASE WHEN event_type='parking' THEN ? ELSE ? END)) "
+            "AND triage_attempts < ? "
+            "AND (triage_last_attempt_at IS NULL OR ? - triage_last_attempt_at "
+            "     >= (CASE triage_attempts WHEN 1 THEN 10 WHEN 2 THEN 30 "
+            "         WHEN 3 THEN 120 ELSE 600 END)) "
             "ORDER BY recorded_at DESC, id DESC LIMIT ?",
             (now, TRIAGE_SETTLE_PARKING_S, TRIAGE_SETTLE_S,
+             TRIAGE_MAX_ATTEMPTS, now,
              -1 if limit is None else limit),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -134,9 +177,23 @@ def triage_one(
     try:
         points = vfs.extract_remote_gps_points(base_url, rec, timeout=timeout)
     except Exception as e:
-        # A clip with no GPS lock / no index decodes to []; an actual I/O
-        # error is logged and the row stays untriaged for a later retry.
-        log.info("triage read failed for %s: %s", filename, e)
+        if _is_offline_error(e):
+            # Camera unreachable (car drove away) — not the clip's fault.
+            # Leave the row untriaged with no attempt bump; it retries
+            # whenever the camera returns.
+            log.info("triage skipped (camera offline) for %s: %s", filename, e)
+        else:
+            # Camera answered but the clip can't be triaged (HTTP error,
+            # corrupt/truncated data) — count toward the give-up cap.
+            now = int(time.time())
+            with db.write() as c:
+                c.execute(
+                    "UPDATE download_queue SET "
+                    "triage_attempts=triage_attempts+1, "
+                    "triage_last_attempt_at=? WHERE id=?",
+                    (now, row["id"]),
+                )
+            log.info("triage failed (clip unreadable) for %s: %s", filename, e)
         return -1
     if points:
         gpx = vfs.generate_gpx(points, os.path.basename(filename) + ".gpx")

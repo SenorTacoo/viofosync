@@ -2,7 +2,10 @@
 """Triage service: select F clips, write skeleton sidecars, track state."""
 from __future__ import annotations
 
+import http.client
+import socket
 import time
+import urllib.error
 
 from web.db import Database
 from web.services import triage
@@ -308,3 +311,113 @@ def test_select_targets_defers_in_progress_clips(tmp_path):
     assert "2026_0618_190000_0005F.MP4" in got    # null recorded_at, ungated
     assert "2026_0618_200000_0001F.MP4" not in got # in-progress normal
     assert "2026_0618_193000_0003F.MP4" not in got # in-progress parking
+
+
+def _attempts(db, fn):
+    with db.conn() as c:
+        return c.execute(
+            "SELECT triage_attempts, triaged_at, triage_last_attempt_at "
+            "FROM download_queue WHERE filename=?",
+            (fn,),
+        ).fetchone()
+
+
+def test_offline_failure_does_not_count(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "v.db"))
+    rec_dir = tmp_path / "rec"; rec_dir.mkdir()
+    fn = "2026_0618_203643_0001F.MP4"
+    _seed(db, fn, camera="F")
+
+    def boom(*a, **k):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(triage.vfs, "extract_remote_gps_points", boom)
+    row = triage.select_targets(db, limit=1)[0]
+    n = triage.triage_one(db, "http://cam", row, str(rec_dir), timeout=5.0)
+
+    assert n == -1
+    r = _attempts(db, fn)
+    assert r["triage_attempts"] == 0          # offline: not counted
+    assert r["triaged_at"] is None            # still un-triaged -> retries
+
+
+def test_unreadable_failure_counts(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "v.db"))
+    rec_dir = tmp_path / "rec"; rec_dir.mkdir()
+    fn = "2026_0618_203643_0001F.MP4"
+    _seed(db, fn, camera="F")
+
+    def http_err(*a, **k):
+        raise urllib.error.HTTPError("http://cam", 500, "boom", {}, None)
+
+    monkeypatch.setattr(triage.vfs, "extract_remote_gps_points", http_err)
+    row = triage.select_targets(db, limit=1)[0]
+    n = triage.triage_one(db, "http://cam", row, str(rec_dir), timeout=5.0)
+
+    assert n == -1
+    r = _attempts(db, fn)
+    assert r["triage_attempts"] == 1          # unreadable: counted
+    assert r["triaged_at"] is None            # not done; retries until cap
+    assert r["triage_last_attempt_at"] is not None
+
+
+def test_truncated_read_counts_as_unreadable(tmp_path, monkeypatch):
+    from viofosync_lib import TruncatedRead
+    db = Database(str(tmp_path / "v.db"))
+    rec_dir = tmp_path / "rec"; rec_dir.mkdir()
+    fn = "2026_0618_203643_0001F.MP4"
+    _seed(db, fn, camera="F")
+
+    def trunc(*a, **k):
+        raise TruncatedRead("short read")
+
+    monkeypatch.setattr(triage.vfs, "extract_remote_gps_points", trunc)
+    row = triage.select_targets(db, limit=1)[0]
+    triage.triage_one(db, "http://cam", row, str(rec_dir), timeout=5.0)
+    r = _attempts(db, fn)
+    assert r["triage_attempts"] == 1
+    assert r["triage_last_attempt_at"] is not None
+
+
+def test_select_skips_given_up_clip(tmp_path):
+    db = Database(str(tmp_path / "v.db"))
+    fn = "2026_0618_203643_0001F.MP4"
+    _seed(db, fn, camera="F")
+    with db.write() as c:
+        c.execute(
+            "UPDATE download_queue SET triage_attempts=? WHERE filename=?",
+            (triage.TRIAGE_MAX_ATTEMPTS, fn),
+        )
+    now = 1_900_000_000
+    assert triage.select_targets(db, limit=10, now=now) == []   # gave up -> excluded
+
+
+def test_select_max_minus_one_still_selectable(tmp_path):
+    db = Database(str(tmp_path / "v.db"))
+    fn = "2026_0618_203643_0001F.MP4"
+    _seed(db, fn, camera="F")
+    now = 1_900_000_000
+    with db.write() as c:
+        c.execute(
+            "UPDATE download_queue SET triage_attempts=?, "
+            "triage_last_attempt_at=? WHERE filename=?",
+            (triage.TRIAGE_MAX_ATTEMPTS - 1, now - 700, fn),  # past 600s backoff
+        )
+    assert len(triage.select_targets(db, limit=10, now=now)) == 1
+
+
+def test_select_respects_backoff(tmp_path):
+    db = Database(str(tmp_path / "v.db"))
+    fn = "2026_0618_203643_0001F.MP4"
+    _seed(db, fn, camera="F")
+    now = 1_900_000_000
+    # 1 failure -> 10s backoff. Last attempt 5s ago -> still backing off.
+    with db.write() as c:
+        c.execute(
+            "UPDATE download_queue SET triage_attempts=1, "
+            "triage_last_attempt_at=? WHERE filename=?",
+            (now - 5, fn),
+        )
+    assert triage.select_targets(db, limit=10, now=now) == []
+    # 15s later -> past the 10s window -> selectable again.
+    assert len(triage.select_targets(db, limit=10, now=now + 15)) == 1
