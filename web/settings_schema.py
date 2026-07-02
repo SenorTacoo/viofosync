@@ -22,6 +22,45 @@ _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _MQTT_NODE_ID_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
+class Location(BaseModel):
+    """A named place (e.g. "Home"). ``radius_m`` (metres) is used for the
+    geocode-label match and, when ``exclude_recordings`` is on, the geofence
+    dwell match. The stop cluster radius is 50 m, so raise the radius if a
+    genuine match is missed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = "Home"
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    radius_m: int = Field(default=30, ge=5, le=500)
+    exclude_recordings: bool = False
+    is_home: bool = False
+
+
+def normalize_locations(items: list[dict]) -> list[dict]:
+    """Enforce the 'exactly one Home' invariant on a LOCATIONS list of dicts.
+
+    - empty list -> unchanged (no Home)
+    - exactly one is_home True -> unchanged
+    - multiple is_home True -> keep the first in list order, clear the rest
+    - none is_home True and list non-empty -> promote the first element
+
+    Tolerates dicts missing the ``is_home`` key (treated as False). Returns a new
+    list of shallow-copied dicts; never mutates the input.
+    """
+    out = [dict(it) for it in items]
+    for it in out:
+        it.setdefault("is_home", False)
+    homes = [i for i, it in enumerate(out) if it["is_home"]]
+    if out and not homes:
+        out[0]["is_home"] = True
+    elif len(homes) > 1:
+        for i in homes[1:]:
+            out[i]["is_home"] = False
+    return out
+
+
 class SettingsModel(BaseModel):
     """Strict-typed view of every persisted setting."""
 
@@ -51,6 +90,11 @@ class SettingsModel(BaseModel):
     SYNC_INTERVAL: int = Field(default=600, ge=60, le=86400)
     ENABLE_SCHEDULED_SYNC: bool = True
     SYNC_RO_ONLY: bool = False
+    # Named locations (Home by default). Used to label journey/stop endpoints
+    # by name, and — for locations flagged exclude_recordings (with GPS_TRIAGE
+    # on) — to auto-skip clips that dwell there. Multiple locations are
+    # supported; exactly one is the designated Home (is_home).
+    LOCATIONS: list[Location] = Field(default_factory=list)
     RETENTION_MAX_DAYS: int = Field(default=0, ge=0, le=3650)
     RETENTION_DISK_PCT: int = Field(default=0, ge=0, le=99)
     RETENTION_PROTECT_RO: bool = True
@@ -170,7 +214,8 @@ EDITABLE_KEYS = {
     "TIMEOUT", "DOWNLOAD_ATTEMPTS", "MAX_DOWNLOAD_ATTEMPTS", "SYNC_INTERVAL",
     "ENABLE_SCHEDULED_SYNC", "WEB_HOST", "WEB_PORT", "EXPORT_ENCODER",
     "NOMINATIM_EMAIL", "GEOCODE_ENABLED",
-    "SYNC_RO_ONLY", "RETENTION_MAX_DAYS", "RETENTION_DISK_PCT",
+    "SYNC_RO_ONLY", "LOCATIONS",
+    "RETENTION_MAX_DAYS", "RETENTION_DISK_PCT",
     "RETENTION_PROTECT_RO", "RECORDINGS_QUOTA_GB", "DISK_CRITICAL_PCT",
     "DISTANCE_UNITS",
     "PIP_POSITION",
@@ -222,6 +267,12 @@ def validate_partial(patch: dict) -> dict:
     out: dict[str, Any] = {}
     for k in patch:
         out[k] = getattr(model, k)
+    # LOCATIONS coerces to a list of Location models; persist + echo them as
+    # plain dicts (normalised so exactly one is the Home).
+    if "LOCATIONS" in out:
+        out["LOCATIONS"] = normalize_locations(
+            [loc.model_dump() for loc in out["LOCATIONS"]]
+        )
     return out
 
 

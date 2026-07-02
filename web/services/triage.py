@@ -37,6 +37,20 @@ PROGRESS_EVERY = 20
 # retry on the next cycle once the camera is back.
 ABORT_AFTER_FAILURES = 8
 
+# Don't triage a clip until its recording window has surely closed, or we read
+# a half-written file with no GPS yet and cache a wrong gps_points=0 that's
+# never revisited. Parking clips are time-lapse (~30 real min observed); normal
+# and RO clips are <=60 s.
+TRIAGE_SETTLE_S = 120            # normal / RO: 60 s clip + margin
+TRIAGE_SETTLE_PARKING_S = 1860   # parking time-lapse window (~31 min)
+
+# States whose ``.triage`` skeleton must be kept on disk. This is the single
+# source of truth shared with the geofence detector (geofence._DETECT_STATES):
+# a skipped clip keeps its skeleton so re-evaluation still sees the full home
+# dwell. 'done'/'gone' clips are superseded by the real sidecar / never return,
+# so their skeletons are swept.
+SKELETON_KEEP_STATES = ("pending", "failed", "skipped", "downloading")
+
 
 def triage_dir(recordings: str) -> str:
     return os.path.join(recordings, ".triage")
@@ -46,8 +60,16 @@ def skeleton_path(recordings: str, filename: str) -> str:
     return os.path.join(triage_dir(recordings), filename + ".gpx")
 
 
-def select_targets(db: Database, *, limit: int | None = None) -> list[dict]:
-    """Pending front-camera rows not yet triaged, newest first.
+def select_targets(
+    db: Database, *, limit: int | None = None, now: int | None = None,
+) -> list[dict]:
+    """Pending front-camera rows not yet triaged and past their recording
+    settle window, newest first.
+
+    Clips are deferred until their recording window has surely closed so we
+    don't read a half-written file with no GPS yet and cache a wrong
+    gps_points=0 that is never revisited (``triaged_at IS NULL`` prevents
+    re-triage). NULL ``recorded_at`` bypasses the gate (legacy rows).
 
     ``limit=None`` (the default) returns the entire un-triaged backlog so one
     pass can triage everything before the download drain runs — otherwise the
@@ -56,14 +78,19 @@ def select_targets(db: Database, *, limit: int | None = None) -> list[dict]:
 
     Front (`F`) and rear (`R`) share one GPS track, so triaging F only halves
     the request count; the rear clip still shows as a placeholder tile."""
+    if now is None:
+        now = int(time.time())
     with db.conn() as c:
         rows = c.execute(
             "SELECT id, filename, source_dir, remote_size, recorded_at "
             "FROM download_queue "
             "WHERE state='pending' AND triaged_at IS NULL "
             "AND upper(substr(filename, -5, 1)) = 'F' "
+            "AND (recorded_at IS NULL OR ? - recorded_at >= "
+            "     (CASE WHEN event_type='parking' THEN ? ELSE ? END)) "
             "ORDER BY recorded_at DESC, id DESC LIMIT ?",
-            (-1 if limit is None else limit,),
+            (now, TRIAGE_SETTLE_PARKING_S, TRIAGE_SETTLE_S,
+             -1 if limit is None else limit),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -209,17 +236,20 @@ def remove_skeleton(recordings: str, filename: str) -> None:
 
 
 def sweep_orphans(db: Database, recordings: str) -> int:
-    """Remove skeleton sidecars whose queue row is no longer pending/failed
-    (downloaded, gone, or absent). Returns the number removed."""
+    """Remove skeleton sidecars whose queue row is no longer in a keep state
+    (downloaded, gone, skipped-but-released, or absent). Returns the number
+    removed."""
     d = triage_dir(recordings)
     if not os.path.isdir(d):
         return 0
     with db.conn() as c:
+        ph = ",".join("?" * len(SKELETON_KEEP_STATES))
         live = {
             r["filename"]
             for r in c.execute(
-                "SELECT filename FROM download_queue "
-                "WHERE state IN ('pending','failed','downloading')"
+                f"SELECT filename FROM download_queue "
+                f"WHERE state IN ({ph})",
+                SKELETON_KEEP_STATES,
             )
         }
     removed = 0

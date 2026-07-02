@@ -85,6 +85,13 @@
           <label class="kind-label" title="Skip Leaflet maps and journey detection for faster browsing">
             <input type="checkbox" id="f-show-maps" checked /> GPS Journey Splits
           </label>
+          <label class="kind-label loc-filter" id="f-location-wrap" hidden
+                 title="Show only journeys and stops to/from a named location">
+            <span>Location</span>
+            <select id="f-location">
+              <option value="">All locations</option>
+            </select>
+          </label>
           <div class="spacer"></div>
           <span class="filter-sep"></span>
           <button type="button" id="rescan">Rescan</button>

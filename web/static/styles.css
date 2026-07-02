@@ -343,6 +343,8 @@ main {
 }
 .archive-filters .spacer { flex: 1; }
 .archive-filters .kind-label { flex-direction: row; }
+.archive-filters .loc-filter { align-items: center; gap: 6px; }
+.archive-filters .loc-filter select { max-width: 170px; }
 
 .archive-actions {
   display: flex; align-items: center; gap: 8px;
@@ -667,6 +669,7 @@ main {
 .clip-pair .thumb.remote.state-failed      .remote-badge { color: var(--err); }
 .clip-pair .thumb.remote.state-skipped     .remote-badge { color: var(--muted); }
 .clip-pair .thumb.remote.state-skipped { opacity: 0.5; }
+.clip-pair .thumb.remote.geofence .remote-badge { color: var(--accent); }
 .clip-pair .thumb.remote .remote-badge .spin { animation: vfs-spin 1.6s linear infinite; transform-origin: 50% 50%; }
 .clip-pair.flash {
   outline: 2px solid var(--accent);
@@ -678,6 +681,11 @@ main {
 }
 
 #map { height: 340px; border-radius: 8px; margin: 16px 0; }
+.home-marker { color: var(--accent); display: block; }
+.home-marker-wrap { display: flex; align-items: center; justify-content: center; }
+.journey-title .start-label svg,
+.journey-title .end-label svg,
+.stop-label svg { vertical-align: -2px; margin-right: 3px; color: var(--accent); }
 
 .journey-table {
   width: 100%; border-collapse: collapse;
@@ -2440,4 +2448,58 @@ main {
 .switch:checked { background: var(--accent-45); border-color: var(--accent); }
 .switch:checked::before { transform: translateX(20px); background: var(--on-accent); }
 .switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* --- Named locations list (Settings → GPS) --- */
+.loc-list { margin: 8px 0 4px; }
+.loc {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 7px 0;
+  background: var(--panel);
+  overflow: hidden;
+}
+.loc.open { border-color: var(--accent); }
+.loc-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.loc-ico { color: var(--accent); display: inline-flex; }
+.loc-name { font-weight: 600; color: var(--text); }
+.loc-badge {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+}
+.loc-badge.home { color: var(--warn); border-color: var(--warn); }
+.loc-badge.excl { color: var(--accent); border-color: var(--accent-45); }
+.loc-meta {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.loc-caret { color: var(--muted); }
+.loc-editor {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+  background: var(--panel-2);
+}
+.loc-map { height: 220px; border-radius: 8px; margin: 0 0 10px; }
+.loc-actions { display: flex; gap: 8px; margin-top: 12px; }
+.loc-del-btn { margin-left: auto; color: var(--err-text); border-color: var(--err); }
+.loc-add {
+  width: 100%;
+  border: 1px dashed var(--border-hover);
+  border-radius: 8px;
+  padding: 11px;
+  margin-top: 9px;
+  background: transparent;
+  color: var(--muted);
+}
+.loc-add:hover { background: var(--panel-2); color: var(--text); }
+.loc-empty { margin: 8px 2px; }
 .switch:disabled { opacity: 0.5; cursor: default; }

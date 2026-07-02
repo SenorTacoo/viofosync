@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 from viofosync_lib.cameras import CAMERA_LETTERS
 
@@ -698,7 +698,7 @@ def skip(db: Database, filenames: List[str]) -> int:
     with db.write() as c:
         ph = ",".join("?" * len(filenames))
         cur = c.execute(
-            f"UPDATE download_queue SET state='skipped' "
+            f"UPDATE download_queue SET state='skipped', skip_reason='user' "
             f"WHERE filename IN ({ph}) "
             f"AND state IN ('pending', 'failed')",
             filenames,
@@ -716,11 +716,119 @@ def unskip(db: Database, filenames: List[str]) -> int:
         ph = ",".join("?" * len(filenames))
         cur = c.execute(
             f"UPDATE download_queue SET state='pending', "
-            f"attempts=0, last_error=NULL "
+            f"attempts=0, last_error=NULL, skip_reason=NULL, "
+            f"geofence_released_at=CASE WHEN skip_reason='geofence' "
+            f"  THEN ? ELSE geofence_released_at END "
             f"WHERE filename IN ({ph}) AND state='skipped'",
+            [int(time.time())] + filenames,
+        )
+        return cur.rowcount
+
+
+def geofence_skip(db: Database, filenames: List[str]) -> int:
+    """Auto-skip the given clips as parked-at-home: ``pending`` →
+    ``skipped``/``geofence``. Never touches non-pending rows or clips the user
+    has permanently released (``geofence_released_at`` set). Returns the count."""
+    if not filenames:
+        return 0
+    with db.write() as c:
+        ph = ",".join("?" * len(filenames))
+        cur = c.execute(
+            f"UPDATE download_queue SET state='skipped', skip_reason='geofence' "
+            f"WHERE filename IN ({ph}) AND state='pending' "
+            f"AND geofence_released_at IS NULL",
             filenames,
         )
         return cur.rowcount
+
+
+def unskip_geofence(db: Database) -> int:
+    """Reset every geofence auto-skipped clip back to ``pending`` so a fresh
+    sweep can re-evaluate it. Unlike :func:`unskip`, this deliberately does NOT
+    set ``geofence_released_at`` — we want the geofence to re-skip the genuine
+    home clips. Leaves user skips, user-released clips, and downloaded/other
+    rows untouched. Returns the count reset. Used by the maintenance flush."""
+    with db.write() as c:
+        cur = c.execute(
+            "UPDATE download_queue SET state='pending', "
+            "attempts=0, last_error=NULL, skip_reason=NULL "
+            "WHERE state='skipped' AND skip_reason='geofence' "
+            "AND geofence_released_at IS NULL"
+        )
+        return cur.rowcount
+
+
+def geofence_candidates(db: Database, day: str) -> List[dict]:
+    """Pending, time-stamped clips on ``day`` eligible for geofence auto-skip.
+
+    Excludes RO/locked clips and event recordings (the sparse, important
+    'something happened while parked' footage) and clips a user has
+    permanently released. Returns ``[{filename, recorded_at}, ...]``."""
+    day_expr = _day_expr()
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT filename, recorded_at FROM download_queue "
+            f"WHERE {day_expr} = ? AND state='pending' "
+            f"AND recorded_at IS NOT NULL "
+            f"AND geofence_released_at IS NULL "
+            # RO clips can be stored with or without a trailing slash
+            # (see next_pending); exclude both forms.
+            f"AND source_dir NOT LIKE '%/RO/%' AND source_dir NOT LIKE '%/RO' "
+            f"AND {_EVT_PREFIX_SQL} <> 'E'",
+            (day,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def geofence_day_signatures(db: Database, states: tuple) -> dict:
+    """Per-day count of clips that carry a GPS triage skeleton, across the
+    given queue ``states``. Monotonic as triage progresses (a skipped clip
+    stays counted), so an unchanged count means a day has no new detection
+    input — letting the geofence sweep skip re-parsing it.
+
+    Returns ``{ 'YYYY-MM-DD': count, ... }``."""
+    day_expr = _day_expr()
+    ph = ",".join("?" * len(states))
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT {day_expr} AS day, COUNT(*) AS n FROM download_queue "
+            f"WHERE state IN ({ph}) "
+            f"  AND triaged_at IS NOT NULL AND gps_points > 0 "
+            f"GROUP BY day",
+            tuple(states),
+        ).fetchall()
+    return {r["day"]: r["n"] for r in rows}
+
+
+def skip_listed_names(db: Database, names: Sequence[str]) -> set[str]:
+    """Subset of ``names`` whose download_queue row is currently ``state='skipped'``
+    (any ``skip_reason`` — geofence auto-skip or a user skip). Empty input → empty
+    set with no query. ``filename`` is UNIQUE-indexed, so the lookup is cheap.
+
+    Single source of truth for the manual-import skip gate: a clip the triage
+    geofence (or the user) marked skipped is not re-imported via browser upload."""
+    names = list(names)
+    if not names:
+        return set()
+    ph = ",".join("?" * len(names))
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT filename FROM download_queue "
+            f"WHERE state='skipped' AND filename IN ({ph})",
+            names,
+        ).fetchall()
+    return {r["filename"] for r in rows}
+
+
+def pending_days(db: Database) -> List[str]:
+    """Distinct YYYY-MM-DD day keys that currently have ``pending`` clips."""
+    day_expr = _day_expr()
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT DISTINCT {day_expr} AS day FROM download_queue "
+            f"WHERE state='pending'"
+        ).fetchall()
+    return [r["day"] for r in rows]
 
 
 def download_next(db: Database, filenames: List[str]) -> int:

@@ -17,6 +17,7 @@ import viofosync_lib as vfs
 
 from ..auth import require_csrf, require_session
 from ..services import exporter, importer
+from ..services import queue as _queue
 from ..services import retention as _retention
 
 log = logging.getLogger("viofosync.import")
@@ -87,12 +88,17 @@ def scan(request: Request, body: _PathBody) -> dict:
 
 @router.post("/present", dependencies=[Depends(require_csrf)])
 def present(request: Request, body: _FilesBody) -> dict:
-    """Report which clips already have a complete copy in the archive, so
-    the browser-upload tab can skip re-sending them. Size-matched: a
-    truncated archive copy is reported absent so the upload redoes it."""
+    """Report which clips the browser-upload tab should not send: clips already
+    in the archive (``present``, size-matched — a truncated copy is reported
+    absent so the upload redoes it) and clips currently marked ``skipped``
+    (``skipped`` — the triage geofence or the user excluded them). The browser
+    excludes the union of both from the upload batch."""
     snap = _snap(request)
     sizes = {f.name: f.size for f in body.files}
-    return {"present": sorted(importer.present_in_archive(snap, sizes))}
+    return {
+        "present": sorted(importer.present_in_archive(snap, sizes)),
+        "skipped": sorted(_queue.skip_listed_names(_db(request), list(sizes.keys()))),
+    }
 
 
 @router.post("/ingest", dependencies=[Depends(require_csrf)])
@@ -145,6 +151,14 @@ async def upload(request: Request) -> dict:
     dest = importer.dest_for(snap, item)
     if importer.has_complete_copy(dest, item.size_bytes):
         return {"status": "already_present", "filename": name}
+
+    # Honour the skip list: a clip the triage geofence (or the user) marked
+    # skipped is refused here, BEFORE make_room_for, so a clip we won't keep can
+    # never evict existing footage. The browser already drops these via /present;
+    # this is the server-side backstop. To force one in, unskip it in the Queue
+    # tab first (that clears the skipped state).
+    if _queue.skip_listed_names(db, [name]):
+        return {"status": "skipped", "filename": name}
 
     # Evict to fit BEFORE writing bytes (size known from the header).
     # Off the loop: in quota mode this walks the whole archive (and

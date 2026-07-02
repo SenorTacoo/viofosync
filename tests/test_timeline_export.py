@@ -181,6 +181,62 @@ async def test_run_timeline_no_front_footage_yields_silent_video(
     assert not any("apad" in tok for a in calls for tok in a)  # no mux
 
 
+async def test_run_timeline_probes_null_duration_clips(db, tmp_path, monkeypatch):
+    """A clip overlapping the selection but with a NULL ``duration_s`` (the
+    duration sweep hasn't caught up — e.g. just after a bulk import) must be
+    probed on demand, not silently treated as zero-length. Otherwise a valid
+    selection fails with 'no footage in selection'. The clip here also starts
+    *before* the window, so the candidate query must reach back for it."""
+    monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
+    # Front clip covers [1000, 1060) but its duration is not yet known.
+    _insert_clip(db, 1, 1000, "F", None, "/rec/f0.mp4")
+    snap = MagicMock()
+    snap.recordings = str(tmp_path)
+    provider = MagicMock()
+    provider.get.return_value = snap
+    worker = ExportWorker(db=db, provider=provider, broadcast=_noop)
+
+    async def fake_probe_duration(path):
+        return 60.0
+
+    monkeypatch.setattr(
+        "web.services.durations.probe_duration", fake_probe_duration,
+    )
+
+    calls = []
+
+    async def fake_run_ffmpeg(job_id, args, total, **kw):
+        calls.append(list(args))
+        Path(args[-1]).write_bytes(b"\0")
+        return 0, ""
+
+    async def fake_probe_res(path):
+        return (1920, 1080)
+
+    monkeypatch.setattr(worker, "_run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr(worker, "_probe_resolution", fake_probe_res)
+    finishes = []
+    monkeypatch.setattr(worker, "_finish",
+                        lambda jid, ok, err, out: finishes.append((ok, err, out)))
+
+    # Selection starts after the clip start, so the old query (which treats a
+    # NULL-duration clip as zero-length) would exclude the only footage.
+    segs = [{"channel": "front", "start_ts": 1030, "end_ts": 1050}]
+    import json as _json
+    job = {"id": 10, "type": "timeline",
+           "clip_ids": _json.dumps({"segments": segs, "encoder": "software"})}
+    await worker._run_job(job)
+
+    assert finishes and finishes[-1][0] is True, finishes
+    # The probed duration is persisted back to the index so the next export
+    # (and the rest of the app) sees it.
+    with db.conn() as c:
+        row = c.execute(
+            "SELECT duration_s FROM clip_index WHERE id=1"
+        ).fetchone()
+    assert row["duration_s"] == 60.0
+
+
 async def test_run_timeline_no_footage_fails(db, tmp_path, monkeypatch):
     monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
     snap = MagicMock()
@@ -198,6 +254,33 @@ async def test_run_timeline_no_footage_fails(db, tmp_path, monkeypatch):
                 "encoder": "software"})}
     await worker._run_job(job)
     assert finishes[-1][0] is False
+
+
+async def test_run_timeline_no_footage_logs_diagnostics(
+    db, tmp_path, monkeypatch, caplog,
+):
+    """The bare 'no footage' job error is unlogged, which is why a failing
+    timeline export leaves nothing in the logs. The failure path must emit a
+    diagnostic naming the window so it can be debugged in production."""
+    monkeypatch.setattr("web.services.exporter.ffmpeg_available", lambda: True)
+    snap = MagicMock()
+    snap.recordings = str(tmp_path)
+    provider = MagicMock()
+    provider.get.return_value = snap
+    worker = ExportWorker(db=db, provider=provider, broadcast=_noop)
+    monkeypatch.setattr(worker, "_finish", lambda *a: None)
+    import json as _json
+    job = {"id": 11, "type": "timeline",
+           "clip_ids": _json.dumps(
+               {"segments": [{"channel": "front", "start_ts": 1, "end_ts": 9}],
+                "encoder": "software"})}
+    import logging
+    with caplog.at_level(logging.WARNING, logger="viofosync.exporter"):
+        await worker._run_job(job)
+    assert any(
+        "no footage in selection" in rec.message and "candidate clip" in rec.message
+        for rec in caplog.records
+    ), caplog.records
 
 
 class _FakeMqttService:

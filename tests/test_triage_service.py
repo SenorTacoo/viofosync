@@ -242,6 +242,21 @@ def test_run_pass_reports_incremental_progress(tmp_path, monkeypatch):
     assert all(isinstance(c[2], int) for c in calls[1:])   # ETA computed after
 
 
+def test_sweep_orphans_keeps_skipped(tmp_path):
+    # A geofence-skipped clip must keep its skeleton: the detector re-reads
+    # skipped skeletons to keep seeing the full home dwell. Deleting it
+    # fragments the dwell and strands the dwell's edge clips.
+    db = Database(str(tmp_path / "v.db"))
+    rec_dir = tmp_path / "recordings"
+    (rec_dir / ".triage").mkdir(parents=True)
+    fn = "2026_0618_203643_0001F.MP4"
+    (rec_dir / ".triage" / (fn + ".gpx")).write_text("x")
+    _seed(db, fn, camera="F", state="skipped")
+    removed = triage.sweep_orphans(db, str(rec_dir))
+    assert removed == 0
+    assert (rec_dir / ".triage" / (fn + ".gpx")).exists()
+
+
 def test_run_pass_aborts_when_camera_drops(tmp_path, monkeypatch):
     """If reads keep failing (camera offline mid-pass), the breaker stops the
     pass early instead of timing out on every remaining clip."""
@@ -263,3 +278,33 @@ def test_run_pass_aborts_when_camera_drops(tmp_path, monkeypatch):
     # Aborted well before attempting all 30 (breaker trips at 8 consecutive,
     # plus at most a couple already in flight).
     assert attempts["n"] < 30
+
+
+def test_select_targets_defers_in_progress_clips(tmp_path):
+    db = Database(str(tmp_path / "v.db"))
+    now = 1_800_000_000
+    def seed(fn, *, recorded_at, event_type="normal"):
+        with db.write() as c:
+            c.execute(
+                "INSERT INTO download_queue "
+                "(filename, source_dir, camera, event_type, state, recorded_at, enqueued_at) "
+                "VALUES (?,?,?,?,?,?,0)",
+                (fn, "/DCIM/Movie", "F", event_type, "pending", recorded_at),
+            )
+    # normal clip recorded 90s ago -> still within the 120s settle -> deferred
+    seed("2026_0618_200000_0001F.MP4", recorded_at=now - 90, event_type="normal")
+    # normal clip recorded 5 min ago -> settled -> selected
+    seed("2026_0618_195000_0002F.MP4", recorded_at=now - 300, event_type="normal")
+    # parking clip recorded 10 min ago -> within 31-min parking settle -> deferred
+    seed("2026_0618_193000_0003F.MP4", recorded_at=now - 600, event_type="parking")
+    # parking clip recorded 40 min ago -> settled -> selected
+    seed("2026_0618_191000_0004F.MP4", recorded_at=now - 2400, event_type="parking")
+    # clip with NULL recorded_at -> not gated (selected)
+    seed("2026_0618_190000_0005F.MP4", recorded_at=None, event_type="normal")
+
+    got = {r["filename"] for r in triage.select_targets(db, now=now)}
+    assert "2026_0618_195000_0002F.MP4" in got   # settled normal
+    assert "2026_0618_191000_0004F.MP4" in got    # settled parking
+    assert "2026_0618_190000_0005F.MP4" in got    # null recorded_at, ungated
+    assert "2026_0618_200000_0001F.MP4" not in got # in-progress normal
+    assert "2026_0618_193000_0003F.MP4" not in got # in-progress parking

@@ -53,6 +53,7 @@ from .services.mqtt import MqttService
 from .services.sync_worker import SyncWorker
 from .services import derive_worker
 from .services.derive_worker import DeriveWorker
+from .services import locations as _locations
 from .setup_mode import SetupModeMiddleware
 
 log = logging.getLogger("viofosync.web")
@@ -72,6 +73,17 @@ def _sync_worker_action(keys: set, snap) -> str | None:
     if snap.enable_scheduled_sync and snap.address:
         return "start"
     return "stop"
+
+
+def _geofence_backfill_needed(keys: set, snap) -> bool:
+    """True when a settings change should trigger an immediate geofence
+    re-evaluation of the existing queue: a LOCATIONS change while GPS triage is
+    on and at least one location is flagged for exclusion."""
+    if "LOCATIONS" not in keys:
+        return False
+    if not getattr(snap, "gps_triage", False):
+        return False
+    return bool(_locations.exclusion_zones(getattr(snap, "locations", ()) or ()))
 
 
 @asynccontextmanager
@@ -299,6 +311,19 @@ async def lifespan(app: FastAPI):
 
     app.state.settings_unsubscribes.append(
         provider.subscribe(_on_triage_settings_changed)
+    )
+
+    def _on_geofence_settings_changed(keys, snap) -> None:
+        # Re-evaluate the existing queue immediately when the home zone is
+        # set/changed, so the backlog is skipped without waiting for a cycle.
+        if _geofence_backfill_needed(keys, snap):
+            _tasks.spawn(
+                app.state.sync_worker._run_geofence_pass(),
+                name="geofence-backfill",
+            )
+
+    app.state.settings_unsubscribes.append(
+        provider.subscribe(_on_geofence_settings_changed)
     )
 
     app.state.mqtt = MqttService(

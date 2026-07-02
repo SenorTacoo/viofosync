@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from typing import Any, Iterable, Optional
 
 
@@ -23,6 +24,12 @@ def _cache_dir(recordings: str) -> str:
     d = os.path.join(recordings, ".route_cache")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def clear_all(recordings: str) -> None:
+    """Drop the entire per-day route cache; journeys recompute from the on-disk
+    GPX on the next request. Best-effort and idempotent (no-op when absent)."""
+    shutil.rmtree(os.path.join(recordings, ".route_cache"), ignore_errors=True)
 
 
 def _cache_path(recordings: str, date: str) -> str:

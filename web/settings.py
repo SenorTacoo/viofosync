@@ -21,6 +21,7 @@ from .config_store import ConfigStore, MigrationResult
 from .settings_schema import (
     DEFAULT_VALUES,
     SettingsModel,
+    normalize_locations,
     validate_new_password,
     validate_partial,
 )
@@ -34,6 +35,18 @@ def _config_dir() -> Path:
 
 
 Subscriber = Callable[[set[str], "Snapshot"], None]
+
+
+@dataclass(frozen=True)
+class Place:
+    """Immutable snapshot view of one named location (metres for radius)."""
+
+    name: str
+    lat: float
+    lon: float
+    radius_m: int
+    exclude_recordings: bool
+    is_home: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +75,7 @@ class Snapshot:
     retention_protect_ro: bool
     recordings_quota_gb: int
     disk_critical_pct: int
+    locations: tuple[Place, ...]
 
     password_hash: str
     session_secret: str
@@ -209,6 +223,34 @@ class SettingsProvider:
         # disk; otherwise every restart would invalidate every
         # session cookie. Has to run before the snapshot is built.
         data = self._store.load()
+        # One-shot: fold a pre-existing GEOFENCE_ZONES (the earlier geofence
+        # design) into the LOCATIONS list, preserving whether exclusion was on.
+        if "LOCATIONS" not in data and data.get("GEOFENCE_ZONES"):
+            excl = bool(data.get("GEOFENCE_ENABLED"))
+            valid = [
+                z for z in data["GEOFENCE_ZONES"]
+                if z.get("lat") is not None and z.get("lon") is not None
+            ]
+            data["LOCATIONS"] = [
+                {
+                    "name": "Home" if i == 0 else f"Location {i + 1}",
+                    "lat": z["lat"],
+                    "lon": z["lon"],
+                    "radius_m": z.get("radius_m", 30),
+                    "exclude_recordings": excl,
+                }
+                for i, z in enumerate(valid)
+            ]
+            data.pop("GEOFENCE_ZONES", None)
+            data.pop("GEOFENCE_ENABLED", None)
+            self._store.write(data)
+        # One-shot: back-fill is_home on locations written by the previous
+        # design (no is_home key). normalize_locations promotes the first place
+        # to Home; persist so the invariant holds on disk, not just per-read.
+        locs = data.get("LOCATIONS")
+        if locs and any("is_home" not in loc for loc in locs):
+            data["LOCATIONS"] = normalize_locations(locs)
+            self._store.write(data)
         if "SESSION_SECRET" not in data:
             data["SESSION_SECRET"] = secrets.token_hex(32)
             self._store.write(data)
@@ -262,6 +304,11 @@ class SettingsProvider:
             retention_protect_ro=m.RETENTION_PROTECT_RO,
             recordings_quota_gb=m.RECORDINGS_QUOTA_GB,
             disk_critical_pct=m.DISK_CRITICAL_PCT,
+            locations=tuple(
+                Place(loc.name, loc.lat, loc.lon, loc.radius_m,
+                      loc.exclude_recordings, loc.is_home)
+                for loc in m.LOCATIONS
+            ),
             password_hash=m.WEB_PASSWORD_HASH,
             session_secret=m.SESSION_SECRET,
             host=m.WEB_HOST,

@@ -24,7 +24,11 @@ from ..auth import require_csrf, require_session
 from ..services import durations, filmstrip, route_cache, scanner, thumbs
 from ..services import tasks as _tasks
 from ..services import gps as gps_service
-from ..services import triage as triage_service
+from ..services import day_tracks
+from ..services import geofence as geofence_service
+from ..services import queue as q
+from ..services.gps import MAX_JOURNEY_BUFFER_S, expand_journey_window
+from ..services import locations as locations_service
 from ..services.naming import (
     CAMERAS,
     CHANNEL_LABELS,
@@ -44,16 +48,8 @@ log = logging.getLogger("viofosync.archive")
 FALLBACK_MAX_S = 300.0
 FALLBACK_DEFAULT_S = 60.0
 
-# Journey-window buffer. GPS stop boundaries land ~STOP_RADIUS_M (50m) inside
-# the real drive, so the pull-away clip at the start and the pull-in clip at
-# the end sit outside the raw journey window — "missing the start" / "cut short
-# on arrival". Pad each edge outward, but no further than the nearest
-# parking-mode clip on that side (the genuine "car is parked" boundary) and
-# never more than this cap. The cap matters because the dashcam can be knocked
-# out of parking mode by the car's electrics waking, producing spurious driving
-# clips — so we don't trust an arbitrary parking->driving switch to mark the
-# journey edge; we only lean on a *parking* clip as a hard stop.
-MAX_JOURNEY_BUFFER_S = 120.0
+# MAX_JOURNEY_BUFFER_S and expand_journey_window live in services/gps.py so the
+# geofence service can share them (a service can't import from this router).
 
 router = APIRouter(
     prefix="/api/archive",
@@ -172,7 +168,11 @@ def list_days(
             if d is not None:
                 d["remote_count"] = rd["remote_count"]
                 d["remote_gps_count"] = rd["remote_gps_count"]
-            elif page == 1:
+            elif page == 1 and rd["remote_gps_count"]:
+                # Only inject a remote-ONLY day once it has GPS-bearing footage
+                # to place on a journey. A day of track-less clips (no GPS lock)
+                # would otherwise open to an empty/Ungrouped card; that footage
+                # stays in the Queue tab until downloaded.
                 days.append({
                     "day": rd["day"], "clip_count": 0,
                     "driving_count": 0, "parking_count": 0, "ro_count": 0,
@@ -275,9 +275,10 @@ def get_day(
 
     # GPS Triage: only when enabled, append queued (not-downloaded) clips as
     # placeholder pairs (respecting the same kind + time-range filters), skipping
-    # any (timestamp, event_type) already covered by a downloaded pair. With
-    # triage off, the day view shows downloaded clips only — no GPS-less
-    # placeholder pairs snapping onto the nearest journey.
+    # any (timestamp, event_type) already covered by a downloaded pair.
+    # remote_day_clips only returns clips with a known GPS trace, so track-less
+    # footage never snaps onto a journey — it stays in the Queue tab until
+    # downloaded. With triage off, the day view shows downloaded clips only.
     if _settings(request).gps_triage:
         kind_ok = {"normal": driving, "parking": parking, "ro": ro}
         have_keys = {(cl["timestamp"], cl["event_type"]) for cl in clips}
@@ -307,7 +308,10 @@ def remote_day_summaries(db, date_from=None, date_to=None) -> list[dict]:
     matching the archive's pair-oriented view."""
     day = _queue_day_expr()
     where = [
-        "state IN ('pending','failed','skipped','downloading')",
+        # Skipped clips are excluded from download AND dropped from the journey
+        # map, so they must not be counted into the archive grid either — they'd
+        # otherwise snap onto a journey. They stay visible in the Queue tab.
+        "state IN ('pending','failed','downloading')",
         "upper(substr(filename, -5, 1)) = 'F'",
     ]
     params: list = []
@@ -338,15 +342,25 @@ def remote_day_summaries(db, date_from=None, date_to=None) -> list[dict]:
 def remote_day_clips(db, date: str) -> list[dict]:
     """Queued, not-downloaded clips for a day, paired front+rear and flagged
     remote. Mirrors get_day's pair shape so the frontend renders them in the
-    same grid/journey layout."""
+    same grid/journey layout.
+
+    Only clips with a known GPS trace (``triaged_at IS NOT NULL AND
+    gps_points > 0``) are returned: the archive is journey-organised, so a clip
+    with no track has nowhere to sit and would land in "Ungrouped" (or snap onto
+    the wrong journey). Track-less queued clips (no GPS lock — e.g. garage
+    parking — or not yet triaged) stay in the Queue tab until they're
+    downloaded. This mirrors ``day_tracks.day_gpx_paths``' skeleton filter so a
+    grid tile always has a matching track on the journey map."""
     day = _queue_day_expr()
     with db.conn() as c:
         rows = c.execute(
             f"""
             SELECT filename, source_dir, camera, event_type, recorded_at,
-                   triaged_at, gps_points, state
+                   triaged_at, gps_points, state, skip_reason
             FROM download_queue
-            WHERE state IN ('pending','failed','skipped','downloading') AND {day} = ?
+            WHERE state IN ('pending','failed','downloading')
+              AND triaged_at IS NOT NULL AND gps_points > 0
+              AND {day} = ?
             ORDER BY recorded_at DESC, filename DESC
             """,
             (date,),
@@ -376,6 +390,7 @@ def remote_day_clips(db, date: str) -> list[dict]:
             "triaged": r["triaged_at"] is not None,
             "gps_points": r["gps_points"] or 0,
             "state": r["state"],
+            "skip_reason": r["skip_reason"],
         }
 
     out = []
@@ -391,7 +406,7 @@ def remote_day_clips(db, date: str) -> list[dict]:
     return out
 
 
-def build_route_payload(db, recordings, date: str, geocoder) -> dict:
+def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
     """Merged GPS track for a day plus detected journeys/stops, as a
     JSON-able dict. Shared by GET /day/{date}/route and GET /timeline.
 
@@ -404,39 +419,7 @@ def build_route_payload(db, recordings, date: str, geocoder) -> dict:
     ``cache_lookup`` is used here — uncached labels are fetched lazily
     by the UI via /geocode after first paint.
     """
-    with db.conn() as c:
-        rows = c.execute(
-            """
-            SELECT path FROM clip_index
-            WHERE group_name = ? AND has_gpx = 1
-            ORDER BY timestamp ASC
-            """,
-            (date,),
-        ).fetchall()
-
-    gpx_paths = [r["path"] + ".gpx" for r in rows]
-
-    # GPS Triage: add skeleton sidecars for clips queued on this day that
-    # aren't downloaded yet. De-dup against clip_index by basename so a stale
-    # skeleton for an already-downloaded clip never double-counts.
-    downloaded_names = {os.path.basename(r["path"]) for r in rows}
-    with db.conn() as c:
-        q_rows = c.execute(
-            """
-            SELECT filename FROM download_queue
-            WHERE state IN ('pending','failed')
-              AND triaged_at IS NOT NULL AND gps_points > 0
-              AND substr(filename,1,4) || '-' || substr(filename,6,2)
-                  || '-' || substr(filename,8,2) = ?
-            """,
-            (date,),
-        ).fetchall()
-    for qr in q_rows:
-        if qr["filename"] in downloaded_names:
-            continue
-        sk = triage_service.skeleton_path(recordings, qr["filename"])
-        if os.path.exists(sk):
-            gpx_paths.append(sk)
+    gpx_paths = day_tracks.day_gpx_paths(db, recordings, date)
 
     sig = route_cache.signature(gpx_paths)
     payload = route_cache.load(recordings, date, sig)
@@ -452,7 +435,8 @@ def build_route_payload(db, recordings, date: str, geocoder) -> dict:
         payload = _assemble_route(date, points, stops, journeys)
         route_cache.store(recordings, date, sig, payload)
 
-    _apply_labels(payload, geocoder)
+    _apply_group_windows(db, date, payload)
+    _apply_labels(payload, geocoder, places)
     return payload
 
 
@@ -508,17 +492,50 @@ def _assemble_route(date: str, points, stops, journeys) -> dict:
     }
 
 
-def _apply_labels(payload: dict, geocoder) -> None:
-    """Fill journey/stop labels from the geocode cache (synchronous, no
-    network). Mutates ``payload`` in place. Uncached labels stay None and
-    are fetched lazily by the UI via /geocode after first paint."""
-    def _lbl(lat, lon):
-        return geocoder.cache_lookup(lat, lon) if geocoder else None
+def _apply_labels(payload: dict, geocoder, places=()) -> None:
+    """Fill journey/stop labels. A point inside a named location's radius is
+    labelled with the location name regardless of geocoding; otherwise the
+    geocode cache is used (uncached labels stay None and are fetched lazily via
+    /geocode). Mutates ``payload`` in place; runs on every read so it stays
+    current.
+
+    Flags set per point:
+    - ``home``/``start_home``/``end_home`` — True only when the matched place
+      has ``is_home=True`` (i.e. the designated Home location).
+    - ``named``/``start_named``/``end_named`` — True whenever *any* named place
+      matched, regardless of whether it is the Home; False for geocoded or
+      unresolved labels."""
+    def _lookup(lat, lon):
+        p = locations_service.match_for_point(places, lat, lon)
+        if p is not None:
+            return p.name, p.is_home, True
+        return (geocoder.cache_lookup(lat, lon) if geocoder else None), False, False
     for j in payload.get("journeys", []):
-        j["start_label"] = _lbl(j["start_lat"], j["start_lon"])
-        j["end_label"] = _lbl(j["end_lat"], j["end_lon"])
+        j["start_label"], j["start_home"], j["start_named"] = _lookup(j["start_lat"], j["start_lon"])
+        j["end_label"], j["end_home"], j["end_named"] = _lookup(j["end_lat"], j["end_lon"])
     for s in payload.get("stops", []):
-        s["label"] = _lbl(s["lat"], s["lon"])
+        s["label"], s["home"], s["named"] = _lookup(s["lat"], s["lon"])
+
+
+def _apply_group_windows(db, date: str, payload: dict) -> None:
+    """Pad each journey's window outward for the archive day-grid grouping, so
+    pull-away / pull-in clips that sit just outside the raw GPS journey (the GPS
+    stop boundary lands ~STOP_RADIUS_M inside the real drive) attach to the
+    journey card instead of the neighbouring stop. Adds ``group_start_ts`` /
+    ``group_end_ts`` to each journey (= the raw window when there's nothing to
+    pad). Mirrors the timeline's ``expand_journey_window`` and is bounded the
+    same way by the day's parking clips. Applied on read (not cached) so it
+    tracks parking clips, which the cached payload's signature doesn't cover."""
+    journeys = payload.get("journeys")
+    if not journeys:
+        return
+    # Parking clips bound the pad; under triage they live in the queue, not
+    # clip_index, so use the unioned source (see day_tracks.day_parking_spans).
+    parking_spans = day_tracks.day_parking_spans(db, date)
+    for j in journeys:
+        gs, ge = expand_journey_window(j["start_ts"], j["end_ts"], parking_spans)
+        j["group_start_ts"] = gs
+        j["group_end_ts"] = ge
 
 
 @router.get("/day/{date}/route")
@@ -530,7 +547,8 @@ def get_route(request: Request, date: str) -> dict:
         raise HTTPException(400, "bad date format")
     geocoder = getattr(request.app.state, "geocode", None)
     return build_route_payload(
-        _db(request), _settings(request).recordings, date, geocoder
+        _db(request), _settings(request).recordings, date, geocoder,
+        _settings(request).locations,
     )
 
 
@@ -561,30 +579,6 @@ def _effective_durations(rows) -> dict[int, float]:
     return eff
 
 
-def _expand_journey_window(
-    start_ts: float, end_ts: float,
-    parking_spans: list[tuple[float, float]],
-) -> tuple[float, float]:
-    """Pad a GPS journey window ``[start_ts, end_ts]`` outward to catch the
-    pull-away / pull-in footage that sits just outside the GPS stop radius.
-
-    Each edge expands by at most ``MAX_JOURNEY_BUFFER_S``, but stops at the
-    nearest parking-mode clip on that side so we never swallow parked footage.
-    ``parking_spans`` is ``[(start_ts, end_ts), ...]`` for the day's parking
-    clips. A parking clip straddling an edge means we're already at the
-    boundary, so that edge doesn't expand at all. See ``MAX_JOURNEY_BUFFER_S``
-    for why the cap, not the mode switch, is the backstop.
-    """
-    new_start = start_ts - MAX_JOURNEY_BUFFER_S
-    new_end = end_ts + MAX_JOURNEY_BUFFER_S
-    for ps, pe in parking_spans:
-        if ps < start_ts:          # parking (partly) before the window
-            new_start = max(new_start, min(pe, start_ts))
-        if pe > end_ts:            # parking (partly) after the window
-            new_end = min(new_end, max(ps, end_ts))
-    return new_start, new_end
-
-
 @router.get("/timeline")
 def get_timeline(
     request: Request,
@@ -606,7 +600,8 @@ def get_timeline(
     geocoder = getattr(request.app.state, "geocode", None)
     db = _db(request)
     route = build_route_payload(
-        db, _settings(request).recordings, date, geocoder
+        db, _settings(request).recordings, date, geocoder,
+        _settings(request).locations,
     )
     log.info(
         "timeline: route built (%d GPS point(s)) — querying clips",
@@ -634,7 +629,7 @@ def get_timeline(
             (r["timestamp"], r["timestamp"] + (r["duration_s"] or 0.0))
             for r in prk
         ]
-        start_ts, end_ts = _expand_journey_window(
+        start_ts, end_ts = expand_journey_window(
             start_ts, end_ts, parking_spans
         )
 
@@ -715,11 +710,16 @@ async def geocode(
     lat: float = Query(...),
     lon: float = Query(...),
 ) -> dict:
+    # A named location wins over reverse-geocoding (local, always available).
+    p = locations_service.match_for_point(_settings(request).locations, lat, lon)
+    if p is not None:
+        return {"lat": lat, "lon": lon, "label": p.name,
+                "home": p.is_home, "named": True}
     geocoder = getattr(request.app.state, "geocode", None)
     if geocoder is None:
-        return {"lat": lat, "lon": lon, "label": None}
+        return {"lat": lat, "lon": lon, "label": None, "home": False, "named": False}
     label = await geocoder.reverse(lat, lon)
-    return {"lat": lat, "lon": lon, "label": label}
+    return {"lat": lat, "lon": lon, "label": label, "home": False, "named": False}
 
 
 # --- Clip bytes ---
@@ -823,6 +823,34 @@ async def rescan(request: Request) -> JSONResponse:
         request.app.state.hub, asyncio.get_running_loop(),
     )
     return JSONResponse({"ok": True, "indexed": n})
+
+
+@router.post(
+    "/rebuild-grouping",
+    dependencies=[Depends(require_csrf)],
+)
+async def rebuild_grouping(request: Request) -> dict:
+    """Maintenance: flush stale geofence decisions and the journey/route cache,
+    then re-evaluate the geofence from the GPS data already on disk. The
+    ``.triage`` skeletons are NOT touched, so this needs no camera and triggers
+    no re-triage. Clips the current logic no longer re-skips return to
+    ``pending`` and may be downloaded on the next drain — that's intended."""
+    s = _settings(request)
+    db = _db(request)
+    unskipped = await asyncio.to_thread(q.unskip_geofence, db)
+    route_cache.clear_all(s.recordings)
+    # Reset the worker's per-day signature cache so its incremental sweeps
+    # re-evaluate too (not just this one-shot full sweep).
+    worker = getattr(request.app.state, "sync_worker", None)
+    if worker is not None:
+        worker._geofence_seen.clear()
+    reskipped = 0
+    zones = locations_service.exclusion_zones(s.locations)
+    if s.gps_triage and zones:
+        reskipped = await asyncio.to_thread(
+            geofence_service.sweep_all, db, s.recordings, zones, seen=None
+        )
+    return {"ok": True, "unskipped": unskipped, "reskipped": reskipped}
 
 
 # --- GPS extraction for existing clips ---

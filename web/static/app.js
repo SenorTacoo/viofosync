@@ -39,7 +39,7 @@ const state = {
   queueExpanded: new Set(),
   queueHoursExpanded: new Set(), // keys: "YYYY-MM-DD HH" (HH may be "??")
   queueSelected: new Set(),// filenames ticked
-  filters: { driving: true, parking: true, ro: true },
+  filters: { driving: true, parking: true, ro: true, location: "" },
   showMaps: localStorage.getItem("vfs.showMaps") !== "0",
   archiveSelected: new Map(),  // pair_id → { ts, front, rear, tele, interior }
   archiveExpanded: new Set(),  // open archive day keys ("YYYY-MM-DD"); persists
@@ -55,6 +55,8 @@ const state = {
   // helpers (fmtDistance) don't need to read from settingsState
   // (which is only loaded when the Settings tab is visited).
   distanceUnits: "km",
+  locations: [],           // named locations mirrored from /api/settings, for the
+                           // archive location filter dropdown
   logsFilter: null,        // { level, logger, q } currently shown in Logs tab
   logsOldestId: null,      // smallest id loaded, for "Load older" pagination
 };
@@ -139,6 +141,8 @@ async function refreshDisplayPrefs() {
   try {
     const body = await api("/api/settings");
     state.distanceUnits = body.editable.DISTANCE_UNITS || "km";
+    state.locations = body.editable.LOCATIONS || [];
+    buildLocationFilter();
   } catch { /* keep defaults */ }
 }
 
@@ -389,6 +393,45 @@ wireArchiveFilter("f-driving", "driving");
 wireArchiveFilter("f-parking", "parking");
 wireArchiveFilter("f-ro", "ro");
 
+// Location filter: client-side, narrows the open day timeline to journeys
+// (start or end) and stops at the selected named location. Populated from
+// state.locations (mirrored from /api/settings); hidden when none are defined.
+function buildLocationFilter() {
+  const wrap = document.getElementById("f-location-wrap");
+  const sel = document.getElementById("f-location");
+  if (!wrap || !sel) return;
+  const locs = state.locations || [];
+  if (!locs.length) {
+    wrap.hidden = true;
+    state.filters.location = "";
+    sel.value = "";
+    return;
+  }
+  // Home first, then alphabetical; name doubles as the option value (filtering
+  // matches by place name).
+  const ordered = [...locs].sort((a, b) =>
+    (b.is_home ? 1 : 0) - (a.is_home ? 1 : 0) ||
+    (a.name || "").localeCompare(b.name || ""));
+  const prev = state.filters.location;
+  const names = ordered.map((l) => l.name);
+  sel.innerHTML =
+    '<option value="">All locations</option>' +
+    ordered.map((l) =>
+      `<option value="${escHtml(l.name)}">${escHtml(l.name)}</option>`).join("");
+  if (prev && names.includes(prev)) {
+    sel.value = prev;
+  } else {
+    sel.value = "";
+    state.filters.location = "";
+  }
+  wrap.hidden = false;
+}
+
+document.getElementById("f-location").addEventListener("change", (e) => {
+  state.filters.location = e.target.value;
+  refreshOpenArchiveDays();
+});
+
 // "GPS Journey Splits" is a view option, not a filter: it gates the
 // journey machinery (Leaflet, route fetch, reverse-geocode) on
 // expansion but doesn't change what's fetched. Persisted to
@@ -481,6 +524,14 @@ function destroyJourneyMaps(root) {
   }
 }
 
+function destroyLocationMaps(root) {
+  for (const div of root.querySelectorAll(".loc-map")) {
+    const m = div._locMap;
+    if (m) { try { m.remove(); } catch {} }
+    div._locMap = null;
+  }
+}
+
 async function loadDays() {
   // Stale-response guard (same token pattern as loadQueue): WS
   // pushes, filter changes, and pagination can race; only the most
@@ -553,6 +604,36 @@ function renderDayCard(d) {
   return el;
 }
 
+// A pair carries GPS if it's a remote tile (already gated to gps_points>0) or
+// any downloaded camera slot has a sidecar. Used to decide whether a clip that
+// snaps to no journey/stop is worth an Ungrouped card or should be dropped.
+function pairHasGps(pair) {
+  if (pair.remote) return true;
+  return CAMERAS.some((c) => pair[c.channel] && pair[c.channel].has_gpx);
+}
+
+// True if a timeline event involves the named location: a journey whose start
+// OR end is that place, or a stop at that place. Matches on the server's
+// `named` flag + the place name, so a coincidental geocoded label can't match.
+function eventMatchesLocation(ev, name) {
+  if (ev.kind === "journey") {
+    const j = ev.data;
+    return (j.start_named && j.start_label === name) ||
+           (j.end_named && j.end_label === name);
+  }
+  const s = ev.data;
+  return !!(s.named && s.label === name);
+}
+
+// Placeholder shown in an expanded day that has nothing to/from the filtered
+// location (uses textContent — `name` is user-supplied).
+function renderNoLocationActivity(name) {
+  const note = document.createElement("p");
+  note.style.cssText = "color:var(--muted);font-size:12px";
+  note.textContent = `No activity to/from ${name} on this day.`;
+  return note;
+}
+
 async function renderDayBody(body, date) {
   const q = new URLSearchParams();
   archiveKindParams(q);
@@ -585,7 +666,14 @@ async function renderDayBody(body, date) {
   const journeys = (route && route.journeys) || [];
   const stops = (route && route.stops) || [];
   const hasGps = journeys.length > 0 || stops.length > 0;
+  const locFilter = state.filters.location;
   if (!hasGps) {
+    // With a location filter active, a day with no journeys/stops has nothing
+    // to/from that place — show the note rather than an unfiltered flat grid.
+    if (locFilter) {
+      body.appendChild(renderNoLocationActivity(locFilter));
+      return;
+    }
     // No journeys and no stops — fall back to a flat grid.
     const grid = document.createElement("div");
     grid.className = "clip-grid";
@@ -606,40 +694,72 @@ async function renderDayBody(body, date) {
   // there directly; the rest snap to whichever event is
   // closest in time, so everything is anchored to *some*
   // visible context instead of a flat "other" pile.
-  const events = [
-    ...journeys.map((j, idx) => ({
-      kind: "journey", data: j, clips: [], idx,
-      start: j.start_ts, end: j.end_ts,
-    })),
-    ...stops.map((s, idx) => ({
-      kind: "stop", data: s, clips: [], idx,
-      start: s.start_ts, end: s.end_ts,
-    })),
-  ];
-  // Newest first — most recent activity at the top of the day.
-  events.sort((a, b) => b.start - a.start);
+  // Journeys group with a PADDED window (group_start_ts/group_end_ts from the
+  // server — the same _expand_journey_window the timeline uses) so the pull-away
+  // and pull-in clips that sit just outside the raw GPS journey (the stop
+  // boundary lands ~50 m inside the real drive) land on the journey card. Fall
+  // back to the raw window for older payloads.
+  const journeyEvents = journeys.map((j, idx) => ({
+    kind: "journey", data: j, clips: [], idx,
+    start: j.group_start_ts ?? j.start_ts,
+    end: j.group_end_ts ?? j.end_ts,
+  }));
+  const stopEvents = stops.map((s, idx) => ({
+    kind: "stop", data: s, clips: [], idx,
+    start: s.start_ts, end: s.end_ts,
+  }));
+  // Newest first — most recent activity at the top of the day. Render order and
+  // the snap fallback below scan this combined list.
+  const events = [...journeyEvents, ...stopEvents].sort((a, b) => b.start - a.start);
+
+  // A loose clip (no event contains its timestamp) snaps to the nearest event
+  // only if it's within this gap; otherwise it collects in an "Ungrouped" card
+  // so a not-yet-skipped home clip can't drag across the whole day onto a journey.
+  const SNAP_MAX_GAP_S = 1800; // 30 min — matches the GPS session-gap splitter
+  const ungrouped = [];
 
   for (const pair of data.clips) {
     const ts = pair.timestamp;
-    let target = events.find((e) => ts >= e.start && ts <= e.end);
+    // Journeys win over an overlapping stop at the boundary: a pull-in clip that
+    // falls inside both the padded journey and the following stop belongs to the
+    // drive, not the dwell.
+    let target =
+      journeyEvents.find((e) => ts >= e.start && ts <= e.end) ||
+      stopEvents.find((e) => ts >= e.start && ts <= e.end);
     if (!target) {
-      // Snap to the closest event by time gap.
       let best = null, bestGap = Infinity;
       for (const e of events) {
         const gap = ts < e.start ? e.start - ts : ts - e.end;
         if (gap < bestGap) { bestGap = gap; best = e; }
       }
-      target = best;
+      target = bestGap <= SNAP_MAX_GAP_S ? best : null;
     }
     if (target) target.clips.push(pair);
+    else if (pairHasGps(pair)) ungrouped.push(pair);
+    // A no-GPS pair with nothing within snap range has no place in the
+    // journey-organised view (its real context — e.g. a home dwell built from
+    // skipped clips — is invisible here), so drop it rather than float it in an
+    // Ungrouped card. Extends the trace-gate principle to downloaded clips. A
+    // no-GPS clip that DID snap to a journey/stop is kept (handled above).
   }
 
-  for (const ev of events) {
+  const shown = locFilter
+    ? events.filter((ev) => eventMatchesLocation(ev, locFilter))
+    : events;
+
+  for (const ev of shown) {
     if (ev.kind === "journey") {
       body.appendChild(renderJourneyCard(ev.data, ev.clips, ev.idx, date));
     } else {
       body.appendChild(renderStopCard(ev.data, ev.clips, ev.idx));
     }
+  }
+
+  if (locFilter) {
+    // The Ungrouped pile isn't tied to a place, so it's hidden while filtering.
+    if (!shown.length) body.appendChild(renderNoLocationActivity(locFilter));
+  } else if (ungrouped.length) {
+    body.appendChild(renderUngroupedCard(ungrouped));
   }
 
   wireClipPairMapClicks(body);
@@ -746,7 +866,7 @@ function renderStopCard(stop, clips, idx) {
     el.innerHTML = `
       <span class="stop-icon" aria-hidden="true">⏸</span>
       <span>Stopped for <strong>${fmtDuration(stop.duration_s)}</strong>
-        at <span class="stop-label">${escHtml(placeLabel)}</span></span>
+        at <span class="stop-label">${placeGlyph(stop.home, stop.named)}${escHtml(placeLabel)}</span></span>
       <span class="stop-when">${startT} – ${endT}</span>
     `;
     if (!stop.label) {
@@ -769,7 +889,7 @@ function renderStopCard(stop, clips, idx) {
       <span class="journey-times">${startT} – ${endT}</span>
       <span class="stop-icon" aria-hidden="true">⏸</span>
       <strong class="journey-title">
-        <span class="stop-label">${escHtml(placeLabel)}</span>
+        <span class="stop-label">${placeGlyph(stop.home, stop.named)}${escHtml(placeLabel)}</span>
       </strong>
       <span class="journey-meta">
         ${fmtDuration(stop.duration_s)} ·
@@ -817,6 +937,30 @@ function renderStopCard(stop, clips, idx) {
   return el;
 }
 
+function renderUngroupedCard(clips) {
+  const el = document.createElement("div");
+  el.className = "journey-card stop-card collapsible";
+  el.innerHTML = `
+    <div class="journey-header">
+      <span class="caret">▸</span>
+      <input type="checkbox" class="journey-check"
+             title="Select all clips in this group" />
+      <strong class="journey-title">Ungrouped</strong>
+      <span class="journey-meta">
+        ${clips.length} clip${clips.length === 1 ? "" : "s"}
+      </span>
+    </div>
+    <div class="journey-body" hidden>
+      <div class="clip-grid"></div>
+    </div>
+  `;
+  const grid = el.querySelector(".clip-grid");
+  for (const pair of clips) grid.appendChild(renderClipPair(pair));
+  wireJourneyToggle(el, () => {});
+  wireJourneyCheck(el);
+  return el;
+}
+
 function renderJourneyCard(j, clips, idx, date) {
   const el = document.createElement("div");
   el.className = "journey-card collapsible";
@@ -837,9 +981,9 @@ function renderJourneyCard(j, clips, idx, date) {
              title="Select all clips in this journey" />
       <span class="journey-times">${startT} – ${endT}</span>
       <strong class="journey-title">
-        <span class="start-label" data-lat="${j.start_lat}" data-lon="${j.start_lon}">${escHtml(startLabel)}</span>
+        <span class="start-label" data-lat="${j.start_lat}" data-lon="${j.start_lon}">${placeGlyph(j.start_home, j.start_named)}${escHtml(startLabel)}</span>
         <span class="journey-arrow">→</span>
-        <span class="end-label" data-lat="${j.end_lat}" data-lon="${j.end_lon}">${escHtml(endLabel)}</span>
+        <span class="end-label" data-lat="${j.end_lat}" data-lon="${j.end_lon}">${placeGlyph(j.end_home, j.end_named)}${escHtml(endLabel)}</span>
       </strong>
       <span class="journey-meta">
         ${fmtDuration(j.duration_s)} · ${distance} · ${clips.length} clip${clips.length === 1 ? "" : "s"}
@@ -1032,18 +1176,34 @@ function flashClip(el) {
   });
 }
 
+// House glyph (SVG, no emoji) for the Home location — settings marker + labels.
+const HOME_GLYPH =
+  '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 7l6-4 6 4M4 6.5V13h8V6.5"/></svg>';
+
+// Generic map-pin glyph (SVG, no emoji) for non-Home named places.
+const PIN_GLYPH =
+  '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 14s4.5-4.2 4.5-7.5a4.5 4.5 0 0 0-9 0C3.5 9.8 8 14 8 14z"/><circle cx="8" cy="6.5" r="1.5"/></svg>';
+
+// Label glyph: house for the designated Home, pin for any other named place,
+// nothing for a plain geocoded label.
+function placeGlyph(isHome, isNamed) {
+  return isHome ? HOME_GLYPH : (isNamed ? PIN_GLYPH : "");
+}
+
 // Small inline SVG status icons for not-yet-downloaded clips (no emoji).
 const TRIAGE_STATE_ICON = {
   pending: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8M5 7l3 3 3-3M3 13h10"/></svg>',
   downloading: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" class="spin"><path d="M8 2a6 6 0 1 1-6 6"/></svg>',
   failed: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5 15 14H1zM8 6v3.5M8 11.5h.01"/></svg>',
   skipped: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="6"/><path d="M4 4l8 8"/></svg>',
+  geofence: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 7l6-4 6 4M4 6.5V13h8V6.5"/></svg>',
 };
 const TRIAGE_STATE_TITLE = {
   pending: "Queued for download",
   downloading: "Downloading",
   failed: "Download failed",
   skipped: "Skipped (excluded from download)",
+  geofence: "Skipped: parked at home",
 };
 
 function renderClipPair(pair) {
@@ -1055,9 +1215,13 @@ function renderClipPair(pair) {
   const thumb = (c, cam) => {
     if (c && c.remote) {
       const st = c.state || "pending";
-      const icon = TRIAGE_STATE_ICON[st] || TRIAGE_STATE_ICON.pending;
-      const title = TRIAGE_STATE_TITLE[st] || TRIAGE_STATE_TITLE.pending;
-      return `<div class="thumb remote state-${st}" data-camera="${cam}">
+      // A geofence auto-skip gets a distinct house glyph + accent so it
+      // reads apart from a manual skip.
+      const geo = st === "skipped" && c.skip_reason === "geofence";
+      const key = geo ? "geofence" : st;
+      const icon = TRIAGE_STATE_ICON[key] || TRIAGE_STATE_ICON.pending;
+      const title = TRIAGE_STATE_TITLE[key] || TRIAGE_STATE_TITLE.pending;
+      return `<div class="thumb remote state-${st}${geo ? " geofence" : ""}" data-camera="${cam}">
         <div class="remote-badge" title="${title}">${icon}</div>
         <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
       </div>`;
@@ -2989,6 +3153,7 @@ function renderSettingsSection(name) {
     clearInterval(_mqttStatusTimer);
     _mqttStatusTimer = null;
   }
+  destroyLocationMaps(pane);
   pane.innerHTML = "";
   (fns[name] || fns.dashcam)(pane);
 }
@@ -3238,6 +3403,304 @@ function renderGpsSection(pane) {
               textInput("NOMINATIM_EMAIL"));
   renderField(pane, "DISTANCE_UNITS", "Distance units",
               select("DISTANCE_UNITS", ["km", "miles"]));
+  renderLocations(pane);
+  renderGpsMaintenance(pane);
+}
+
+// Discreet maintenance action: flush stale geofence decisions + the journey
+// (route) cache and re-evaluate from existing GPS data. No camera / re-triage.
+function renderGpsMaintenance(pane) {
+  const h = document.createElement("h3");
+  h.textContent = "Maintenance";
+  h.style.marginTop = "24px";
+  pane.appendChild(h);
+
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent =
+    "Re-runs named-location detection and rebuilds journey grouping from the " +
+    "GPS data already on disk — useful after changing locations or grouping " +
+    "logic. Doesn't re-download anything, but clips no longer matched to an " +
+    "excluded location may be queued for download.";
+  pane.appendChild(note);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "Re-evaluate geofence & journeys";
+  btn.addEventListener("click", async () => {
+    if (!confirm(
+      "Re-evaluate named locations and rebuild journey grouping from existing " +
+      "GPS data?\n\nThis may queue some previously-skipped clips for download.",
+    )) return;
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = "Re-evaluating…";
+    try {
+      const r = await api("/api/archive/rebuild-grouping", { method: "POST" });
+      toast(`Re-evaluated: ${r.unskipped} un-skipped, ${r.reskipped} re-skipped.`);
+    } catch (e) {
+      toast(`Re-evaluate failed: ${e.message || e}`, { type: "error" });
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  });
+  pane.appendChild(btn);
+}
+
+// Reusable single-location editor: map + name + radius + exclude + actions.
+// Pure widget — edits flow out through callbacks; owns one Leaflet map that the
+// host MUST tear down via the returned destroy() (mirrors destroyJourneyMaps).
+// { location, gpsTriageOn, onChange(updated), onSetHome(), onDelete() } -> { el, destroy }
+function createLocationEditor({ location, gpsTriageOn, onChange, onSetHome, onDelete }) {
+  const loc = { ...location };
+  const wrap = document.createElement("div");
+  wrap.className = "loc-editor";
+
+  const mapDiv = document.createElement("div");
+  mapDiv.className = "loc-map";
+  wrap.appendChild(mapDiv);
+
+  // name
+  const nameRow = document.createElement("div");
+  nameRow.className = "form-row";
+  const nameLbl = document.createElement("label");
+  nameLbl.textContent = "Name";
+  const nameInp = document.createElement("input");
+  nameInp.type = "text";
+  nameInp.value = loc.name || "";
+  nameInp.addEventListener("input", () => {
+    loc.name = nameInp.value;
+    onChange({ ...loc });
+  });
+  nameRow.appendChild(nameLbl);
+  nameRow.appendChild(nameInp);
+  wrap.appendChild(nameRow);
+
+  // radius slider with a live value in the label
+  const radRow = document.createElement("div");
+  radRow.className = "form-row";
+  const radLbl = document.createElement("label");
+  const radText = () => `Radius — ${loc.radius_m} m`;
+  radLbl.textContent = radText();
+  const radInp = document.createElement("input");
+  radInp.type = "range";
+  radInp.min = 5;
+  radInp.max = 500;
+  radInp.step = 5;
+  radInp.value = loc.radius_m;
+  radInp.addEventListener("input", () => {
+    loc.radius_m = Number(radInp.value);
+    radLbl.textContent = radText();
+    if (circle) circle.setRadius(loc.radius_m);
+    onChange({ ...loc });
+  });
+  radRow.appendChild(radLbl);
+  radRow.appendChild(radInp);
+  wrap.appendChild(radRow);
+
+  // exclude toggle (requires GPS triage)
+  if (gpsTriageOn) {
+    const exRow = document.createElement("div");
+    exRow.className = "form-row";
+    const exLbl = document.createElement("label");
+    exLbl.textContent = "Exclude recordings made here";
+    const exInp = document.createElement("input");
+    exInp.type = "checkbox";
+    exInp.className = "switch";
+    exInp.checked = !!loc.exclude_recordings;
+    exInp.addEventListener("change", () => {
+      loc.exclude_recordings = exInp.checked;
+      onChange({ ...loc });
+    });
+    exRow.appendChild(exLbl);
+    exRow.appendChild(exInp);
+    wrap.appendChild(exRow);
+  } else {
+    const exNote = document.createElement("p");
+    exNote.className = "hint";
+    exNote.textContent =
+      "Enable “GPS triage” above to auto-skip recordings made at this location.";
+    wrap.appendChild(exNote);
+  }
+
+  // actions
+  const actions = document.createElement("div");
+  actions.className = "loc-actions";
+  const homeBtn = document.createElement("button");
+  homeBtn.type = "button";
+  homeBtn.className = "btn-secondary loc-home-btn";
+  homeBtn.textContent = loc.is_home ? "Current Home" : "Set as Home";
+  homeBtn.disabled = !!loc.is_home;
+  homeBtn.addEventListener("click", () => onSetHome());
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "btn-secondary loc-del-btn";
+  delBtn.textContent = "Delete";
+  delBtn.addEventListener("click", () => onDelete());
+  actions.appendChild(homeBtn);
+  actions.appendChild(delBtn);
+  wrap.appendChild(actions);
+
+  // Leaflet map: click-to-set / draggable pin + radius circle
+  const map = L.map(mapDiv).setView([loc.lat, loc.lon], 16);
+  mapDiv._locMap = map;
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "© OpenStreetMap",
+  }).addTo(map);
+  setTimeout(() => map.invalidateSize(), 0);
+
+  const icon = L.divIcon({
+    html: `<span class="home-marker">${loc.is_home ? HOME_GLYPH : PIN_GLYPH}</span>`,
+    className: "home-marker-wrap",
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
+  });
+  const marker = L.marker([loc.lat, loc.lon], { draggable: true, icon }).addTo(map);
+  let circle = L.circle([loc.lat, loc.lon], {
+    radius: loc.radius_m, color: "#3b82f6",
+  }).addTo(map);
+
+  function moveTo(lat, lon) {
+    loc.lat = lat;
+    loc.lon = lon;
+    marker.setLatLng([lat, lon]);
+    circle.setLatLng([lat, lon]);
+    onChange({ ...loc });
+  }
+  marker.on("dragend", () => {
+    const p = marker.getLatLng();
+    moveTo(p.lat, p.lng);
+  });
+  map.on("click", (e) => moveTo(e.latlng.lat, e.latlng.lng));
+
+  return {
+    el: wrap,
+    destroy() { map.remove(); mapDiv._locMap = null; },
+  };
+}
+
+// Inline list of named locations (add / edit / set-home / delete). Replaces the
+// single "Home location" block. All edits flow into settingsState.pending so the
+// existing Save footer persists them; the existing LOCATIONS-change backfill
+// (geofence + journey rebuild) runs server-side on save.
+function renderLocations(pane) {
+  const h = document.createElement("h3");
+  h.textContent = "Locations";
+  h.style.marginTop = "24px";
+  pane.appendChild(h);
+
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent =
+    "Named places used to label journeys and stops. One place is your Home " +
+    "(shown with a house icon); the rest use a pin. With GPS Triage on, a place " +
+    "can also auto-skip recordings made while parked there. Default radius 30 m.";
+  pane.appendChild(note);
+
+  const listWrap = document.createElement("div");
+  listWrap.className = "loc-list";
+  pane.appendChild(listWrap);
+
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.className = "loc-add";
+  addBtn.textContent = "+ Add location";
+  pane.appendChild(addBtn);
+
+  // Deep working copy; the backend stores it under LOCATIONS.
+  let list = JSON.parse(JSON.stringify(valueOf("LOCATIONS") || []));
+  let openIdx = -1;
+  let editor = null;
+  const gpsTriageOn = !!valueOf("GPS_TRIAGE");
+
+  function persist() {
+    setPending("LOCATIONS", JSON.parse(JSON.stringify(list)));
+  }
+  function closeEditor() {
+    if (editor) { editor.destroy(); editor = null; }
+  }
+  function metaText(loc) {
+    return `${Number(loc.lat).toFixed(4)}, ${Number(loc.lon).toFixed(4)} · ${loc.radius_m} m`;
+  }
+
+  function rerender() {
+    closeEditor();
+    listWrap.innerHTML = "";
+    if (!list.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint loc-empty";
+      empty.textContent = "No locations yet. Add one to label journeys and stops.";
+      listWrap.appendChild(empty);
+    }
+    list.forEach((loc, i) => {
+      const row = document.createElement("div");
+      row.className = "loc" + (i === openIdx ? " open" : "");
+
+      const head = document.createElement("div");
+      head.className = "loc-row";
+      head.innerHTML = `
+        <span class="loc-ico">${loc.is_home ? HOME_GLYPH : PIN_GLYPH}</span>
+        <span class="loc-name">${escHtml(loc.name || "(unnamed)")}</span>
+        ${loc.is_home ? '<span class="loc-badge home">Home</span>' : ""}
+        ${loc.exclude_recordings ? '<span class="loc-badge excl">Excluded</span>' : ""}
+        <span class="loc-meta">${metaText(loc)}</span>
+        <span class="loc-caret">${i === openIdx ? "▴" : "▾"}</span>
+      `;
+      head.addEventListener("click", () => {
+        openIdx = (openIdx === i) ? -1 : i;
+        rerender();
+      });
+      row.appendChild(head);
+
+      if (i === openIdx) {
+        editor = createLocationEditor({
+          location: loc,
+          gpsTriageOn,
+          onChange: (updated) => {
+            list[i] = updated;
+            persist();
+            // keep the row's name/meta live without tearing down the open map
+            head.querySelector(".loc-name").textContent = updated.name || "(unnamed)";
+            head.querySelector(".loc-meta").textContent = metaText(updated);
+          },
+          onSetHome: () => {
+            list.forEach((l, j) => { l.is_home = (j === i); });
+            persist();
+            rerender();
+          },
+          onDelete: () => {
+            const wasHome = list[i].is_home;
+            list.splice(i, 1);
+            if (wasHome && list.length) list[0].is_home = true;
+            openIdx = -1;
+            persist();
+            rerender();
+          },
+        });
+        row.appendChild(editor.el);
+      }
+      listWrap.appendChild(row);
+    });
+  }
+
+  addBtn.addEventListener("click", () => {
+    const base = list[0] || { lat: 53.0, lon: -2.0 };
+    list.push({
+      name: "New location",
+      lat: base.lat,
+      lon: base.lon,
+      radius_m: 30,
+      exclude_recordings: false,
+      is_home: list.length === 0,  // the very first place added is Home
+    });
+    openIdx = list.length - 1;
+    persist();
+    rerender();
+  });
+
+  rerender();
 }
 
 function renderThumbnailsSection(pane) {
@@ -3620,6 +4083,10 @@ if (settingsSave) {
       if (body.editable && body.editable.DISTANCE_UNITS) {
         state.distanceUnits = body.editable.DISTANCE_UNITS;
       }
+      if (body.editable && body.editable.LOCATIONS) {
+        state.locations = body.editable.LOCATIONS;
+        buildLocationFilter();
+      }
       await loadSettings();
     } catch (e) {
       alert(`Save failed: ${e}`);
@@ -3802,9 +4269,14 @@ window.addEventListener("hashchange", () => {
         }),
       });
       if (r.ok) {
-        const present = new Set((await r.json()).present || []);
-        queue = picked.filter((p) => !present.has(p.file.name));
+        const body = await r.json();
+        const present = new Set(body.present || []);
+        const skipped = new Set(body.skipped || []);
+        queue = picked.filter(
+          (p) => !present.has(p.file.name) && !skipped.has(p.file.name),
+        );
         if (present.size) tally.already_present = present.size;
+        if (skipped.size) tally.skipped = skipped.size;
       }
     } catch (_) { /* fall back to uploading everything */ }
 
@@ -3893,7 +4365,7 @@ window.addEventListener("hashchange", () => {
     const el = $("import-summary");
     el.textContent =
       `Imported ${t.imported || 0}, duplicate ${t.already_present || 0}, ` +
-      `skipped (over quota) ${t.over_quota_older || 0}, ` +
+      `skipped ${t.skipped || 0}, over quota ${t.over_quota_older || 0}, ` +
       `unrecognised ${t.not_recognised || 0}, errors ${t.errors || 0}.`;
     show(el);
     if (!document.getElementById("view-archive").hidden) loadDays();

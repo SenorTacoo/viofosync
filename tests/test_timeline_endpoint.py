@@ -136,7 +136,7 @@ def test_timeline_journey_mode_windows_clips(logged_in_client, monkeypatch):
     }
     monkeypatch.setattr(
         "web.routers.archive.build_route_payload",
-        lambda db, recordings, date, geocoder: fake_route,
+        lambda db, recordings, date, geocoder, places=(): fake_route,
     )
 
     r = logged_in_client.get("/api/archive/timeline?date=2026-06-02&journey=0")
@@ -155,7 +155,7 @@ def test_timeline_journey_out_of_range_404(logged_in_client, monkeypatch):
     _insert_clip(app, 1, 1_717_312_440, "F", 60.0)
     monkeypatch.setattr(
         "web.routers.archive.build_route_payload",
-        lambda db, recordings, date, geocoder: {
+        lambda db, recordings, date, geocoder, places=(): {
             "date": "2026-06-02", "point_count": 0, "journeys": [], "stops": [],
         },
     )
@@ -236,7 +236,7 @@ def test_timeline_keeps_real_duration(logged_in_client):
 
 def test_expand_journey_window_no_parking_uses_cap():
     cap = archive.MAX_JOURNEY_BUFFER_S
-    s, e = archive._expand_journey_window(1000.0, 2000.0, [])
+    s, e = archive.expand_journey_window(1000.0, 2000.0, [])
     assert s == 1000.0 - cap
     assert e == 2000.0 + cap
 
@@ -245,7 +245,7 @@ def test_expand_journey_window_parking_bounds_each_side():
     # Parking ends 30s before the window and starts 40s after it — both
     # inside the cap, so they bound the expansion instead of the cap.
     spans = [(800.0, 970.0), (2040.0, 2200.0)]
-    s, e = archive._expand_journey_window(1000.0, 2000.0, spans)
+    s, e = archive.expand_journey_window(1000.0, 2000.0, spans)
     assert s == 970.0
     assert e == 2040.0
 
@@ -254,7 +254,7 @@ def test_expand_journey_window_distant_parking_falls_back_to_cap():
     cap = archive.MAX_JOURNEY_BUFFER_S
     # Parking is more than the cap away on both sides -> the cap wins.
     spans = [(0.0, 100.0), (5000.0, 5100.0)]
-    s, e = archive._expand_journey_window(1000.0, 2000.0, spans)
+    s, e = archive.expand_journey_window(1000.0, 2000.0, spans)
     assert s == 1000.0 - cap
     assert e == 2000.0 + cap
 
@@ -263,7 +263,7 @@ def test_expand_journey_window_overlapping_parking_no_expansion():
     # A parking clip straddling an edge means we're already at the boundary;
     # don't expand into parked footage.
     spans = [(950.0, 1050.0), (1950.0, 2050.0)]
-    s, e = archive._expand_journey_window(1000.0, 2000.0, spans)
+    s, e = archive.expand_journey_window(1000.0, 2000.0, spans)
     assert s == 1000.0
     assert e == 2000.0
 
@@ -289,7 +289,7 @@ def test_timeline_journey_buffer_includes_adjacent_clips(
     _insert_clip(app, 3, j1 + 30, "F", 40.0)   # pull-in [j1+30, j1+70]
     monkeypatch.setattr(
         "web.routers.archive.build_route_payload",
-        lambda db, recordings, date, geocoder: _fake_journey_route(j0, j1),
+        lambda db, recordings, date, geocoder, places=(): _fake_journey_route(j0, j1),
     )
 
     body = logged_in_client.get(
@@ -312,7 +312,7 @@ def test_timeline_journey_buffer_stops_at_parking_clip(
     _insert_clip(app, 3, j0, "F", 300.0)       # the journey itself
     monkeypatch.setattr(
         "web.routers.archive.build_route_payload",
-        lambda db, recordings, date, geocoder: _fake_journey_route(j0, j1),
+        lambda db, recordings, date, geocoder, places=(): _fake_journey_route(j0, j1),
     )
 
     body = logged_in_client.get(

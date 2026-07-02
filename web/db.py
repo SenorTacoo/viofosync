@@ -129,7 +129,9 @@ CREATE TABLE IF NOT EXISTS download_queue (
     enqueued_at     INTEGER NOT NULL,
     started_at      INTEGER,
     finished_at     INTEGER,
-    manual          INTEGER NOT NULL DEFAULT 0
+    manual          INTEGER NOT NULL DEFAULT 0,
+    skip_reason     TEXT,             -- 'geofence' (auto) | 'user' | NULL
+    geofence_released_at INTEGER      -- set when a geofence-skip is manually released
 );
 CREATE INDEX IF NOT EXISTS idx_queue_state
     ON download_queue(state, priority DESC, enqueued_at ASC);
@@ -257,6 +259,14 @@ class Database:
         # triaged, 0 = triaged but no fix (never retried), >0 = points found.
         _add_column("download_queue", "triaged_at", "INTEGER")
         _add_column("download_queue", "gps_points", "INTEGER")
+
+        # Geofence exclusion: skip provenance + permanent-release marker.
+        # skip_reason 'geofence' = auto-skipped while parked at home,
+        # 'user' = manually skipped, NULL = legacy / not skipped.
+        # geofence_released_at: when a user un-skips a geofence clip, so the
+        # geofence never re-skips it.
+        _add_column("download_queue", "skip_reason", "TEXT")
+        _add_column("download_queue", "geofence_released_at", "INTEGER")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:

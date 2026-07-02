@@ -39,6 +39,8 @@ from ..settings import SettingsProvider
 from . import queue as q
 from . import retention as _retention
 from . import scanner
+from . import geofence as _geofence
+from . import locations as _locations
 from . import triage as _triage
 from .hub import Hub
 
@@ -51,6 +53,7 @@ BACKOFF_STEPS = [10, 30, 120, 600]  # seconds
 # still sweeps immediately after a drain; this loop is what keeps the
 # archive bounded when the camera is offline or has nothing new.
 RETENTION_INTERVAL_SECONDS = 300  # 5 minutes
+GEOFENCE_INTERVAL_SECONDS = 60  # incremental home-skip cadence during triage
 
 # Upper bound on how long stop() waits for the cycle/retention tasks
 # before abandoning them — keeps SIGTERM shutdown bounded even when a
@@ -318,6 +321,12 @@ class SyncWorker:
         self.hub = hub
         self._task: Optional[asyncio.Task] = None
         self._retention_task: Optional[asyncio.Task] = None
+        self._geofence_task: Optional[asyncio.Task] = None
+        # Per-day {day: signature} cache shared by the periodic loop and the
+        # per-cycle sweep, so an idle tick is two queries, not a GPX re-parse.
+        self._geofence_seen: dict[str, int] = {}
+        # Serialises the periodic loop against the per-cycle / backfill sweeps.
+        self._geofence_lock = asyncio.Lock()
         self._stop = asyncio.Event()
         self._cancel_current = threading.Event()
         self._kick = asyncio.Event()
@@ -376,6 +385,11 @@ class SyncWorker:
         self._retention_task = asyncio.run_coroutine_threadsafe(
             self._retention_loop(), self._loop
         )
+        # Skip home-parked clips incrementally as triage fills in skeletons,
+        # rather than only after the whole backlog finishes.
+        self._geofence_task = asyncio.run_coroutine_threadsafe(
+            self._geofence_loop(), self._loop
+        )
 
     def _is_running(self) -> bool:
         if self._task is None:
@@ -389,7 +403,7 @@ class SyncWorker:
         self._cancel_current.set()
         self._kick.set()
         import concurrent.futures
-        for task in (self._task, self._retention_task):
+        for task in (self._task, self._retention_task, self._geofence_task):
             if task is None:
                 continue
             # ``task`` may be an asyncio.Task or a
@@ -646,6 +660,56 @@ class SyncWorker:
             # error) so the status never gets stuck on "triaging".
             await self.hub.broadcast({"type": "triage_progress", "active": False})
 
+    async def _run_geofence_pass(self, *, seen: dict | None = None) -> None:
+        """Auto-skip queued clips dwelling in a location flagged for exclusion.
+        Runs after the triage pass, on the periodic loop while triage fills in
+        skeletons, and on a settings change. Works on local data, so it doesn't
+        need the camera online.
+
+        Pass ``seen=self._geofence_seen`` for the cheap incremental sweeps
+        (loop + per-cycle): only days with newly-triaged skeletons are
+        re-parsed. A full sweep (``seen=None``, the settings-change backfill)
+        drops that cache so every day is re-evaluated under the new zones."""
+        snap = self._provider.get()
+        if not getattr(snap, "gps_triage", False):
+            return
+        zones = _locations.exclusion_zones(getattr(snap, "locations", ()) or ())
+        if not zones:
+            return
+        async with self._geofence_lock:
+            # Clear inside the lock: a full sweep (backfill, seen=None) must not
+            # reset the cache while the periodic loop's worker thread is still
+            # mutating it under the lock.
+            if seen is None:
+                self._geofence_seen.clear()
+            try:
+                n = await asyncio.to_thread(
+                    _geofence.sweep_all, self.db, snap.recordings, zones,
+                    seen=seen,
+                )
+            except Exception:  # pragma: no cover — never kill the cycle
+                log.exception("geofence pass failed")
+                return
+        if n:
+            q.emit_queue_changed(self.db, self.hub)
+
+    async def _geofence_loop(self) -> None:
+        """Re-skip home-parked clips on a fixed cadence while a triage pass is
+        filling in skeletons, instead of only once after the whole backlog.
+        The per-day signature cache keeps an idle tick to a couple of indexed
+        queries, so this is cheap to run often. Same lifecycle as the worker."""
+        while not self._stop.is_set():
+            try:
+                await self._run_geofence_pass(seen=self._geofence_seen)
+            except Exception:  # pragma: no cover — never kill the loop
+                log.exception("periodic geofence sweep failed")
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=GEOFENCE_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                pass
+
     async def _run_retention_sweep(self) -> None:
         """Run one retention pass against the live settings, then
         refresh the broadcast disk %. Offloaded to a thread because
@@ -783,6 +847,10 @@ class SyncWorker:
         # Triage queued clips (if enabled) before downloading any, so the
         # journey view shows where clips were recorded first.
         await self._run_triage_pass()
+
+        # Auto-skip clips parked at home (if enabled) once skeleton tracks
+        # exist, so they never enter the download drain below.
+        await self._run_geofence_pass(seen=self._geofence_seen)
 
         # Drain the queue. After each successful download the
         # loop re-checks ``next_pending`` so a priority update
