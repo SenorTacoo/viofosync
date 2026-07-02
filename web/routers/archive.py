@@ -27,7 +27,7 @@ from ..services import gps as gps_service
 from ..services import day_tracks
 from ..services import geofence as geofence_service
 from ..services import queue as q
-from ..services.gps import MAX_JOURNEY_BUFFER_S, expand_journey_window
+from ..services.gps import MAX_JOURNEY_BUFFER_S, expand_journey_window, _haversine_ll
 from ..services import locations as locations_service
 from ..services.naming import (
     CAMERAS,
@@ -423,7 +423,7 @@ def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
 
     sig = route_cache.signature(gpx_paths)
     payload = route_cache.load(recordings, date, sig)
-    if payload is None:
+    if payload is None or "points" not in payload:
         log.info(
             "route: aggregating %d GPX file(s) for %s", len(gpx_paths), date
         )
@@ -436,6 +436,8 @@ def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
         route_cache.store(recordings, date, sig, payload)
 
     _apply_group_windows(db, date, payload)
+    _reframe_journeys(payload)
+    payload.pop("points", None)  # server-only scratch; don't ship it to clients
     _apply_labels(payload, geocoder, places)
     return payload
 
@@ -447,6 +449,7 @@ def _assemble_route(date: str, points, stops, journeys) -> dict:
     return {
         "date": date,
         "point_count": len(points),
+        "points": [[p.lon, p.lat, p.t.timestamp()] for p in points],
         "journeys": [
             {
                 "start_time": j.start_time.isoformat(),
@@ -538,6 +541,54 @@ def _apply_group_windows(db, date: str, payload: dict) -> None:
         j["group_end_ts"] = ge
 
 
+def _iso_utc(ts: float) -> str:
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).isoformat()
+
+
+def _reframe_journeys(payload: dict) -> None:
+    """Re-derive each journey's geometry, endpoints, time-range, duration and
+    distance from the merged-point slice inside its padded group window, so the
+    trace, the start/end markers, the geocoded labels and the displayed time
+    all describe the SAME window the day grid uses to group clips.
+
+    The window only *selects* points; it never fabricates them. When fixes exist
+    before the raw GPS start (low-speed maneuvering the stop detector swallowed)
+    the start moves back to them. When none do (a cold GPS start with no fix
+    until a minute in) the start stays at the first real fix — the line can't be
+    drawn where nothing was recorded.
+
+    Runs on read, after ``_apply_group_windows`` (which sets the window from the
+    *raw* start/end) and before ``_apply_labels`` (which reads the new
+    endpoints). ``payload['points']`` must be present and sorted ascending by
+    timestamp."""
+    pts = payload.get("points")
+    if not pts:
+        return
+    for j in payload.get("journeys", []):
+        gs = j.get("group_start_ts", j["start_ts"])
+        ge = j.get("group_end_ts", j["end_ts"])
+        sl = [p for p in pts if gs <= p[2] <= ge]
+        if len(sl) < 2:
+            continue
+        j["geojson"] = {
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[p[0], p[1]] for p in sl],
+            },
+        }
+        j["times"] = [p[2] for p in sl]
+        j["start_ts"], j["end_ts"] = sl[0][2], sl[-1][2]
+        j["start_time"], j["end_time"] = _iso_utc(sl[0][2]), _iso_utc(sl[-1][2])
+        j["start_lon"], j["start_lat"] = sl[0][0], sl[0][1]
+        j["end_lon"], j["end_lat"] = sl[-1][0], sl[-1][1]
+        j["duration_s"] = int(sl[-1][2] - sl[0][2])
+        dist = 0.0
+        for i in range(1, len(sl)):
+            dist += _haversine_ll(sl[i - 1][1], sl[i - 1][0], sl[i][1], sl[i][0])
+        j["distance_m"] = round(dist, 1)
+
+
 @router.get("/day/{date}/route")
 def get_route(request: Request, date: str) -> dict:
     """Merged GPS track for the day plus detected journeys."""
@@ -615,23 +666,13 @@ def get_timeline(
         if journey >= len(journeys):
             raise HTTPException(404, "journey index out of range")
         j = journeys[journey]
-        start_ts, end_ts = j["start_ts"], j["end_ts"]
-        # Pad the window so the pull-away / pull-in footage isn't lost. Parking
-        # clips are queried unfiltered (the display kind-filter must not hide a
-        # boundary) and bound how far each edge may travel.
-        with db.conn() as c:
-            prk = c.execute(
-                "SELECT timestamp, duration_s FROM clip_index "
-                "WHERE group_name = ? AND event_type = 'parking'",
-                [date],
-            ).fetchall()
-        parking_spans = [
-            (r["timestamp"], r["timestamp"] + (r["duration_s"] or 0.0))
-            for r in prk
-        ]
-        start_ts, end_ts = expand_journey_window(
-            start_ts, end_ts, parking_spans
-        )
+        # The journey already carries its padded window (group_start_ts/
+        # group_end_ts from _apply_group_windows), bounded by the unioned
+        # clip_index+download_queue parking source. Use it directly so the
+        # editor's clip window matches the day grid and the reframed trace —
+        # one definition of the journey's edges, no second (divergent) re-pad.
+        start_ts = j["group_start_ts"]
+        end_ts = j["group_end_ts"]
 
     where = ["group_name = ?"]
     params: list = [date]
