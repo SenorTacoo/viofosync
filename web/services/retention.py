@@ -41,6 +41,8 @@ def _eligible_by_time(
     window or rule disabled), or ``'ro_protected'`` (no, RO clip
     and protection is on).
     """
+    if clip.get("locked"):
+        return False, "locked"
     if protect_ro and (clip.get("event_type") or "") == "ro":
         return False, "ro_protected"
     if max_days <= 0:
@@ -138,7 +140,7 @@ def sweep(
         with db.conn() as c:
             rows = [
                 dict(r) for r in c.execute(
-                    "SELECT id, path, basename, timestamp, event_type "
+                    "SELECT id, path, basename, timestamp, event_type, locked "
                     f"FROM clip_index WHERE timestamp < ?{guard_sql}",
                     [now - max_days * 86400, *guard_params],
                 ).fetchall()
@@ -405,7 +407,7 @@ def _disk_pressure_pass(
         recordings, disk_pct=disk_pct, quota_gb=quota_gb, refresh=True,
         exclude=exclude,
     ):
-        conds = ["1=1"]
+        conds = ["COALESCE(locked, 0) = 0"]
         params: list = []
         if protect_ro:
             conds.append("COALESCE(event_type, '') != 'ro'")
@@ -489,7 +491,7 @@ def make_room_for(
                 return True
         return False
 
-    where = "WHERE timestamp < ?"
+    where = "WHERE timestamp < ? AND COALESCE(locked, 0) = 0"
     params: list = [before_ts]
     if protect_ro:
         where += " AND COALESCE(event_type, '') != 'ro'"

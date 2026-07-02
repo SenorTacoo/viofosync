@@ -49,7 +49,7 @@ def test_delete_removes_files_index_and_marks_skipped(tmp_path):
     rec, db = _env(tmp_path)
     cid, path = _make_clip(rec, db, basename="A.MP4")
     res = delete_clips(db, ["A.MP4"], str(rec))
-    assert res == {"deleted": 1, "skipped": 1}
+    assert res == {"deleted": 1, "skipped": 1, "protected": 0}
     assert not path.exists()
     assert not (path.parent / "A.MP4.gpx").exists()
     with db.conn() as c:
@@ -60,13 +60,34 @@ def test_delete_removes_files_index_and_marks_skipped(tmp_path):
     assert row["state"] == "skipped" and row["skip_reason"] == "user"
 
 
-def test_delete_ro_clip_is_not_protected(tmp_path):
+def test_delete_skips_ro_clip(tmp_path):
     from web.services.queue import delete_clips
     rec, db = _env(tmp_path)
     _, path = _make_clip(rec, db, basename="LOCK.MP4", event_type="ro")
     res = delete_clips(db, ["LOCK.MP4"], str(rec))
-    assert res["deleted"] == 1
-    assert not path.exists()
+    assert res["deleted"] == 0
+    assert res.get("protected") == 1
+    assert path.exists()  # RO clip retained
+
+
+def test_delete_nonexistent_file_reports_zero(tmp_path):
+    # A filename with no clip_index AND no download_queue row touches nothing:
+    # skipped must reflect the actual queue UPDATE rowcount (0), not len(targets).
+    from web.services.queue import delete_clips
+    rec, db = _env(tmp_path)
+    res = delete_clips(db, ["GHOST.MP4"], str(rec))
+    assert res == {"deleted": 0, "skipped": 0, "protected": 0}
+
+
+def test_delete_skips_locked_clip(tmp_path):
+    from web.services.queue import delete_clips
+    rec, db = _env(tmp_path)
+    _, path = _make_clip(rec, db, basename="KEEP.MP4")
+    with db.write() as c:
+        c.execute("UPDATE clip_index SET locked=1 WHERE basename='KEEP.MP4'")
+    res = delete_clips(db, ["KEEP.MP4"], str(rec))
+    assert res["deleted"] == 0 and res.get("protected") == 1
+    assert path.exists()
 
 
 def test_delete_undownloaded_marks_skipped_only(tmp_path):
@@ -76,7 +97,7 @@ def test_delete_undownloaded_marks_skipped_only(tmp_path):
     with db.write() as c:
         _insert_queue(c, "PEND.MP4", "pending")
     res = delete_clips(db, ["PEND.MP4"], str(rec))
-    assert res == {"deleted": 0, "skipped": 1}
+    assert res == {"deleted": 0, "skipped": 1, "protected": 0}
     with db.conn() as c:
         assert c.execute(
             "SELECT state FROM download_queue WHERE filename='PEND.MP4'"
@@ -95,7 +116,7 @@ def test_delete_missing_file_does_not_raise(tmp_path):
 def test_delete_empty_is_noop(tmp_path):
     from web.services.queue import delete_clips
     rec, db = _env(tmp_path)
-    assert delete_clips(db, [], str(rec)) == {"deleted": 0, "skipped": 0}
+    assert delete_clips(db, [], str(rec)) == {"deleted": 0, "skipped": 0, "protected": 0}
 
 
 def test_delete_logs_info_audit_line(tmp_path, caplog):

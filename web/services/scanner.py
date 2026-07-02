@@ -256,6 +256,16 @@ def scan(db: Database, destination: str, grouping: str, hub=None, loop=None) -> 
             c.execute("ROLLBACK")
             raise
 
+    # Carry a queued "retain indefinitely" lock into the freshly-indexed clip.
+    # Only sets locked 0->1 (never clears), so a lock set on the index after
+    # download — or a later unlock — is preserved across rescans.
+    with db.write() as c:
+        c.execute(
+            "UPDATE clip_index SET locked = 1 "
+            "WHERE locked = 0 AND basename IN "
+            "(SELECT filename FROM download_queue WHERE locked = 1)"
+        )
+
     if hub is not None:
         event = {"type": "clip_indexed", "total": len(seen_paths)}
         try:

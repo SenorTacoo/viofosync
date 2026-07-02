@@ -219,7 +219,7 @@ def get_day(
         rows = c.execute(
             f"""
             SELECT id, basename, path, timestamp, camera,
-                   sequence, event_type, size_bytes, has_gpx
+                   sequence, event_type, size_bytes, has_gpx, locked
             FROM clip_index
             WHERE {' AND '.join(where)}
             ORDER BY timestamp DESC, sequence DESC
@@ -275,6 +275,9 @@ def get_day(
             "timestamp": ts,
             "sequence": pair["sequence"],
             "event_type": kind,
+            "locked": 1 if any(
+                pair[s] and pair[s].get("locked") for s in slots
+            ) else 0,
             "iso": _dt.datetime.fromtimestamp(ts).isoformat(),
             **{s: pair[s] for s in slots},
         })
@@ -389,7 +392,7 @@ def remote_day_clips(db, date: str) -> list[dict]:
         rows = c.execute(
             f"""
             SELECT filename, source_dir, camera, event_type, recorded_at,
-                   triaged_at, gps_points, state, skip_reason
+                   triaged_at, gps_points, state, skip_reason, locked
             FROM download_queue
             WHERE state IN ('pending','failed','downloading')
               AND triaged_at IS NOT NULL AND gps_points > 0
@@ -424,6 +427,7 @@ def remote_day_clips(db, date: str) -> list[dict]:
             "gps_points": r["gps_points"] or 0,
             "state": r["state"],
             "skip_reason": r["skip_reason"],
+            "locked": r["locked"] or 0,
         }
 
     out = []
@@ -433,6 +437,9 @@ def remote_day_clips(db, date: str) -> list[dict]:
             "timestamp": ts,
             "sequence": 0,
             "event_type": kind,
+            "locked": 1 if any(
+                pair[s] and pair[s].get("locked") for s in slots
+            ) else 0,
             "iso": _dt.datetime.fromtimestamp(ts).isoformat() if ts else "",
             **{s: pair[s] for s in slots},
         })

@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS clip_index (
     size_bytes    INTEGER,
     has_gpx       INTEGER NOT NULL DEFAULT 0,
     gps_examined  INTEGER NOT NULL DEFAULT 0,
+    locked        INTEGER NOT NULL DEFAULT 0,  -- user "retain indefinitely"
     duration_s    REAL,
     scanned_at    INTEGER NOT NULL
 );
@@ -131,7 +132,8 @@ CREATE TABLE IF NOT EXISTS download_queue (
     finished_at     INTEGER,
     manual          INTEGER NOT NULL DEFAULT 0,
     skip_reason     TEXT,             -- 'geofence' (auto) | 'user' | NULL
-    geofence_released_at INTEGER      -- set when a geofence-skip is manually released
+    geofence_released_at INTEGER,     -- set when a geofence-skip is manually released
+    locked          INTEGER NOT NULL DEFAULT 0  -- user "retain indefinitely"
 );
 CREATE INDEX IF NOT EXISTS idx_queue_state
     ON download_queue(state, priority DESC, enqueued_at ASC);
@@ -267,6 +269,11 @@ class Database:
         # geofence never re-skips it.
         _add_column("download_queue", "skip_reason", "TEXT")
         _add_column("download_queue", "geofence_released_at", "INTEGER")
+
+        # User "retain indefinitely" flag. Distinct from event_type='ro'
+        # (dashcam-locked): a user pin that retention always honours.
+        _add_column("clip_index", "locked", "INTEGER NOT NULL DEFAULT 0")
+        _add_column("download_queue", "locked", "INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:

@@ -107,12 +107,13 @@
           <span id="selection-count" class="selection-hint" aria-live="polite"></span>
           <div class="spacer"></div>
           <div class="action-group clip-action-group">
-            <label class="action-label" for="clip-action">Clip actions</label>
+            <label class="action-label" for="clip-action">Actions</label>
             <select id="clip-action">
-              <optgroup label="Queue">
+              <optgroup label="Clips">
                 <option value="download-next">Download next</option>
                 <option value="skip">Skip</option>
                 <option value="retry">Retry</option>
+                <option value="mark-ro">Mark read-only</option>
                 <option value="delete">Delete…</option>
               </optgroup>
               <optgroup label="Export" id="clip-action-export">
@@ -160,21 +161,26 @@
             <input type="checkbox" id="q-kind-ro" checked /> Read-only
           </label>
           <span class="filter-sep"></span>
-          <select id="q-action" aria-label="Bulk action">
-            <option value="" disabled selected>Actions…</option>
-            <option value="download-next">Download next</option>
-            <option value="skip">Skip</option>
-            <option value="clear-skip">Clear skip</option>
-            <option value="retry-failed">Retry failed</option>
-          </select>
-          <button type="button" id="q-apply">Apply</button>
-          <span class="filter-sep"></span>
           <label class="recent-label">
             <input type="number" id="q-recent-hours" min="0.5" step="0.5"
                    value="2" style="width:60px"
                    aria-label="Recent hours to prioritise" />
             <button type="button" id="q-prio-recent">Download recent hours next</button>
           </label>
+          <div class="spacer"></div>
+          <div class="action-group clip-action-group">
+            <label class="action-label" for="q-action">Actions</label>
+            <select id="q-action" aria-label="Bulk action">
+              <option value="download-next">Download next</option>
+              <option value="skip">Skip</option>
+              <option value="clear-skip">Clear skip</option>
+              <option value="retry-failed">Retry</option>
+              <option value="mark-ro">Mark read-only</option>
+              <option value="delete-from-camera">Delete from camera…</option>
+            </select>
+            <button type="button" id="q-apply">Apply</button>
+            <button type="button" id="q-clear">Clear</button>
+          </div>
         </div>
         <div id="queue-meta" class="queue-meta"></div>
         <div id="queue-days"></div>

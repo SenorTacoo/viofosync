@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence
 
+import viofosync_lib as vfs
 from viofosync_lib.cameras import CAMERA_LETTERS
 
 from ..db import Database
@@ -730,38 +731,49 @@ def skip(db: Database, filenames: List[str]) -> int:
 
 
 def delete_clips(db: Database, filenames: List[str], recordings: str) -> dict:
-    """User-initiated delete of selected clips: remove the downloaded files +
-    clip_index rows, and mark the download_queue rows skipped (regardless of
-    current state — downloaded rows are 'done') so they won't re-download. Returns
-    {'deleted': <files/index rows removed>, 'skipped': <queue rows marked>}."""
+    """User-initiated delete: remove downloaded files + clip_index rows and mark
+    the queue rows skipped. Clips the user has pinned read-only (clip_index or
+    download_queue locked=1) or dashcam-locked (event_type='ro') are skipped and
+    reported as 'protected'. Returns {deleted, skipped, protected}."""
     if not filenames:
-        return {"deleted": 0, "skipped": 0}
+        return {"deleted": 0, "skipped": 0, "protected": 0}
     from . import retention as _retention
+    ph = ",".join("?" * len(filenames))
     with db.conn() as c:
-        ph = ",".join("?" * len(filenames))
-        rows = c.execute(
-            f"SELECT id, path, basename, event_type FROM clip_index "
-            f"WHERE basename IN ({ph})",
-            filenames,
-        ).fetchall()
+        protected = {
+            r["name"] for r in c.execute(
+                f"SELECT basename AS name FROM clip_index "
+                f"WHERE basename IN ({ph}) "
+                f"AND (COALESCE(locked,0)=1 OR COALESCE(event_type,'')='ro') "
+                f"UNION "
+                f"SELECT filename AS name FROM download_queue "
+                f"WHERE filename IN ({ph}) AND COALESCE(locked,0)=1",
+                [*filenames, *filenames],
+            ).fetchall()
+        }
+    targets = [f for f in filenames if f not in protected]
     deleted = 0
-    for r in rows:
-        _retention.delete_clip(db, dict(r), recordings)
-        deleted += 1
-    with db.write() as c:
-        ph = ",".join("?" * len(filenames))
-        cur = c.execute(
-            f"UPDATE download_queue SET state='skipped', skip_reason='user' "
-            f"WHERE filename IN ({ph})",
-            filenames,
-        )
-        skipped = cur.rowcount
-    if deleted or skipped:
-        log.info(
-            "archive delete: removed %d clip(s), marked %d queue row(s) "
-            "skipped — %s", deleted, skipped, _names(filenames),
-        )
-    return {"deleted": deleted, "skipped": skipped}
+    skipped = 0
+    if targets:
+        tph = ",".join("?" * len(targets))
+        with db.conn() as c:
+            rows = c.execute(
+                f"SELECT id, path, basename, event_type FROM clip_index "
+                f"WHERE basename IN ({tph})", targets,
+            ).fetchall()
+        for r in rows:
+            _retention.delete_clip(db, dict(r), recordings)
+            deleted += 1
+        with db.write() as c:
+            cur = c.execute(
+                f"UPDATE download_queue SET state='skipped', skip_reason='user' "
+                f"WHERE filename IN ({tph})", targets,
+            )
+            skipped = cur.rowcount  # rows actually marked, not len(targets)
+    if deleted or skipped or protected:
+        log.info("archive delete: removed %d clip(s), %d protected — %s",
+                 deleted, len(protected), _names(filenames))
+    return {"deleted": deleted, "skipped": skipped, "protected": len(protected)}
 
 
 def unskip(db: Database, filenames: List[str]) -> int:
@@ -859,6 +871,70 @@ def geofence_day_signatures(db: Database, states: tuple) -> dict:
             tuple(states),
         ).fetchall()
     return {r["day"]: r["n"] for r in rows}
+
+
+def set_locked(db: Database, filenames: List[str], locked: bool = True) -> int:
+    """Set the user 'retain indefinitely' flag on the given clips, in BOTH
+    clip_index (by basename) and download_queue (by filename), so the state is
+    stable whether the clip is downloaded or still queued. Returns the count of
+    distinct filenames affected."""
+    if not filenames:
+        return 0
+    val = 1 if locked else 0
+    ph = ",".join("?" * len(filenames))
+    with db.write() as c:
+        c.execute(
+            f"UPDATE clip_index SET locked=? WHERE basename IN ({ph})",
+            [val, *filenames],
+        )
+        c.execute(
+            f"UPDATE download_queue SET locked=? WHERE filename IN ({ph})",
+            [val, *filenames],
+        )
+    verb = "read-only" if locked else "writable"
+    log.info("archive mark %s: %d clip(s) — %s", verb, len(filenames),
+             _names(filenames))
+    return len(filenames)
+
+
+def delete_from_camera(
+    db: Database, filenames: List[str], base_url: str, *, timeout: float = 10.0,
+) -> dict:
+    """Delete the given clips from the dashcam SD card (cmd=4003). Skips clips
+    the user has locked (retain indefinitely) and dashcam RO clips (source_dir
+    under /RO/ — firmware write-protected). On a successful delete the queue row
+    becomes 'gone' (no longer on the camera). Network failures are counted, not
+    raised. Returns {deleted, skipped, errors}."""
+    if not filenames:
+        return {"deleted": 0, "skipped": 0, "errors": 0}
+    ph = ",".join("?" * len(filenames))
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT filename, source_dir, locked FROM download_queue "
+            f"WHERE filename IN ({ph})", filenames,
+        ).fetchall()
+    deleted = skipped = errors = 0
+    gone: List[str] = []
+    for r in rows:
+        sd = r["source_dir"] or ""
+        if r["locked"] or "/RO/" in sd or sd.endswith("/RO"):
+            skipped += 1
+            continue
+        if vfs.delete_dashcam_file(base_url, sd, r["filename"], timeout=timeout):
+            gone.append(r["filename"])
+            deleted += 1
+        else:
+            errors += 1
+    if gone:
+        gph = ",".join("?" * len(gone))
+        with db.write() as c:
+            c.execute(
+                f"UPDATE download_queue SET state='gone' WHERE filename IN ({gph})",
+                gone,
+            )
+    log.info("delete from camera: %d deleted, %d skipped, %d error(s) — %s",
+             deleted, skipped, errors, _names(filenames))
+    return {"deleted": deleted, "skipped": skipped, "errors": errors}
 
 
 def skip_listed_names(db: Database, names: Sequence[str]) -> set[str]:

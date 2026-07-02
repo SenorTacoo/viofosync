@@ -1257,7 +1257,8 @@ function renderClipPair(pair) {
     if (pair.event_type === "parking") {
       return `<span class="kind-badge kind-parking">Parking</span>`;
     }
-    if (pair.event_type === "ro") {
+    if (pair.event_type === "ro" || pair.locked) {
+      // Dashcam-locked (ro) OR user-pinned (locked) both read as "retained".
       return `<span class="kind-badge kind-ro">Read-only</span>`;
     }
     return "";
@@ -1679,6 +1680,18 @@ async function applyClipAction() {
   ];
   if (!filenames.length) {
     toast("Select some clips first.", { type: "error" });
+    return;
+  }
+  if (action === "mark-ro") {
+    try {
+      const res = await api("/api/queue/lock",
+        { method: "POST", body: JSON.stringify({ filenames }) });
+      toast(`Marked ${res.updated} read-only`);
+      clearSelection();
+      refreshOpenArchiveDays();
+    } catch (e) {
+      toast(`Failed: ${e.message || e}`, { type: "error" });
+    }
     return;
   }
   if (action === "delete") {
@@ -2349,8 +2362,10 @@ function renderKindBadge(it) {
   } else if (evt === "event") {
     parts.push(`<span class="kind-badge kind-event">Event</span>`);
   }
-  if (it.kind_ro) {
-    parts.push(`<span class="kind-badge kind-ro">RO</span>`);
+  if (it.kind_ro || it.locked) {
+    // Dashcam-locked (kind_ro) OR user-pinned (locked) — both retained.
+    const title = it.locked ? "Read-only — retained" : "Read-only";
+    parts.push(`<span class="kind-badge kind-ro" title="${title}">RO</span>`);
   }
   return parts.join(" ");
 }
@@ -2714,6 +2729,22 @@ const QUEUE_ACTIONS = {
                      body: (f) => ({ filenames: f }), label: "un-skipped" },
   "retry-failed":  { url: "/api/queue/retry",
                      body: (f) => ({ filenames: f }), label: "re-queued" },
+  "mark-ro":       { url: "/api/queue/lock",
+                     body: (f) => ({ filenames: f }), label: "marked read-only" },
+  "delete-from-camera": {
+    url: "/api/queue/delete-from-camera",
+    body: (f) => ({ filenames: f }),
+    confirm: (n) =>
+      `Delete ${n} clip(s) from the dashcam SD card? This cannot be undone.`,
+    // The route returns {deleted, skipped, errors} (not {updated}), and
+    // {ok:false,error} when no camera is configured.
+    toast: (r) => r.ok === false
+      ? `Failed: ${r.error || "no dashcam configured"}`
+      : `Deleted ${r.deleted} from camera`
+        + (r.skipped ? `, ${r.skipped} protected` : "")
+        + (r.errors ? `, ${r.errors} error(s)` : ""),
+    toastType: (r) => (r.ok === false || r.errors) ? "error" : "success",
+  },
 };
 
 async function applyQueueAction() {
@@ -2725,19 +2756,24 @@ async function applyQueueAction() {
     toast("Select some files first.", { type: "error" });
     return;
   }
+  if (spec.confirm && !confirm(spec.confirm(filenames.length))) return;
   const btn = document.getElementById("q-apply");
   btn.disabled = true;
   try {
     const r = await api(spec.url, {
       method: "POST", body: JSON.stringify(spec.body(filenames)),
     });
-    const n = r.updated ?? 0;
-    toast(n
-      ? `${n} file${n === 1 ? "" : "s"} ${spec.label}`
-      : "No applicable items in selection.",
-          { type: n ? "success" : "error" });
+    if (spec.toast) {
+      toast(spec.toast(r),
+        { type: spec.toastType ? spec.toastType(r) : "success" });
+    } else {
+      const n = r.updated ?? 0;
+      toast(n
+        ? `${n} file${n === 1 ? "" : "s"} ${spec.label}`
+        : "No applicable items in selection.",
+            { type: n ? "success" : "error" });
+    }
     state.queueSelected.clear();
-    sel.value = "";
     await loadQueue();
   } catch (e) {
     toast(`Action failed: ${e.message || e}`, { type: "error" });
@@ -2745,7 +2781,17 @@ async function applyQueueAction() {
     btn.disabled = false;
   }
 }
+
+// Clear the queue tick selection in place (mirrors the archive "Clear"),
+// unchecking every row/hour/day checkbox without a re-fetch.
+function clearQueueSelection() {
+  state.queueSelected.clear();
+  document.querySelectorAll('#queue-days input[type="checkbox"]')
+    .forEach((cb) => { cb.checked = false; cb.indeterminate = false; });
+  renderQueueMeta();
+}
 document.getElementById("q-apply").addEventListener("click", applyQueueAction);
+document.getElementById("q-clear").addEventListener("click", clearQueueSelection);
 
 // Download most recent X hours first
 document.getElementById("q-prio-recent").addEventListener("click", async () => {

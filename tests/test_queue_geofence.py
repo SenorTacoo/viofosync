@@ -124,3 +124,21 @@ def test_geofence_skipped_by_day_respects_date_range(db: Database) -> None:
     _seed(db, "2026_0620_090000_002F.MP4", state="skipped", skip_reason="geofence")
     assert geofence_skipped_by_day(db, "2026-06-20", None) == {"2026-06-20": 1}
     assert geofence_skipped_by_day(db, None, "2026-06-19") == {"2026-06-19": 1}
+
+
+def test_locked_columns_exist(db: Database) -> None:
+    with db.conn() as c:
+        ci = {r["name"] for r in c.execute("PRAGMA table_info(clip_index)")}
+        dq = {r["name"] for r in c.execute("PRAGMA table_info(download_queue)")}
+    assert "locked" in ci
+    assert "locked" in dq
+
+
+def test_locked_migration_idempotent(tmp_path) -> None:
+    from pathlib import Path
+    p = str(Path(tmp_path) / "v.db")
+    Database(p)            # create + migrate
+    db2 = Database(p)      # re-migrate must not raise
+    with db2.conn() as c:
+        ci = {r["name"] for r in c.execute("PRAGMA table_info(clip_index)")}
+    assert "locked" in ci

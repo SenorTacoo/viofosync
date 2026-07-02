@@ -271,3 +271,99 @@ def test_remote_day_summaries_excludes_skipped(tmp_path):
     rows = archive.remote_day_summaries(db, "2026-06-18", "2026-06-18")
     assert len(rows) == 1
     assert rows[0]["remote_count"] == 1   # only the pending clip counted
+
+
+# --- RO-7: locked flag in day payloads ---
+
+
+def _seed_clip(db, filename, *, camera, day, ts, locked=0):
+    """Insert a clip_index row (no real file needed for payload tests)."""
+    with db.write() as c:
+        c.execute(
+            "INSERT INTO clip_index "
+            "(path, basename, group_name, timestamp, camera, sequence, "
+            " event_type, size_bytes, has_gpx, gps_examined, scanned_at, locked) "
+            "VALUES (?,?,?,?,?,?,?,?,0,1,?,?)",
+            (f"/rec/{day}/{filename}", filename, day, ts,
+             camera, 1, "normal", 1, ts, locked),
+        )
+
+
+def test_get_day_locked_clip_sets_pair_locked(tmp_path):
+    """A downloaded clip with locked=1 makes the returned pair carry locked=1."""
+    db = Database(str(tmp_path / "v.db"))
+    day = "2026-06-18"
+    ts = int(_dt.datetime(2026, 6, 18, 12, 0, 0).timestamp())
+    _seed_clip(db, "2026_0618_120000_0001F.MP4", camera="F",
+               day=day, ts=ts, locked=1)
+
+    kw = dict(time_from=None, time_to=None, driving=True, parking=True, ro=True)
+    out = archive.get_day(_req(db, gps_triage=False), day, **kw)
+    assert len(out["clips"]) == 1
+    assert out["clips"][0]["locked"] == 1
+
+
+def test_get_day_unlocked_clip_sets_pair_locked_zero(tmp_path):
+    """A downloaded clip with locked=0 produces pair locked=0."""
+    db = Database(str(tmp_path / "v.db"))
+    day = "2026-06-18"
+    ts = int(_dt.datetime(2026, 6, 18, 12, 0, 0).timestamp())
+    _seed_clip(db, "2026_0618_120000_0001F.MP4", camera="F",
+               day=day, ts=ts, locked=0)
+
+    kw = dict(time_from=None, time_to=None, driving=True, parking=True, ro=True)
+    out = archive.get_day(_req(db, gps_triage=False), day, **kw)
+    assert len(out["clips"]) == 1
+    assert not out["clips"][0]["locked"]
+
+
+def test_get_day_locked_rear_makes_pair_locked(tmp_path):
+    """If either camera in the pair is locked the pair-level locked is truthy."""
+    db = Database(str(tmp_path / "v.db"))
+    day = "2026-06-18"
+    ts = int(_dt.datetime(2026, 6, 18, 12, 0, 0).timestamp())
+    _seed_clip(db, "2026_0618_120000_0001F.MP4", camera="F",
+               day=day, ts=ts, locked=0)
+    _seed_clip(db, "2026_0618_120000_0002R.MP4", camera="R",
+               day=day, ts=ts, locked=1)
+
+    kw = dict(time_from=None, time_to=None, driving=True, parking=True, ro=True)
+    out = archive.get_day(_req(db, gps_triage=False), day, **kw)
+    assert len(out["clips"]) == 1
+    assert out["clips"][0]["locked"] == 1
+
+
+def test_remote_day_clips_carries_locked(tmp_path):
+    """A queued clip with locked=1 produces a remote pair with locked=1."""
+    db = Database(str(tmp_path / "v.db"))
+    ts = int(_dt.datetime(2026, 6, 18, 12, 0, 0).timestamp())
+    with db.write() as c:
+        c.execute(
+            "INSERT INTO download_queue "
+            "(filename, source_dir, camera, event_type, state, enqueued_at, "
+            " recorded_at, triaged_at, gps_points, locked) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("2026_0618_120000_0001F.MP4", "/DCIM/Movie", "F", "normal",
+             "pending", int(time.time()), ts, int(time.time()), 1, 1),
+        )
+    clips = archive.remote_day_clips(db, "2026-06-18")
+    assert len(clips) == 1
+    assert clips[0]["locked"] == 1
+
+
+def test_remote_day_clips_unlocked_pair_locked_zero(tmp_path):
+    """A queued clip with locked=0 produces a remote pair with locked=0."""
+    db = Database(str(tmp_path / "v.db"))
+    ts = int(_dt.datetime(2026, 6, 18, 12, 0, 0).timestamp())
+    with db.write() as c:
+        c.execute(
+            "INSERT INTO download_queue "
+            "(filename, source_dir, camera, event_type, state, enqueued_at, "
+            " recorded_at, triaged_at, gps_points, locked) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("2026_0618_120000_0001F.MP4", "/DCIM/Movie", "F", "normal",
+             "pending", int(time.time()), ts, int(time.time()), 1, 0),
+        )
+    clips = archive.remote_day_clips(db, "2026-06-18")
+    assert len(clips) == 1
+    assert not clips[0]["locked"]

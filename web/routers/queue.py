@@ -156,8 +156,27 @@ class Unskip(BaseModel):
     filenames: List[str] = Field(default_factory=list)
 
 
+class Lock(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
 class DeleteClips(BaseModel):
     filenames: List[str] = Field(default_factory=list)
+
+
+class DeleteFromCamera(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+@router.post("/queue/delete-from-camera", dependencies=[Depends(require_csrf)])
+def delete_from_camera_route(body: DeleteFromCamera, request: Request) -> dict:
+    snap = request.app.state.settings_provider.get()
+    addr = snap.address
+    if not addr:
+        return {"ok": False, "error": "no dashcam address configured"}
+    res = q.delete_from_camera(request.app.state.db, body.filenames, f"http://{addr}")
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    return {"ok": True, **res}
 
 
 @router.post("/queue/delete", dependencies=[Depends(require_csrf)])
@@ -176,6 +195,13 @@ def unskip(body: Unskip, request: Request) -> dict:
     worker = getattr(request.app.state, "sync_worker", None)
     if worker is not None:
         worker.kick()
+    return {"ok": True, "updated": n}
+
+
+@router.post("/queue/lock", dependencies=[Depends(require_csrf)])
+def lock(body: Lock, request: Request) -> dict:
+    n = q.set_locked(request.app.state.db, body.filenames, True)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
     return {"ok": True, "updated": n}
 
 

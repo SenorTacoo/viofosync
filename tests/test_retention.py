@@ -492,3 +492,79 @@ def test_sweep_logs_progress_every_10_deletions(env, caplog) -> None:
     assert progress[0].startswith("retention sweep: 10/25 clip(s) deleted")
     assert progress[1].startswith("retention sweep: 20/25 clip(s) deleted")
     assert "MB freed so far" in progress[0]
+
+
+# ---------------------------------------------------------------------------
+# locked=1 protection (independent of protect_ro)
+# ---------------------------------------------------------------------------
+
+def test_eligible_by_time_locked_clip_never_deleted() -> None:
+    """A clip with locked=1 must be ineligible regardless of protect_ro."""
+    clip = _clip(ts=0, event_type="normal")
+    clip["locked"] = 1
+    ok, reason = _eligible_by_time(
+        clip, now=86400 * 365, max_days=30, protect_ro=False,
+    )
+    assert ok is False
+    assert reason == "locked"
+
+
+def test_eligible_by_time_unlocked_clip_still_eligible() -> None:
+    """A clip with locked=0 (or missing) is not shielded by the lock check."""
+    clip = _clip(ts=0, event_type="normal")
+    clip["locked"] = 0
+    ok, reason = _eligible_by_time(
+        clip, now=86400 * 365, max_days=30, protect_ro=False,
+    )
+    assert ok is True
+    assert reason == "time"
+
+
+def test_sweep_time_protects_locked_clip_with_protect_ro_false(env) -> None:
+    """Time sweep must NOT delete a locked=1 clip even when protect_ro=False."""
+    rec, db = env
+    now = 86400 * 365
+    clip_id = _make_clip(rec, db, basename="LOCKED.MP4", ts=0)
+    with db.write() as c:
+        c.execute("UPDATE clip_index SET locked=1 WHERE id=?", (clip_id,))
+    # Control: an un-locked clip that SHOULD be deleted.
+    _make_clip(rec, db, basename="NORMAL.MP4", ts=1)
+
+    summary = sweep(
+        db, str(rec), max_days=30, disk_pct=0,
+        protect_ro=False, _now=now,
+    )
+    assert summary["deleted_time"] == 1
+    assert _index_count(db) == 1
+    # Locked clip file must still exist.
+    assert (rec / "1970-01-01" / "LOCKED.MP4").exists()
+    # Un-locked clip must be gone.
+    assert not (rec / "1970-01-01" / "NORMAL.MP4").exists()
+
+
+def test_sweep_disk_protects_locked_clip_with_protect_ro_false(
+    env, monkeypatch
+) -> None:
+    """Disk-pressure sweep must NOT evict a locked=1 clip (protect_ro=False)."""
+    rec, db = env
+    locked_id = _make_clip(rec, db, basename="LOCKED.MP4", ts=100)
+    with db.write() as c:
+        c.execute("UPDATE clip_index SET locked=1 WHERE id=?", (locked_id,))
+    _make_clip(rec, db, basename="NORMAL.MP4", ts=200)
+
+    # Disk stays "full" so sweep keeps trying to evict.
+    monkeypatch.setattr(
+        "web.services.retention.shutil.disk_usage",
+        lambda p: DiskUsage(total=100, used=99, free=1),
+    )
+    summary = sweep(
+        db, str(rec), max_days=0, disk_pct=80,
+        protect_ro=False, _now=86400 * 365,
+    )
+    assert summary["deleted_disk"] == 1
+    # NORMAL deleted; LOCKED survives.
+    with db.conn() as c:
+        remaining = c.execute(
+            "SELECT basename FROM clip_index"
+        ).fetchone()["basename"]
+    assert remaining == "LOCKED.MP4"
