@@ -133,7 +133,9 @@ CREATE TABLE IF NOT EXISTS download_queue (
     manual          INTEGER NOT NULL DEFAULT 0,
     skip_reason     TEXT,             -- 'geofence' (auto) | 'user' | NULL
     geofence_released_at INTEGER,     -- set when a geofence-skip is manually released
-    locked          INTEGER NOT NULL DEFAULT 0  -- user "retain indefinitely"
+    locked          INTEGER NOT NULL DEFAULT 0, -- user "retain indefinitely"
+    triage_attempts INTEGER NOT NULL DEFAULT 0,  -- failed-triage retry counter
+    triage_last_attempt_at INTEGER               -- last triage attempt (backoff)
 );
 CREATE INDEX IF NOT EXISTS idx_queue_state
     ON download_queue(state, priority DESC, enqueued_at ASC);
@@ -261,6 +263,16 @@ class Database:
         # triaged, 0 = triaged but no fix (never retried), >0 = points found.
         _add_column("download_queue", "triaged_at", "INTEGER")
         _add_column("download_queue", "gps_points", "INTEGER")
+
+        # Triage retry bookkeeping (resilient-gps-triage): attempt counter +
+        # last-attempt timestamp so failed triage reads back off and give up
+        # after a bounded number of *unreadable* attempts. triage_attempts is
+        # bumped only for clip-specific failures, never for camera-offline.
+        _add_column(
+            "download_queue", "triage_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        _add_column("download_queue", "triage_last_attempt_at", "INTEGER")
 
         # Geofence exclusion: skip provenance + permanent-release marker.
         # skip_reason 'geofence' = auto-skipped while parked at home,
