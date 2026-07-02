@@ -88,6 +88,15 @@ def _delete_index_row(db: Database, clip_id: int) -> None:
         c.execute("DELETE FROM clip_index WHERE id = ?", (clip_id,))
 
 
+def delete_clip(db: Database, rec: dict, recordings: str) -> int:
+    """Delete one downloaded clip's files (mp4 + .gpx + thumb/sprite/meta) and its
+    clip_index row. Returns bytes freed. Public wrapper over the same plumbing the
+    retention sweep uses, for the user-initiated archive delete."""
+    freed = _delete_clip_files(rec, recordings)
+    _delete_index_row(db, rec["id"])
+    return freed
+
+
 def _broadcast(sink, filename: str, reason: str) -> None:
     if sink is None:
         return

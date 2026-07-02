@@ -963,7 +963,7 @@ function renderUngroupedCard(clips) {
 
 function renderJourneyCard(j, clips, idx, date) {
   const el = document.createElement("div");
-  el.className = "journey-card collapsible";
+  el.className = "journey-card collapsible drive";
   const mapId = `journey-map-${j.start_ts}-${idx}`;
   const distance = fmtDistance(j.distance_m);
   const startT = new Date(j.start_time).toLocaleTimeString();
@@ -1377,45 +1377,10 @@ function updateArchiveActions() {
     label.textContent = `${n} selected`;
     bar.classList.add("has-selection");
   }
-  // Per-camera selection counts, plus front+partner pair counts
-  // for the PiP buttons.
-  const count = Object.fromEntries(CAMERAS.map((c) => [c.channel, 0]));
-  const withFront = Object.fromEntries(
-    CAMERAS.map((c) => [c.channel, 0]),
-  );
-  for (const v of state.archiveSelected.values()) {
-    for (const c of CAMERAS) {
-      if (v[c.channel]) count[c.channel]++;
-      if (v.front && v[c.channel]) withFront[c.channel]++;
-    }
-  }
-  const hasFront = count.front > 0, hasRear = count.rear > 0;
-  const hasPair = withFront.rear > 0;
-  document.getElementById("dl-orig-front").disabled = !hasFront;
-  document.getElementById("dl-orig-rear").disabled = !hasRear;
-  document.getElementById("export-join-front").disabled = !hasFront;
-  document.getElementById("export-join-rear").disabled = !hasRear;
-  document.getElementById("export-pip-front").disabled = !hasPair;
-  document.getElementById("export-pip-rear").disabled = !hasPair;
-  // Third-camera actions: the whole button group stays hidden until
-  // the selection contains a clip from that camera, so 2-camera
-  // setups see the original action bar unchanged.
-  for (const c of EXTRA_CAMERAS) {
-    const group = document.getElementById(`actions-${c.channel}`);
-    if (!group) continue;
-    const present = count[c.channel] > 0;
-    group.hidden = !present;
-    if (!present) continue;
-    document.getElementById(`dl-orig-${c.channel}`).disabled = false;
-    document.getElementById(`export-join-${c.channel}`).disabled = false;
-    document.getElementById(`export-pip-${c.channel}`).disabled =
-      withFront[c.channel] === 0;
-  }
-  document.getElementById("clear-selection").disabled = n === 0;
+  document.getElementById("clip-action-apply").disabled = n === 0;
+  document.getElementById("clip-action-clear").disabled = n === 0;
+  rebuildClipActionMenu();
 }
-
-// Call once on load so the disabled buttons render correctly.
-updateArchiveActions();
 
 function clearSelection() {
   state.archiveSelected.clear();
@@ -1533,47 +1498,67 @@ document.getElementById("exports-toggle").addEventListener("click", () => {
   setExportsPanelOpen(!open);
 });
 
-// One originals/join/pip button trio per camera. "pip" is the
-// legacy name of the front-main job; every other camera's PiP is
-// pip_<channel>.
-for (const c of CAMERAS) {
-  const ch = c.channel;
-  document.getElementById(`dl-orig-${ch}`)
-    .addEventListener("click", () => downloadOriginals(ch));
-  document.getElementById(`export-join-${ch}`)
-    .addEventListener("click", () => submitExport(`join_${ch}`));
-  document.getElementById(`export-pip-${ch}`)
-    .addEventListener("click", () =>
-      submitExport(ch === "front" ? "pip" : `pip_${ch}`));
-}
-document.getElementById("clear-selection")
-  .addEventListener("click", clearSelection);
+// ---- Consolidated "Clip actions" control (sticky toolbar) ----
 
-const DOWNLOAD_ACTION_ENDPOINT = {
+const CAMERA_LABEL_BY_CHANNEL = Object.fromEntries(CAMERAS.map((c) => [c.channel, c.label]));
+const EXPORT_CAMERAS_ALWAYS = ["front", "rear"];
+
+// Rebuild the Export optgroup: Front/Rear always; Tele/Interior only when the
+// current selection contains such clips. Originals first, then Joined (the order
+// the user reads top-to-bottom). Preserves the current selection if still valid.
+function rebuildClipActionMenu() {
+  const sel = document.getElementById("clip-action");
+  const grp = document.getElementById("clip-action-export");
+  if (!sel || !grp) return;
+  const present = new Set();
+  for (const v of state.archiveSelected.values()) {
+    for (const c of EXTRA_CAMERAS) if (v[c.channel]) present.add(c.channel);
+  }
+  const cams = [
+    ...EXPORT_CAMERAS_ALWAYS,
+    ...EXTRA_CAMERAS.filter((c) => present.has(c.channel)).map((c) => c.channel),
+  ];
+  // Only rewrite the optgroup when the camera set actually changed — avoids
+  // churning the DOM (and closing an open dropdown) on every checkbox tick.
+  const newValues = cams.flatMap((cam) => [`originals-${cam}`, `join-${cam}`]);
+  // grp is an <optgroup> (no .options — that's a <select>-only property); its
+  // <option>s are its direct children.
+  const oldValues = [...grp.children].map((o) => o.value);
+  if (newValues.join() === oldValues.join()) return;
+  const prev = sel.value;
+  grp.innerHTML =
+    cams.map((cam) =>
+      `<option value="originals-${cam}">Originals · ${CAMERA_LABEL_BY_CHANNEL[cam]}</option>`).join("") +
+    cams.map((cam) =>
+      `<option value="join-${cam}">Joined · ${CAMERA_LABEL_BY_CHANNEL[cam]}</option>`).join("");
+  // If the previously-selected option vanished (a tele/interior option that's no
+  // longer offered), fall back to the first Queue action.
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  else sel.value = "download-next";
+}
+
+function selectionHasCamera(cam) {
+  for (const v of state.archiveSelected.values()) if (v[cam]) return true;
+  return false;
+}
+
+const QUEUE_ENDPOINT = {
   "download-next": "/api/queue/download-next",
   "skip": "/api/queue/skip",
-  "clear-skip": "/api/queue/unskip",
-  "retry": "/api/queue/retry",
 };
 
-async function applyDownloadAction() {
-  const action = document.getElementById("download-action").value;
-  const endpoint = DOWNLOAD_ACTION_ENDPOINT[action];
-  if (!endpoint) return;
-  const filenames = [
-    ...new Set(
-      [...state.archiveSelected.values()].flatMap((v) => v.filenames || []),
-    ),
-  ];
-  if (!filenames.length) {
-    toast("Select some clips first.", { type: "error" });
-    return;
-  }
+async function runQueueAction(action, filenames) {
   try {
-    const res = await api(endpoint, {
-      method: "POST",
-      body: JSON.stringify({ filenames }),
-    });
+    let res;
+    if (action === "retry") {
+      // Retry also clears any user/geofence skip on the selection first.
+      await api("/api/queue/unskip", { method: "POST", body: JSON.stringify({ filenames }) });
+      res = await api("/api/queue/retry", { method: "POST", body: JSON.stringify({ filenames }) });
+    } else {
+      const endpoint = QUEUE_ENDPOINT[action];
+      if (!endpoint) { toast(`Unknown action: ${action}`, { type: "error" }); return; }
+      res = await api(endpoint, { method: "POST", body: JSON.stringify({ filenames }) });
+    }
     toast(`${action.replaceAll("-", " ")}: ${res.updated} updated`);
     clearSelection();
     refreshOpenArchiveDays();
@@ -1582,8 +1567,61 @@ async function applyDownloadAction() {
   }
 }
 
-document.getElementById("download-action-apply")
-  .addEventListener("click", applyDownloadAction);
+async function runQueueDelete(filenames) {
+  try {
+    const res = await api("/api/queue/delete", { method: "POST", body: JSON.stringify({ filenames }) });
+    toast(`Deleted ${res.deleted}, skipped ${res.skipped}`);
+    clearSelection();
+    refreshOpenArchiveDays();
+  } catch (e) {
+    toast(`Delete failed: ${e.message || e}`, { type: "error" });
+  }
+}
+
+async function applyClipAction() {
+  if (state.archiveSelected.size === 0) {
+    toast("Select some clips first.", { type: "error" });
+    return;
+  }
+  const action = document.getElementById("clip-action").value;
+
+  // Export actions operate on per-camera clip ids.
+  if (action.startsWith("originals-") || action.startsWith("join-")) {
+    const cam = action.slice(action.indexOf("-") + 1);
+    if (!selectionHasCamera(cam)) {
+      toast(`No ${CAMERA_LABEL_BY_CHANNEL[cam] || cam} clips selected.`, { type: "error" });
+      return;
+    }
+    if (action.startsWith("originals-")) downloadOriginals(cam);
+    else submitExport(`join_${cam}`);
+    return;
+  }
+
+  // Queue actions operate on filenames.
+  const filenames = [
+    ...new Set([...state.archiveSelected.values()].flatMap((v) => v.filenames || [])),
+  ];
+  if (!filenames.length) {
+    toast("Select some clips first.", { type: "error" });
+    return;
+  }
+  if (action === "delete") {
+    if (!confirm(
+      `Delete ${filenames.length} downloaded clip(s) from storage and skip them ` +
+      `so they won't re-download? Files on the camera aren't affected.`,
+    )) return;
+    await runQueueDelete(filenames);
+    return;
+  }
+  await runQueueAction(action, filenames);
+}
+
+document.getElementById("clip-action-apply").addEventListener("click", applyClipAction);
+document.getElementById("clip-action-clear").addEventListener("click", clearSelection);
+
+// Prime the toolbar's disabled state + camera-aware menu on load. Placed here
+// (not at updateArchiveActions's definition) so the consts above are initialised.
+updateArchiveActions();
 
 async function refreshExportJobs() {
   try {

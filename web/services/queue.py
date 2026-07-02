@@ -706,6 +706,36 @@ def skip(db: Database, filenames: List[str]) -> int:
         return cur.rowcount
 
 
+def delete_clips(db: Database, filenames: List[str], recordings: str) -> dict:
+    """User-initiated delete of selected clips: remove the downloaded files +
+    clip_index rows, and mark the download_queue rows skipped (regardless of
+    current state — downloaded rows are 'done') so they won't re-download. Returns
+    {'deleted': <files/index rows removed>, 'skipped': <queue rows marked>}."""
+    if not filenames:
+        return {"deleted": 0, "skipped": 0}
+    from . import retention as _retention
+    with db.conn() as c:
+        ph = ",".join("?" * len(filenames))
+        rows = c.execute(
+            f"SELECT id, path, basename, event_type FROM clip_index "
+            f"WHERE basename IN ({ph})",
+            filenames,
+        ).fetchall()
+    deleted = 0
+    for r in rows:
+        _retention.delete_clip(db, dict(r), recordings)
+        deleted += 1
+    with db.write() as c:
+        ph = ",".join("?" * len(filenames))
+        cur = c.execute(
+            f"UPDATE download_queue SET state='skipped', skip_reason='user' "
+            f"WHERE filename IN ({ph})",
+            filenames,
+        )
+        skipped = cur.rowcount
+    return {"deleted": deleted, "skipped": skipped}
+
+
 def unskip(db: Database, filenames: List[str]) -> int:
     """Return ``skipped`` files to ``pending`` for downloading again,
     resetting attempts/last_error for a fresh try (mirrors ``retry``).

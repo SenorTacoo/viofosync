@@ -96,15 +96,6 @@
           <span class="filter-sep"></span>
           <button type="button" id="rescan">Rescan</button>
           <button type="button" id="extract-gps">Extract GPS</button>
-          <span class="filter-sep"></span>
-          <label class="kind-label" for="download-action">Download actions</label>
-          <select id="download-action">
-            <option value="download-next">Download next</option>
-            <option value="skip">Skip</option>
-            <option value="clear-skip">Clear skip</option>
-            <option value="retry">Retry failed</option>
-          </select>
-          <button type="button" id="download-action-apply">Apply</button>
         </div>
         <div id="archive-actions" class="archive-actions">
           <button type="button" id="exports-toggle" class="exports-toggle"
@@ -115,62 +106,25 @@
           </button>
           <span id="selection-count" class="selection-hint" aria-live="polite"></span>
           <div class="spacer"></div>
-          <div class="action-group">
-            <span class="action-label">Originals:</span>
-            <button type="button" id="dl-orig-front"
-                    aria-label="Download selected front originals"
-                    title="Download selected front originals">F</button>
-            <button type="button" id="dl-orig-rear"
-                    aria-label="Download selected rear originals"
-                    title="Download selected rear originals">R</button>
+          <div class="action-group clip-action-group">
+            <label class="action-label" for="clip-action">Clip actions</label>
+            <select id="clip-action">
+              <optgroup label="Queue">
+                <option value="download-next">Download next</option>
+                <option value="skip">Skip</option>
+                <option value="retry">Retry</option>
+                <option value="delete">Delete…</option>
+              </optgroup>
+              <optgroup label="Export" id="clip-action-export">
+                <option value="originals-front">Originals · Front</option>
+                <option value="originals-rear">Originals · Rear</option>
+                <option value="join-front">Joined · Front</option>
+                <option value="join-rear">Joined · Rear</option>
+              </optgroup>
+            </select>
+            <button type="button" id="clip-action-apply">Apply</button>
+            <button type="button" id="clip-action-clear">Clear</button>
           </div>
-          <div class="action-group">
-            <span class="action-label">Joined:</span>
-            <button type="button" id="export-join-front"
-                    aria-label="Join selected front clips"
-                    title="Join selected front clips">F</button>
-            <button type="button" id="export-join-rear"
-                    aria-label="Join selected rear clips"
-                    title="Join selected rear clips">R</button>
-          </div>
-          <div class="action-group">
-            <span class="action-label">PIP:</span>
-            <button type="button" id="export-pip-front"
-                    aria-label="Picture-in-picture, front main"
-                    title="Picture-in-picture, front main">Fr</button>
-            <button type="button" id="export-pip-rear"
-                    aria-label="Picture-in-picture, rear main"
-                    title="Picture-in-picture, rear main">Rf</button>
-          </div>
-          <!-- Third-camera (telephoto / interior) groups: hidden
-               until the selection contains a clip from that
-               camera, so 2-camera setups see the original bar
-               unchanged. -->
-          <div class="action-group" id="actions-tele" hidden>
-            <span class="action-label">Tele:</span>
-            <button type="button" id="dl-orig-tele"
-                    aria-label="Download selected telephoto originals"
-                    title="Download selected telephoto originals">T</button>
-            <button type="button" id="export-join-tele"
-                    aria-label="Join selected telephoto clips"
-                    title="Join selected telephoto clips">Join</button>
-            <button type="button" id="export-pip-tele"
-                    aria-label="Picture-in-picture, telephoto main"
-                    title="Picture-in-picture, telephoto main">Tf</button>
-          </div>
-          <div class="action-group" id="actions-interior" hidden>
-            <span class="action-label">Interior:</span>
-            <button type="button" id="dl-orig-interior"
-                    aria-label="Download selected interior originals"
-                    title="Download selected interior originals">I</button>
-            <button type="button" id="export-join-interior"
-                    aria-label="Join selected interior clips"
-                    title="Join selected interior clips">Join</button>
-            <button type="button" id="export-pip-interior"
-                    aria-label="Picture-in-picture, interior main"
-                    title="Picture-in-picture, interior main">If</button>
-          </div>
-          <button type="button" id="clear-selection">Clear selected clips</button>
         </div>
         <div id="exports-panel" class="exports-panel" hidden>
           <div id="exports-list"></div>

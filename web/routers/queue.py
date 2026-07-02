@@ -156,6 +156,18 @@ class Unskip(BaseModel):
     filenames: List[str] = Field(default_factory=list)
 
 
+class DeleteClips(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+@router.post("/queue/delete", dependencies=[Depends(require_csrf)])
+def delete_clips(body: DeleteClips, request: Request) -> dict:
+    recordings = request.app.state.settings_provider.get().recordings
+    res = q.delete_clips(request.app.state.db, body.filenames, recordings)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    return {"ok": True, **res}
+
+
 @router.post("/queue/unskip", dependencies=[Depends(require_csrf)])
 def unskip(body: Unskip, request: Request) -> dict:
     n = q.unskip(request.app.state.db, body.filenames)
