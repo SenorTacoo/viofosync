@@ -568,6 +568,8 @@ function renderDayCard(d) {
   const open = state.archiveExpanded.has(d.day);
   el.innerHTML = `
     <div class="day-header">
+      <input type="checkbox" class="day-check"
+             title="Select all clips in this day" />
       <h3>${d.day}</h3>
       <div class="meta">
         ${d.clip_count} clips${
@@ -578,6 +580,10 @@ function renderDayCard(d) {
           ].filter(Boolean).map((s) => ` · ${s}`).join("")
         } · ${fmtBytes(d.total_bytes)}${d.gpx_count ? " · GPS" : ""}${
           d.remote_count ? ` · ${d.remote_count} on camera` : ""
+        }${
+          d.geofence_skipped_count
+            ? ` · ${d.geofence_skipped_count} GPS-excluded`
+            : ""
         }
       </div>
     </div>
@@ -592,16 +598,26 @@ function renderDayCard(d) {
     }
     body.hidden = false;
     state.archiveExpanded.add(d.day);
-    body.innerHTML = "<p>Loading…</p>";
-    await renderDayBody(body, d.day);
+    await loadDayBody(el);
   });
+  wireDayCheck(el);
   // Restore a remembered-open day: populate its body immediately. Async; the
   // card is returned synchronously and fills in when the fetch resolves.
   if (open) {
-    body.innerHTML = "<p>Loading…</p>";
-    renderDayBody(body, d.day);
+    loadDayBody(el);
   }
   return el;
+}
+
+// Load (or reload) a day's body, then sync its select-all checkbox. Centralised
+// so the day-header toggle, a remembered-open day, and the day-level select-all
+// all populate the body the same way and mark it loaded for refreshDayCheck.
+async function loadDayBody(dayEl) {
+  const body = dayEl.querySelector(".day-body");
+  body.innerHTML = "<p>Loading…</p>";
+  await renderDayBody(body, dayEl.dataset.day);
+  body.dataset.loaded = "1";
+  refreshDayCheck(dayEl);
 }
 
 // A pair carries GPS if it's a remote tile (already gated to gps_points>0) or
@@ -887,7 +903,6 @@ function renderStopCard(stop, clips, idx) {
       <input type="checkbox" class="journey-check"
              title="Select all clips in this stop" />
       <span class="journey-times">${startT} – ${endT}</span>
-      <span class="stop-icon" aria-hidden="true">⏸</span>
       <strong class="journey-title">
         <span class="stop-label">${placeGlyph(stop.home, stop.named)}${escHtml(placeLabel)}</span>
       </strong>
@@ -895,6 +910,7 @@ function renderStopCard(stop, clips, idx) {
         ${fmtDuration(stop.duration_s)} ·
         ${clips.length} clip${clips.length === 1 ? "" : "s"}
       </span>
+      <span class="stop-icon" aria-hidden="true">⏸</span>
     </div>
     <div class="journey-body" hidden>
       <div id="${mapId}" class="journey-map stop-map"></div>
@@ -1309,6 +1325,9 @@ function renderClipPair(pair) {
     // unchecked as appropriate.
     const card = el.closest(".journey-card");
     if (card) refreshCardCheck(card);
+    // Also reflect up to the day-level "select all" header checkbox.
+    const dayEl = el.closest(".day");
+    if (dayEl) refreshDayCheck(dayEl);
   });
 
   return el;
@@ -1366,6 +1385,58 @@ function wireJourneyCheck(cardEl) {
   refreshCardCheck(cardEl);
 }
 
+// ---- Day-level "select all" ----
+
+function refreshDayCheck(dayEl) {
+  const cb = dayEl.querySelector(".day-check");
+  if (!cb) return;
+  const body = dayEl.querySelector(".day-body");
+  // A collapsed / not-yet-loaded day keeps its checkbox actionable — clicking
+  // it loads the body and selects everything. We just can't reflect counts yet.
+  if (!body || body.dataset.loaded !== "1" || body.hidden) {
+    cb.disabled = false;
+    cb.indeterminate = false;
+    return;
+  }
+  const pairs = dayEl.querySelectorAll(
+    '.day-body .clip-pair input[type="checkbox"]:not([disabled])');
+  const total = pairs.length;
+  if (total === 0) {          // loaded but nothing selectable (e.g. remote-only)
+    cb.disabled = true;
+    cb.checked = false;
+    cb.indeterminate = false;
+    return;
+  }
+  let checked = 0;
+  pairs.forEach((p) => { if (p.checked) checked++; });
+  cb.disabled = false;
+  cb.checked = checked === total;
+  cb.indeterminate = checked > 0 && checked < total;
+}
+
+function wireDayCheck(dayEl) {
+  const cb = dayEl.querySelector(".day-check");
+  if (!cb) return;
+  // Keep the tick from also toggling the day's expand/collapse (same header).
+  cb.addEventListener("click", (e) => e.stopPropagation());
+  cb.addEventListener("change", async (e) => {
+    const body = dayEl.querySelector(".day-body");
+    if (e.target.checked) {
+      // Selecting a whole day needs its clips in the DOM, so expand + load
+      // first if it hasn't been opened yet, then tick every clip.
+      if (body.hidden) {
+        body.hidden = false;
+        state.archiveExpanded.add(dayEl.dataset.day);
+      }
+      if (body.dataset.loaded !== "1") await loadDayBody(dayEl);
+      setCardSelection(body, true);
+    } else {
+      setCardSelection(body, false);
+    }
+    refreshDayCheck(dayEl);
+  });
+}
+
 function updateArchiveActions() {
   const n = state.archiveSelected.size;
   const label = document.getElementById("selection-count");
@@ -1391,6 +1462,11 @@ function clearSelection() {
   // checkbox so it goes back to unchecked too.
   document.querySelectorAll("#view-archive .journey-card")
     .forEach(refreshCardCheck);
+  // And every day-level "select all" header checkbox.
+  document.querySelectorAll("#view-archive .day-check").forEach((cb) => {
+    cb.checked = false;
+    cb.indeterminate = false;
+  });
   updateArchiveActions();
 }
 
@@ -3456,10 +3532,9 @@ function renderGpsMaintenance(pane) {
   const note = document.createElement("p");
   note.className = "hint";
   note.textContent =
-    "Re-runs named-location detection and rebuilds journey grouping from the " +
-    "GPS data already on disk — useful after changing locations or grouping " +
-    "logic. Doesn't re-download anything, but clips no longer matched to an " +
-    "excluded location may be queued for download.";
+    "Rebuilds location labels and journey grouping from existing GPS data; use " +
+    "after changing locations. Nothing is re-downloaded, but clips no longer " +
+    "excluded by a location may be queued for download.";
   pane.appendChild(note);
 
   const btn = document.createElement("button");
@@ -3632,9 +3707,8 @@ function renderLocations(pane) {
   const note = document.createElement("p");
   note.className = "hint";
   note.textContent =
-    "Named places used to label journeys and stops. One place is your Home " +
-    "(shown with a house icon); the rest use a pin. With GPS Triage on, a place " +
-    "can also auto-skip recordings made while parked there. Default radius 30 m.";
+    "Named places used to label and filter journeys and stops. With GPS Triage " +
+    "on, a place can also auto-skip recordings made while parked there.";
   pane.appendChild(note);
 
   const listWrap = document.createElement("div");

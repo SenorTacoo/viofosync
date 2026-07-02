@@ -98,6 +98,28 @@ def test_delete_empty_is_noop(tmp_path):
     assert delete_clips(db, [], str(rec)) == {"deleted": 0, "skipped": 0}
 
 
+def test_delete_logs_info_audit_line(tmp_path, caplog):
+    # The viofosync.queue logger emits at INFO, which DBLogHandler persists to
+    # app_log — so a delete leaves an audit trail.
+    from web.services.queue import delete_clips
+    rec, db = _env(tmp_path)
+    _make_clip(rec, db, basename="A.MP4")
+    with caplog.at_level("INFO", logger="viofosync.queue"):
+        delete_clips(db, ["A.MP4"], str(rec))
+    recs = [r for r in caplog.records if r.name == "viofosync.queue"]
+    assert any("archive delete" in r.getMessage() and "A.MP4" in r.getMessage()
+               for r in recs), recs
+
+
+def test_delete_noop_does_not_log(tmp_path, caplog):
+    # Nothing matched -> no audit line (avoids "removed 0" noise).
+    from web.services.queue import delete_clips
+    rec, db = _env(tmp_path)
+    with caplog.at_level("INFO", logger="viofosync.queue"):
+        delete_clips(db, ["NOPE.MP4"], str(rec))
+    assert not [r for r in caplog.records if r.name == "viofosync.queue"]
+
+
 @pytest.fixture
 def authed_client(tmp_config_dir: Path, tmp_recordings_dir: Path, monkeypatch):
     from web import app as app_mod

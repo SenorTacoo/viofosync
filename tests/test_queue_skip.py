@@ -70,6 +70,21 @@ def test_unskip_empty_is_noop(tmp_path):
     assert unskip(db, []) == 0
 
 
+def test_skip_and_unskip_log_info_audit(tmp_path, caplog):
+    # viofosync.queue INFO is persisted to app_log by DBLogHandler.
+    from web.db import Database
+    from web.services.queue import skip, unskip
+    db = Database(str(tmp_path / "v.db"))
+    with db.write() as c:
+        _insert(c, "p.MP4", "pending")
+    with caplog.at_level("INFO", logger="viofosync.queue"):
+        skip(db, ["p.MP4"])
+        unskip(db, ["p.MP4"])
+    msgs = [r.getMessage() for r in caplog.records if r.name == "viofosync.queue"]
+    assert any("archive skip" in m and "p.MP4" in m for m in msgs), msgs
+    assert any("archive unskip" in m and "p.MP4" in m for m in msgs), msgs
+
+
 def test_next_pending_ignores_skipped(tmp_path):
     from web.db import Database
     from web.services.queue import next_pending

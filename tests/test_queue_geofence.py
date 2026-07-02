@@ -102,3 +102,25 @@ def test_pending_days(db: Database) -> None:
     _seed(db, "2026_0619_080000_0001F.MP4", state="pending")
     _seed(db, "2026_0617_080000_0001F.MP4", state="done")
     assert set(q.pending_days(db)) == {"2026-06-18", "2026-06-19"}
+
+
+def test_geofence_skipped_by_day_counts_front_geofence_only(db: Database) -> None:
+    from web.routers.archive import geofence_skipped_by_day
+    # Two geofence-skipped pairs on 2026-06-19 (front clips counted only).
+    _seed(db, "2026_0619_082048_001F.MP4", state="skipped", skip_reason="geofence")
+    _seed(db, "2026_0619_082048_001R.MP4", state="skipped", skip_reason="geofence")
+    _seed(db, "2026_0619_082148_002F.MP4", state="skipped", skip_reason="geofence")
+    # A user skip and a pending clip must NOT count.
+    _seed(db, "2026_0619_083000_003F.MP4", state="skipped", skip_reason="user")
+    _seed(db, "2026_0619_084000_004F.MP4", state="pending")
+    # A different day.
+    _seed(db, "2026_0620_090000_005F.MP4", state="skipped", skip_reason="geofence")
+    assert geofence_skipped_by_day(db) == {"2026-06-19": 2, "2026-06-20": 1}
+
+
+def test_geofence_skipped_by_day_respects_date_range(db: Database) -> None:
+    from web.routers.archive import geofence_skipped_by_day
+    _seed(db, "2026_0619_082048_001F.MP4", state="skipped", skip_reason="geofence")
+    _seed(db, "2026_0620_090000_002F.MP4", state="skipped", skip_reason="geofence")
+    assert geofence_skipped_by_day(db, "2026-06-20", None) == {"2026-06-20": 1}
+    assert geofence_skipped_by_day(db, None, "2026-06-19") == {"2026-06-19": 1}

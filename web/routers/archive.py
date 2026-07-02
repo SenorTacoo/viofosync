@@ -162,6 +162,11 @@ def list_days(
         # is page-1-inclusive only — the frontend must not derive an exact page
         # count from it across pages. A fully paginated clip_index + queue union
         # is deliberately out of scope (see the plan).
+        # GPS-excluded (geofence auto-skipped) clips per day, so the day card
+        # can report how much parked-at-home footage was held back.
+        gskip = geofence_skipped_by_day(_db(request), date_from, date_to)
+        for d in days:
+            d["geofence_skipped_count"] = gskip.get(d["day"], 0)
         by_day = {d["day"]: d for d in days}
         for rd in remote_day_summaries(_db(request), date_from, date_to):
             d = by_day.get(rd["day"])
@@ -180,6 +185,7 @@ def list_days(
                     "last_ts": rd["last_ts"], "total_bytes": 0,
                     "remote_count": rd["remote_count"],
                     "remote_gps_count": rd["remote_gps_count"],
+                    "geofence_skipped_count": gskip.get(rd["day"], 0),
                 })
                 total += 1
         days.sort(key=lambda dd: dd["day"], reverse=(sort == "desc"))
@@ -337,6 +343,33 @@ def remote_day_summaries(db, date_from=None, date_to=None) -> list[dict]:
             params,
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def geofence_skipped_by_day(db, date_from=None, date_to=None) -> dict[str, int]:
+    """Per-day count of clips auto-skipped by the home geofence
+    (``skip_reason='geofence'``), keyed by ``YYYY-MM-DD``. Counts front clips
+    only, matching the archive's pair-oriented day stats. Lets the day card show
+    how much footage was excluded as parked-at-home."""
+    day = _queue_day_expr()
+    where = [
+        "state = 'skipped'",
+        "skip_reason = 'geofence'",
+        "upper(substr(filename, -5, 1)) = 'F'",
+    ]
+    params: list = []
+    if date_from:
+        where.append(f"{day} >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append(f"{day} <= ?")
+        params.append(date_to)
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT {day} AS day, COUNT(*) AS n FROM download_queue "
+            f"WHERE {' AND '.join(where)} GROUP BY {day}",
+            params,
+        ).fetchall()
+    return {r["day"]: r["n"] for r in rows}
 
 
 def remote_day_clips(db, date: str) -> list[dict]:

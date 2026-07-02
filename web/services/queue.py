@@ -20,6 +20,7 @@ State machine (see the plan for rationale):
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence
@@ -27,6 +28,19 @@ from typing import Iterable, List, Optional, Sequence
 from viofosync_lib.cameras import CAMERA_LETTERS
 
 from ..db import Database
+
+# INFO-level here is persisted to the app_log table by DBLogHandler (the
+# "viofosync.*" namespace is captured at INFO) — so user-initiated archive
+# mutations (delete/skip/unskip/retry/download-next/prioritize) leave an
+# audit trail in the activity log, not just the console.
+log = logging.getLogger("viofosync.queue")
+
+
+def _names(filenames: List[str], limit: int = 20) -> str:
+    """Compact, log-friendly rendering of a filename list (truncated)."""
+    shown = ", ".join(filenames[:limit])
+    extra = len(filenames) - limit
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
 @dataclass
@@ -671,6 +685,9 @@ def prioritize(
             f"WHERE filename IN ({ph}) AND state='pending'",
             [target] + filenames,
         )
+        if cur.rowcount:
+            log.info("archive prioritize (%s): %d clip(s) — %s",
+                     position, cur.rowcount, _names(filenames))
         return cur.rowcount
 
 
@@ -685,6 +702,9 @@ def retry(db: Database, filenames: List[str]) -> int:
             f"WHERE filename IN ({ph}) AND state='failed'",
             filenames,
         )
+        if cur.rowcount:
+            log.info("archive retry: %d failed clip(s) requeued — %s",
+                     cur.rowcount, _names(filenames))
         return cur.rowcount
 
 
@@ -703,6 +723,9 @@ def skip(db: Database, filenames: List[str]) -> int:
             f"AND state IN ('pending', 'failed')",
             filenames,
         )
+        if cur.rowcount:
+            log.info("archive skip: %d clip(s) skipped — %s",
+                     cur.rowcount, _names(filenames))
         return cur.rowcount
 
 
@@ -733,6 +756,11 @@ def delete_clips(db: Database, filenames: List[str], recordings: str) -> dict:
             filenames,
         )
         skipped = cur.rowcount
+    if deleted or skipped:
+        log.info(
+            "archive delete: removed %d clip(s), marked %d queue row(s) "
+            "skipped — %s", deleted, skipped, _names(filenames),
+        )
     return {"deleted": deleted, "skipped": skipped}
 
 
@@ -752,6 +780,9 @@ def unskip(db: Database, filenames: List[str]) -> int:
             f"WHERE filename IN ({ph}) AND state='skipped'",
             [int(time.time())] + filenames,
         )
+        if cur.rowcount:
+            log.info("archive unskip: %d clip(s) returned to pending — %s",
+                     cur.rowcount, _names(filenames))
         return cur.rowcount
 
 

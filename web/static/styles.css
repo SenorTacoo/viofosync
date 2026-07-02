@@ -558,6 +558,13 @@ main {
   align-items: baseline;
 }
 .day-header:hover { background: rgba(255, 255, 255, 0.015); }
+.day-header .day-check {
+  flex: 0 0 auto;
+  align-self: center;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
 /* The date is the strongest landmark on the archive page;
  * it deserves more weight than the metadata that follows it.
  * Pre-bolder this was 15px/600 (≈1.07× the 14px body — flat).
@@ -710,6 +717,11 @@ main {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 14px;
   flex-wrap: wrap;
+  /* Reserve the Timeline button's row height (only drive cards carry it) so a
+     button-less stop / ungrouped header is the same height as a drive's. With
+     box-sizing: border-box this clamps every header — whatever its padding — to
+     one height; align-items: center keeps the content vertically centred. */
+  min-height: 50px;
 }
 .journey-card.collapsible .journey-header {
   cursor: pointer;
@@ -745,7 +757,13 @@ main {
 .start-label, .end-label, .stop-label {
   overflow-wrap: anywhere;
 }
-.journey-header .journey-times { color: var(--text); font-size: 13px; }
+/* tabular-nums keeps every HH:MM:SS range the same width, so the journey-title
+   column starts at the same x on drive and stop cards. */
+.journey-header .journey-times {
+  color: var(--text); font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
 .journey-header .journey-meta {
   color: var(--muted); font-size: 12px;
   margin-left: auto;
@@ -758,7 +776,13 @@ main {
 .journey-card .clip-grid { padding: 12px; }
 
 .stop-card .journey-header { background: rgba(241, 196, 15, 0.05); }
-.stop-card .stop-icon { font-size: 14px; color: var(--warn); }
+/* In the stop-card header the icon sits in the right-hand action slot — the
+   same place the Timeline button occupies on drive cards (8px past the meta,
+   matching the button's margin). */
+.stop-card .journey-header .stop-icon {
+  font-size: 14px; color: var(--warn);
+  flex: 0 0 auto; margin-left: 8px;
+}
 .stop-card .journey-map { height: 200px; }
 
 /* Drives are the spine of the day: accent rail + graded header wash + bold title.
