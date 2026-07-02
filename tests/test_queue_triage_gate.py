@@ -39,6 +39,23 @@ def test_rear_sibling_is_gated_with_front(tmp_path):
     assert q.next_pending(db, triage_gate=True) is None
 
 
+def test_prefixed_parking_pair_is_gated_then_released(tmp_path):
+    # Parking/event prefixes (PF/PR) must reconstruct correctly: the gate's
+    # substr() rebuilds the GPS sibling as `…0001PF.MP4`, so the prefixed rear
+    # is held until the prefixed front is triaged.
+    db = Database(str(tmp_path / "v.db"))
+    _seed(db, "2026_0618_203643_0001PF.MP4")         # parking front, pending
+    _seed(db, "2026_0618_203643_0001PR.MP4")         # parking rear of pair
+    assert q.next_pending(db, triage_gate=True) is None
+    # Triage the front → the whole parking pair is released.
+    with db.write() as c:
+        c.execute(
+            "UPDATE download_queue SET triaged_at=? WHERE filename=?",
+            (int(time.time()), "2026_0618_203643_0001PF.MP4"),
+        )
+    assert q.next_pending(db, triage_gate=True) is not None
+
+
 def test_released_once_triaged(tmp_path):
     db = Database(str(tmp_path / "v.db"))
     _seed(db, "2026_0618_203643_0001F.MP4",

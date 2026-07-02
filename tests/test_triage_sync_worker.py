@@ -203,3 +203,98 @@ async def test_drain_passes_triage_gate(tmp_path, monkeypatch):
 
     await sw._cycle()
     assert captured == {"ro_only": False, "triage_gate": True}
+
+
+def _seed_dl(db, filename, *, recorded_at, triaged_at=None, gps_points=None):
+    with db.write() as c:
+        c.execute(
+            "INSERT INTO download_queue (filename, source_dir, camera, "
+            "event_type, state, enqueued_at, recorded_at, triaged_at, "
+            "gps_points) VALUES (?,?,?,?,?,?,?,?,?)",
+            (filename, "/DCIM", filename[-5], "normal", "pending",
+             recorded_at, recorded_at, triaged_at, gps_points),
+        )
+
+
+def _cycle_stubs(sw, monkeypatch):
+    async def _noop(*a, **k):
+        return None
+
+    async def _true(*a, **k):
+        return True
+
+    async def _addr(*a, **k):
+        return ("1.2.3.4", "primary")
+
+    async def _triaged_nothing(*a, **k):
+        return 0       # a pass that made no progress (e.g. pause/resume abort)
+
+    monkeypatch.setattr(sw, "_emit_disk_pct", _noop)
+    monkeypatch.setattr(sw, "_check_recordings_writable", _true)
+    monkeypatch.setattr(sw, "_select_active_address", _addr)
+    monkeypatch.setattr(sw, "_refresh_listing_and_reconcile", _true)
+    monkeypatch.setattr(sw, "_run_triage_pass", _triaged_nothing)
+    monkeypatch.setattr(sw, "_run_geofence_pass", _noop)
+    monkeypatch.setattr(sw, "_probe_one", _true)
+
+
+async def test_drain_held_until_triage_complete(tmp_path, monkeypatch):
+    # A settled, un-triaged clip means triage is incomplete: NOTHING should
+    # download this cycle — not even a co-queued already-triaged clip. This is
+    # the pause-during-triage / resume case the user hit.
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"; rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=True)
+    snap.sync_ro_only = False
+    snap.disk_critical_pct = 95
+    sw = SyncWorker(db, _Provider(snap), Hub())
+
+    old = int(time.time()) - 10_000     # well past the settle window
+    _seed_dl(db, "2026_0618_203643_0001F.MP4",
+             recorded_at=old, triaged_at=old, gps_points=5)   # triaged
+    _seed_dl(db, "2026_0618_203644_0002F.MP4", recorded_at=old)  # NOT triaged
+
+    _cycle_stubs(sw, monkeypatch)
+    downloaded = []
+
+    async def _dl(item):
+        downloaded.append(item.filename)
+        return True
+
+    monkeypatch.setattr(sw, "_download_one", _dl)
+
+    await sw._cycle()
+    assert downloaded == []              # held: triage not complete
+
+
+async def test_drain_runs_when_triage_complete(tmp_path, monkeypatch):
+    # With every settled clip triaged, the guard does not fire and the drain
+    # downloads normally.
+    db = Database(str(tmp_path / "v.db"))
+    rec = tmp_path / "rec"; rec.mkdir()
+    snap = _Snap(str(rec), gps_triage=True)
+    snap.sync_ro_only = False
+    snap.disk_critical_pct = 95
+    sw = SyncWorker(db, _Provider(snap), Hub())
+
+    old = int(time.time()) - 10_000
+    _seed_dl(db, "2026_0618_203643_0001F.MP4",
+             recorded_at=old, triaged_at=old, gps_points=5)
+    _seed_dl(db, "2026_0618_203644_0002F.MP4",
+             recorded_at=old, triaged_at=old, gps_points=0)
+
+    _cycle_stubs(sw, monkeypatch)
+    from web.services import queue as q
+    downloaded = []
+
+    async def _dl(item):
+        downloaded.append(item.filename)
+        q.mark_done(db, item.id)     # advance state so the drain doesn't loop
+        return True
+
+    monkeypatch.setattr(sw, "_download_one", _dl)
+
+    await sw._cycle()
+    assert set(downloaded) == {
+        "2026_0618_203643_0001F.MP4", "2026_0618_203644_0002F.MP4",
+    }

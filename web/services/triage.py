@@ -24,6 +24,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
 import viofosync_lib as vfs
+from viofosync_lib.cameras import GPS_CAMERA_LETTER
 
 from ..db import Database
 
@@ -114,8 +115,11 @@ def select_targets(
     long drain starves triage and the journey map never fills in. SQLite
     treats ``LIMIT -1`` as unbounded.
 
-    Front (`F`) and rear (`R`) share one GPS track, so triaging F only halves
-    the request count; the rear clip still shows as a placeholder tile."""
+    Only the GPS-bearing lens is triaged: Viofo embeds the GPS track in one
+    stream (the front), and the other lenses of the same capture share it, so
+    triaging just that one covers the whole group. Which lens that is comes
+    from the camera registry (``GPS_CAMERA_LETTER`` in viofosync_lib/cameras.py),
+    not a hard-coded letter; the sibling clips still show as placeholder tiles."""
     if now is None:
         now = int(time.time())
     with db.conn() as c:
@@ -123,7 +127,7 @@ def select_targets(
             "SELECT id, filename, source_dir, remote_size, recorded_at "
             "FROM download_queue "
             "WHERE state='pending' AND triaged_at IS NULL "
-            "AND upper(substr(filename, -5, 1)) = 'F' "
+            "AND upper(substr(filename, -5, 1)) = ? "
             "AND (recorded_at IS NULL OR ? - recorded_at >= "
             "     (CASE WHEN event_type='parking' THEN ? ELSE ? END)) "
             "AND triage_attempts < ? "
@@ -131,11 +135,20 @@ def select_targets(
             "     >= (CASE triage_attempts WHEN 1 THEN 10 WHEN 2 THEN 30 "
             "         WHEN 3 THEN 120 ELSE 600 END)) "
             "ORDER BY recorded_at DESC, id DESC LIMIT ?",
-            (now, TRIAGE_SETTLE_PARKING_S, TRIAGE_SETTLE_S,
+            (GPS_CAMERA_LETTER, now, TRIAGE_SETTLE_PARKING_S, TRIAGE_SETTLE_S,
              TRIAGE_MAX_ATTEMPTS, now,
              -1 if limit is None else limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def has_pending_targets(db: Database, *, now: int | None = None) -> bool:
+    """True if any clip still needs triage *right now* — the same predicate as
+    :func:`select_targets` (settled, un-triaged, under the give-up cap, past
+    its backoff). The sync cycle uses this to hold downloads until triage is
+    complete: a clip that is merely deferred (still settling) or given up does
+    not count, so the drain isn't blocked forever."""
+    return bool(select_targets(db, limit=1, now=now))
 
 
 def _write_skeleton(recordings: str, filename: str, gpx: str) -> str:

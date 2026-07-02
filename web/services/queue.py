@@ -26,7 +26,11 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence
 
 import viofosync_lib as vfs
-from viofosync_lib.cameras import CAMERA_LETTERS
+from viofosync_lib.cameras import (
+    CAMERA_LETTERS,
+    GPS_CAMERA_LETTER,
+    is_gps_camera,
+)
 
 from ..db import Database
 from .triage import TRIAGE_MAX_ATTEMPTS
@@ -45,13 +49,20 @@ def _names(filenames: List[str], limit: int = 20) -> str:
     return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
-def _gps_state(d: dict) -> str:
+def _gps_state(d: dict) -> Optional[str]:
     """Derive the per-file GPS indicator from triage columns.
 
     'ok'      = GPS fetched (gps_points > 0)
     'none'    = triaged with no fix, OR gave up after MAX unreadable attempts
     'pending' = still awaiting triage
+    None      = not the GPS-bearing lens (rear/tele/interior) — GPS is carried
+                by the front clip, so only it shows an indicator
+
+    Camera identity is taken from the filename via the registry, not the
+    ``camera`` column, so historical rows with a NULL ``camera`` still resolve.
     """
+    if not is_gps_camera(_camera_from_filename(d.get("filename") or "")):
+        return None
     if (d.get("gps_points") or 0) > 0:
         return "ok"
     if d.get("triaged_at") is not None:
@@ -259,11 +270,12 @@ def next_pending(
     consider rows whose source_dir is under /RO/.
 
     If ``triage_gate`` is set (GPS_TRIAGE on), a row is held back while its
-    front sibling is still awaiting triage (``triaged_at IS NULL AND
-    triage_attempts < TRIAGE_MAX_ATTEMPTS``) — so we never download a clip,
-    or its rear pair, ahead of triage. The front sibling is the same name
-    with 'F' at the camera position; a front clip is its own sibling, and an
-    orphan rear (no front) is not gated."""
+    GPS-bearing sibling is still awaiting triage (``triaged_at IS NULL AND
+    triage_attempts < TRIAGE_MAX_ATTEMPTS``) — so we never download a clip, or
+    its paired lenses, ahead of triage. The sibling is the same name with the
+    GPS-bearing camera letter (from the registry) at the camera position; that
+    lens is its own sibling, and an orphan non-GPS clip (no GPS sibling) is not
+    gated."""
     sql = "SELECT dq.* FROM download_queue dq WHERE dq.state='pending'"
     params: List[object] = []
     if ro_only:
@@ -276,12 +288,13 @@ def next_pending(
             " AND NOT EXISTS ("
             "  SELECT 1 FROM download_queue f"
             "  WHERE f.filename = substr(dq.filename, 1, length(dq.filename)-5)"
-            "                     || 'F' || substr(dq.filename, -4)"
+            "                     || ? || substr(dq.filename, -4)"
             "    AND f.state='pending'"
             "    AND f.triaged_at IS NULL"
             "    AND f.triage_attempts < ?"
             " )"
         )
+        params.append(GPS_CAMERA_LETTER)
         params.append(TRIAGE_MAX_ATTEMPTS)
     sql += " ORDER BY dq.priority DESC, dq.enqueued_at ASC LIMIT 1"
     with db.conn() as c:

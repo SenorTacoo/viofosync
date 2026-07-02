@@ -2337,12 +2337,11 @@ const GPS_BADGE = {
   pending: { sym: "–", cls: "gps-pending", title: "Awaiting triage" },
 };
 function renderGpsBadge(it) {
-  // GPS is a pair-level fact carried by the front clip — only it is triaged
-  // (the rear shares the same track). So the badge belongs on the front row;
-  // rear (and orphan-rear) rows are left blank rather than showing a stale
-  // "pending" forever. Camera letter is the 5th char from the end.
-  const fn = it.filename || "";
-  if (fn.length < 5 || fn[fn.length - 5].toUpperCase() !== "F") return "";
+  // GPS is a capture-level fact carried by one lens (the front). The server
+  // (driven by the camera registry) sets gps_state only on that lens and
+  // leaves it null on the others, so the badge shows on the GPS-bearing clip
+  // and the paired lenses stay blank — no camera logic needed here.
+  if (!it.gps_state) return "";
   const b = GPS_BADGE[it.gps_state] || GPS_BADGE.pending;
   return `<span class="gps-badge ${b.cls}" title="${b.title}">${b.sym}</span>`;
 }

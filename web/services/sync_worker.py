@@ -475,6 +475,9 @@ class SyncWorker:
         log.info("sync resumed")
         self._paused.clear()
         self.db.kv_set(_PAUSED_KV_KEY, "0")
+        # Drop the cancel the pause set, so the resumed cycle's probe/listing
+        # and triage pass aren't suppressed by a stale abort flag.
+        self._cancel_current.clear()
         self._broadcast_sync_state()
         self.kick()
 
@@ -627,16 +630,20 @@ class SyncWorker:
             except asyncio.TimeoutError:
                 pass
 
-    async def _run_triage_pass(self) -> None:
+    async def _run_triage_pass(self) -> int:
         """Extract skeleton GPS tracks for queued clips (GPS_TRIAGE). Triages
         the whole un-triaged backlog before the download drain so the journey
         map is complete first; results are cached on the queue row, so
-        steady-state cost is only newly-listed clips."""
+        steady-state cost is only newly-listed clips.
+
+        Returns the number of clips triaged this pass (0 if disabled, no
+        camera, or the pass made no progress) so the cycle can choose a quick
+        retry vs back-off when triage is still incomplete."""
         snap = self._provider.get()
         if not getattr(snap, "gps_triage", False):
-            return
+            return 0
         if not self._active_address:
-            return
+            return 0
         # Clear any stale cancel from a prior pause/skip so a resumed cycle's
         # triage pass isn't suppressed (the flag is otherwise only cleared by
         # _download_one, which may not run if the queue has nothing to download).
@@ -652,20 +659,24 @@ class SyncWorker:
                  "triaged": triaged, "total": total, "eta_s": eta_s},
             )
 
+        triaged = 0
         try:
-            await asyncio.to_thread(
+            summary = await asyncio.to_thread(
                 _triage.run_pass,
                 self.db, base, snap.recordings,
                 timeout=snap.timeout,
                 cancel_check=self._cancel_current.is_set,
                 progress_cb=_progress,
             )
+            if isinstance(summary, dict):
+                triaged = int(summary.get("triaged", 0))
         except Exception:  # pragma: no cover — never kill the cycle
             log.exception("triage pass failed")
         finally:
             # Always clear the triaging substate (completion, pause-abort, or
             # error) so the status never gets stuck on "triaging".
             await self.hub.broadcast({"type": "triage_progress", "active": False})
+        return triaged
 
     async def _run_geofence_pass(self, *, seen: dict | None = None) -> None:
         """Auto-skip queued clips dwelling in a location flagged for exclusion.
@@ -853,11 +864,25 @@ class SyncWorker:
 
         # Triage queued clips (if enabled) before downloading any, so the
         # journey view shows where clips were recorded first.
-        await self._run_triage_pass()
+        triaged_n = await self._run_triage_pass()
 
         # Auto-skip clips parked at home (if enabled) once skeleton tracks
         # exist, so they never enter the download drain below.
         await self._run_geofence_pass(seen=self._geofence_seen)
+
+        # Never start downloads while settled clips still need triage. The
+        # per-clip gate (next_pending) only holds the un-triaged clips, but a
+        # partial/aborted triage pass (e.g. after a pause/resume or a camera
+        # hiccup) would otherwise let the drain download the already-triaged
+        # clips ahead of the rest. Hold the whole drain until triage is done;
+        # a clip merely settling or given up does not count, so this can't
+        # block forever. Quick retry if we made progress, else back off.
+        snap = self._provider.get()
+        if getattr(snap, "gps_triage", False) and _triage.has_pending_targets(
+            self.db
+        ):
+            log.info("holding downloads until GPS triage completes")
+            return bool(triaged_n)
 
         # Drain the queue. After each successful download the
         # loop re-checks ``next_pending`` so a priority update

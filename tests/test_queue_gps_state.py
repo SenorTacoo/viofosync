@@ -50,3 +50,26 @@ def test_gps_state_present_in_day_items(tmp_path):
     _seed(db, fn, triaged_at=now, gps_points=7)
     items = q.list_day_items(db, day="2026-06-18")
     assert _state_for(items, fn) == "ok"
+
+
+def test_gps_state_none_for_non_gps_lenses(tmp_path):
+    # GPS is carried by the front lens; rear/tele/interior rows show no
+    # indicator (gps_state is None) regardless of their own triage columns.
+    db = Database(str(tmp_path / "v.db"))
+    now = int(time.time())
+    _seed(db, "2026_0618_203643_0001R.MP4", triaged_at=now, gps_points=9)  # rear
+    _seed(db, "2026_0618_203643_0001T.MP4")                                 # tele
+    _seed(db, "2026_0618_203643_0001I.MP4")                                 # interior
+    items = q.list_page(db, per_page=100)["items"]
+    assert _state_for(items, "2026_0618_203643_0001R.MP4") is None
+    assert _state_for(items, "2026_0618_203643_0001T.MP4") is None
+    assert _state_for(items, "2026_0618_203643_0001I.MP4") is None
+
+
+def test_gps_state_none_for_parking_prefixed_rear(tmp_path):
+    # Parking/event prefixes (PR, ER) resolve via the registry's last-letter
+    # rule, so a prefixed rear is still treated as a non-GPS lens.
+    db = Database(str(tmp_path / "v.db"))
+    _seed(db, "2026_0618_203643_0001PR.MP4")
+    items = q.list_page(db, per_page=100)["items"]
+    assert _state_for(items, "2026_0618_203643_0001PR.MP4") is None

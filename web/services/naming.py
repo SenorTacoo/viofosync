@@ -27,7 +27,9 @@ from typing import List
 
 from viofosync_lib.cameras import (  # noqa: F401 — re-exported
     CAMERAS,
+    GPS_CAMERA_LETTER,
     channel_of,
+    is_gps_camera,
     pair_slot_of,
 )
 

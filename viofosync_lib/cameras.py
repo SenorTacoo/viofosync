@@ -23,11 +23,17 @@ class Camera:
     letter: str   # filename suffix letter (the F in ``…0001F.MP4``)
     channel: str  # stable machine key: timeline channel / pair slot
     label: str    # human-facing label
+    gps: bool = False  # True for the lens whose stream carries the GPS track
 
 
 # Declaration order is display order (timeline tracks, UI cycles).
+# ``gps=True`` marks the lens that embeds the GPS track: Viofo records GPS
+# once, in the front camera's stream, and the other lenses of the same
+# capture share it. GPS Triage reads only this lens (see web/services/
+# triage.py); the download gate holds a clip until its GPS-bearing sibling
+# is triaged (see web/services/queue.py::next_pending).
 CAMERAS: tuple[Camera, ...] = (
-    Camera("F", "front", "Front"),
+    Camera("F", "front", "Front", gps=True),
     Camera("R", "rear", "Rear"),
     Camera("T", "tele", "Tele"),
     Camera("I", "interior", "Interior"),
@@ -37,6 +43,21 @@ CAMERAS: tuple[Camera, ...] = (
 CAMERA_LETTERS = "".join(c.letter for c in CAMERAS)
 
 CHANNEL_FOR_LETTER = {c.letter: c.channel for c in CAMERAS}
+
+# The single GPS-bearing lens (the front). Derived, not hard-coded, so the
+# whole app's triage/gate/indicator logic follows the registry.
+GPS_CAMERA_LETTER = next(c.letter for c in CAMERAS if c.gps)
+
+
+def is_gps_camera(camera: str | None) -> bool:
+    """True if a clip's ``camera`` code is the GPS-bearing lens.
+
+    The lens is the trailing letter of the code, so parking/event prefixes
+    (``PF``, ``EF``) still resolve correctly; a bare letter works too.
+    Unknown / empty codes are not GPS-bearing."""
+    if not camera:
+        return False
+    return camera[-1].upper() == GPS_CAMERA_LETTER
 
 
 def channel_of(camera: str | None) -> str:
