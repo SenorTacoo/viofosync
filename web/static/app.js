@@ -131,10 +131,6 @@ async function showApp() {
     // The WS snapshot will deliver the server-computed sync_status
     // shortly; no direct updateSyncState call needed here.
   } catch {}
-  try {
-    const gs = await api("/api/archive/extract-gps/status");
-    setExtractButton(gs);
-  } catch {}
 }
 
 async function refreshDisplayPrefs() {
@@ -466,43 +462,6 @@ document.getElementById("rescan").addEventListener("click", async () => {
   }
 });
 
-function setExtractButton({ running, done, total, extracted, empty, errors }) {
-  const btn = document.getElementById("extract-gps");
-  if (running) {
-    btn.disabled = true;
-    btn.textContent = total
-      ? `Extracting GPS ${done}/${total}…`
-      : "Extracting GPS…";
-  } else {
-    btn.disabled = false;
-    btn.textContent = "Extract GPS";
-  }
-  if (!running && total > 0 && (extracted != null)) {
-    btn.title = `Last run: ${extracted} extracted · ${empty} empty · ${errors} errors`;
-  }
-}
-
-document.getElementById("extract-gps").addEventListener("click", async (e) => {
-  // Shift+click forces re-extraction of clips that already
-  // have a sidecar — use this after tweaking the spike filter.
-  const force = e.shiftKey;
-  if (force && !confirm(
-    "Re-extract GPS for every clip in the archive? This overwrites existing .gpx sidecars."
-  )) return;
-  try {
-    const url = force ? "/api/archive/extract-gps?force=true" : "/api/archive/extract-gps";
-    const r = await api(url, { method: "POST" });
-    if (!r.started) {
-      const btn = document.getElementById("extract-gps");
-      btn.textContent = r.total === 0 ? "No clips need GPS" : "Extract GPS";
-      setTimeout(() => { btn.textContent = "Extract GPS"; }, 2000);
-      return;
-    }
-    setExtractButton({ running: true, done: 0, total: r.total });
-  } catch (e) {
-    console.warn("extract-gps failed", e);
-  }
-});
 
 function archiveKindParams(q) {
   q.set("driving", state.filters.driving ? "true" : "false");
@@ -3136,18 +3095,10 @@ function handleEvent(ev) {
     case "sync_done":
       refreshQueueIfVisible();
       break;
-    case "gps_extract_started":
-    case "gps_extract_progress":
-      setExtractButton({
-        running: true, done: ev.done || 0, total: ev.total || 0,
-      });
-      break;
     case "gps_extract_done":
-      setExtractButton({
-        running: false,
-        done: ev.done, total: ev.total,
-        extracted: ev.extracted, empty: ev.empty, errors: ev.errors,
-      });
+      // The Extract GPS toolbar button was removed; a force re-extract can
+      // still be triggered via the API, so refresh the open archive when one
+      // finishes.
       if (!document.getElementById("view-archive").hidden) {
         loadDays();
       }
