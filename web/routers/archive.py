@@ -33,6 +33,7 @@ from ..services.naming import (
     CAMERAS,
     CHANNEL_LABELS,
     CHANNEL_ORDER,
+    GPS_CAMERA_LETTER,
     channel_of,
     pair_slot_of,
 )
@@ -477,6 +478,7 @@ def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
 
     _apply_group_windows(db, date, payload)
     _reframe_journeys(payload)
+    _apply_completion(db, date, payload)
     payload.pop("points", None)  # server-only scratch; don't ship it to clients
     _apply_labels(payload, geocoder, places)
     return payload
@@ -627,6 +629,77 @@ def _reframe_journeys(payload: dict) -> None:
         for i in range(1, len(sl)):
             dist += _haversine_ll(sl[i - 1][1], sl[i - 1][0], sl[i][1], sl[i][0])
         j["distance_m"] = round(dist, 1)
+
+
+def _apply_completion(db, date: str, payload: dict) -> None:
+    """Attach per-journey data-completeness so the archive can show a pie:
+    ``completion`` (downloaded duration / total, 0-1) and ``completion_detail``
+    for the tooltip. Front clips only (the GPS-bearing lens; counting the rear
+    too would double the duration). Skipped clips are already absent from both
+    sources, so they're excluded from the denominator — a fully-geofenced
+    journey reads complete. Empty window -> 1.0.
+
+    Runs on read, in the chain ``_apply_group_windows`` -> ``_reframe_journeys``
+    -> this. It needs the padded window; it reads ``group_start_ts`` /
+    ``group_end_ts``, which ``_reframe_journeys`` doesn't touch, so order with
+    that step is safe.
+    Duration is estimated uniformly via gap-to-next-front-clip (the
+    ``_effective_durations`` fallback) so it works before ffprobe and for
+    not-yet-downloaded clips: real ``duration_s`` is preferred when present."""
+    journeys = payload.get("journeys")
+    if not journeys:
+        return
+    qday = _queue_day_expr()
+    with db.conn() as c:
+        dl = c.execute(
+            "SELECT timestamp AS ts, duration_s FROM clip_index "
+            "WHERE group_name = ? AND upper(substr(camera, -1, 1)) = ? "
+            "ORDER BY timestamp ASC",
+            (date, GPS_CAMERA_LETTER),
+        ).fetchall()
+        pend = c.execute(
+            f"SELECT recorded_at AS ts FROM download_queue "
+            f"WHERE {qday} = ? AND upper(substr(filename, -5, 1)) = ? "
+            f"AND state IN ('pending','failed','downloading') "
+            f"AND triaged_at IS NOT NULL AND gps_points > 0 "
+            f"ORDER BY recorded_at ASC",
+            (date, GPS_CAMERA_LETTER),
+        ).fetchall()
+
+    clips = [(r["ts"], r["duration_s"], True) for r in dl if r["ts"] is not None]
+    clips += [(r["ts"], None, False) for r in pend if r["ts"] is not None]
+    clips.sort(key=lambda x: x[0])
+
+    eff = []
+    for i, (ts, real, dled) in enumerate(clips):
+        if real and real > 0:
+            d = float(real)
+        elif i + 1 < len(clips):
+            gap = clips[i + 1][0] - ts
+            d = float(min(gap, FALLBACK_MAX_S)) if gap > 0 else FALLBACK_DEFAULT_S
+        else:
+            d = FALLBACK_DEFAULT_S
+        eff.append((ts, d, dled))
+
+    for j in journeys:
+        gs = j.get("group_start_ts", j["start_ts"])
+        ge = j.get("group_end_ts", j["end_ts"])
+        total_s = dl_s = 0.0
+        n_total = n_dl = 0
+        for ts, d, dled in eff:
+            if gs <= ts <= ge:
+                total_s += d
+                n_total += 1
+                if dled:
+                    dl_s += d
+                    n_dl += 1
+        j["completion"] = 1.0 if total_s <= 0 else round(dl_s / total_s, 4)
+        j["completion_detail"] = {
+            "downloaded_s": round(dl_s),
+            "total_s": round(total_s),
+            "downloaded_clips": n_dl,
+            "total_clips": n_total,
+        }
 
 
 @router.get("/day/{date}/route")

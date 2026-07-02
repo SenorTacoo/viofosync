@@ -936,6 +936,19 @@ function renderUngroupedCard(clips) {
   return el;
 }
 
+function renderCompletionPie(j) {
+  if (j.completion == null) return "";
+  const p = Math.round(j.completion * 100);
+  const done = p >= 100;
+  const d = j.completion_detail || {};
+  const dlMin = Math.round((d.downloaded_s || 0) / 60);
+  const totMin = Math.round((d.total_s || 0) / 60);
+  const tip = done
+    ? `Journey complete — ${totMin} min · ${d.total_clips || 0} clips downloaded`
+    : `${dlMin} of ${totMin} min · ${d.downloaded_clips || 0} of ${d.total_clips || 0} clips downloaded`;
+  return `<span class="journey-pie${done ? " is-complete" : ""}" role="img" style="--pp:${p}" title="${escHtml(tip)}" aria-label="${escHtml(tip)}"></span>`;
+}
+
 function renderJourneyCard(j, clips, idx, date) {
   const el = document.createElement("div");
   el.className = "journey-card collapsible drive";
@@ -961,7 +974,7 @@ function renderJourneyCard(j, clips, idx, date) {
         <span class="end-label" data-lat="${j.end_lat}" data-lon="${j.end_lon}">${placeGlyph(j.end_home, j.end_named)}${escHtml(endLabel)}</span>
       </strong>
       <span class="journey-meta">
-        ${fmtDuration(j.duration_s)} · ${distance} · ${clips.length} clip${clips.length === 1 ? "" : "s"}
+        ${renderCompletionPie(j)}${fmtDuration(j.duration_s)} · ${distance} · ${clips.length} clip${clips.length === 1 ? "" : "s"}
       </span>
       <button type="button" class="journey-open-tl"
               title="Open this journey in the timeline view">Timeline</button>
