@@ -12,8 +12,8 @@ import time
 import viofosync_lib as vfs
 from web.db import Database
 from web.services import queue as q
-from web.services.sync_worker import SyncWorker
 from web.services.hub import Hub
+from web.services.sync_worker import SyncWorker
 
 
 class _Snap:
@@ -57,7 +57,8 @@ def _row(db, filename):
 
 async def test_deferral_refunds_attempt(tmp_path, monkeypatch):
     db = Database(str(tmp_path / "v.db"))
-    rec = tmp_path / "rec"; rec.mkdir()
+    rec = tmp_path / "rec"
+    rec.mkdir()
     snap = _Snap(str(rec))
     sw = SyncWorker(db, _Provider(snap), Hub())
     sw._active_address = "1.2.3.4"

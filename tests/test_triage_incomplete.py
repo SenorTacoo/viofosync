@@ -65,7 +65,7 @@ def test_triage_one_incomplete_old_marks_no_gps(tmp_path, monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(IncompleteRecording("x")),
     )
     row = _row(db, "2026_0628_120000_0001F.MP4")
-    n = triage.triage_one(db, "http://cam", row, str(tmp_path), timeout=5)
+    triage.triage_one(db, "http://cam", row, str(tmp_path), timeout=5)
     after = _row(db, "2026_0628_120000_0001F.MP4")
     assert after["triaged_at"] is not None
     assert after["gps_points"] == 0

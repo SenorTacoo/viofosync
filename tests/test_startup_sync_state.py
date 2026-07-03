@@ -15,8 +15,8 @@ from unittest.mock import AsyncMock
 
 from web.db import Database
 from web.services.hub import Hub
-from web.services.sync_worker import SyncWorker
 from web.services.sync_status import compute_sync_status
+from web.services.sync_worker import SyncWorker
 
 
 def _snap(tmp_path):

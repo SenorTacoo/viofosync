@@ -7,9 +7,8 @@ import struct
 
 import pytest
 
-from viofosync_lib import IncompleteRecording
+from viofosync_lib import IncompleteRecording, _gpx
 from viofosync_lib._protocol import RangeReader
-from viofosync_lib import _gpx
 
 
 def _atom(atom_type: bytes, payload: bytes = b"") -> bytes:

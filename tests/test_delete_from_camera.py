@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 
 def _env(tmp_path: Path):
     from web.db import Database
-    rec = tmp_path / "rec"; rec.mkdir()
+    rec = tmp_path / "rec"
+    rec.mkdir()
     return rec, Database(str(rec / "v.db"))
 
 

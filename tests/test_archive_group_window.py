@@ -114,10 +114,11 @@ def test_assemble_route_persists_merged_points():
     """The cached payload carries the day's merged points (lon, lat, ts),
     sorted ascending by ts, so the on-read reframe can slice them."""
     import datetime as _dt
-    from web.services.gps import Point
-    from web.routers import archive
 
-    base = _dt.datetime(2026, 6, 18, 8, 0, 0, tzinfo=_dt.timezone.utc)
+    from web.routers import archive
+    from web.services.gps import Point
+
+    base = _dt.datetime(2026, 6, 18, 8, 0, 0, tzinfo=_dt.UTC)
     pts = [
         Point(base + _dt.timedelta(seconds=i * 60), 53.0, -2.0 + i * 0.0008, 13, 90)
         for i in range(6)
@@ -230,12 +231,15 @@ def _drive_dwell_drive_gpx(lat0, lon0, start, dt_s=60):
                     f"<speed>{sp}</speed><course>{crs}</course></trkpt>")
     for _ in range(6):
         lon += 0.0008
-        emit(lat0, lon, 13, 90); t += _dt.timedelta(seconds=dt_s)
+        emit(lat0, lon, 13, 90)
+        t += _dt.timedelta(seconds=dt_s)
     for _ in range(8):  # dwell in place, >5 min
-        emit(lat0, lon, 0, 0); t += _dt.timedelta(seconds=dt_s)
+        emit(lat0, lon, 0, 0)
+        t += _dt.timedelta(seconds=dt_s)
     for _ in range(6):
         lon += 0.0008
-        emit(lat0, lon, 13, 90); t += _dt.timedelta(seconds=dt_s)
+        emit(lat0, lon, 13, 90)
+        t += _dt.timedelta(seconds=dt_s)
     return ('<?xml version="1.0"?><gpx version="1.0" '
             'xmlns="http://www.topografix.com/GPX/1/0"><trk><trkseg>'
             + "".join(rows) + "</trkseg></trk></gpx>")

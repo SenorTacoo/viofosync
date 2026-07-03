@@ -168,7 +168,8 @@ async def test_triage_pass_clears_even_on_error(tmp_path, monkeypatch):
 
 async def test_drain_passes_triage_gate(tmp_path, monkeypatch):
     db = Database(str(tmp_path / "v.db"))
-    rec = tmp_path / "rec"; rec.mkdir()
+    rec = tmp_path / "rec"
+    rec.mkdir()
     snap = _Snap(str(rec), gps_triage=True)
     snap.sync_ro_only = False
     snap.disk_critical_pct = 95
@@ -246,7 +247,8 @@ async def test_drain_held_until_triage_complete(tmp_path, monkeypatch):
     # download this cycle — not even a co-queued already-triaged clip. This is
     # the pause-during-triage / resume case the user hit.
     db = Database(str(tmp_path / "v.db"))
-    rec = tmp_path / "rec"; rec.mkdir()
+    rec = tmp_path / "rec"
+    rec.mkdir()
     snap = _Snap(str(rec), gps_triage=True)
     snap.sync_ro_only = False
     snap.disk_critical_pct = 95
@@ -282,7 +284,8 @@ async def test_drain_runs_when_triage_complete(tmp_path, monkeypatch):
     # neither the triage gate nor the active-recording guard fires, so the
     # drain downloads normally.
     db = Database(str(tmp_path / "v.db"))
-    rec = tmp_path / "rec"; rec.mkdir()
+    rec = tmp_path / "rec"
+    rec.mkdir()
     snap = _Snap(str(rec), gps_triage=True)
     snap.sync_ro_only = False
     snap.disk_critical_pct = 95

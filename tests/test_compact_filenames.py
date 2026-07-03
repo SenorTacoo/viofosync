@@ -15,12 +15,10 @@ import time
 
 import viofosync_lib as vfs
 from viofosync_lib.cameras import GPS_CAMERA_LETTER
-
 from web.db import Database
 from web.routers import archive
 from web.services import queue as q
-from web.services import scanner
-from web.services import triage
+from web.services import scanner, triage
 
 COMPACT = "20260618203643_000123.MP4"
 

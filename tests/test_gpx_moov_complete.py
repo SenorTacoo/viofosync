@@ -5,9 +5,7 @@ from __future__ import annotations
 import io
 import struct
 
-import pytest
-
-from viofosync_lib import IncompleteRecording, TruncatedRead
+from viofosync_lib import TruncatedRead
 from viofosync_lib._gpx import has_final_moov
 
 

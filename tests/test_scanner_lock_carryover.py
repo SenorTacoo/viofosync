@@ -14,7 +14,6 @@ from pathlib import Path
 from web.db import Database
 from web.services import scanner
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

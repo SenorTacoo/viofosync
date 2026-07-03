@@ -10,7 +10,7 @@ from web.routers.archive import _trim_stops_to_journeys
 
 
 def _iso(ts: float) -> str:
-    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).isoformat()
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.UTC).isoformat()
 
 
 def _journey(gs: float, ge: float) -> dict:

@@ -2,8 +2,6 @@
 """Triage service: select F clips, write skeleton sidecars, track state."""
 from __future__ import annotations
 
-import http.client
-import socket
 import time
 import urllib.error
 
@@ -326,7 +324,8 @@ def _attempts(db, fn):
 
 def test_offline_failure_does_not_count(tmp_path, monkeypatch):
     db = Database(str(tmp_path / "v.db"))
-    rec_dir = tmp_path / "rec"; rec_dir.mkdir()
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
     fn = "2026_0618_203643_0001F.MP4"
     _seed(db, fn, camera="F")
 
@@ -345,7 +344,8 @@ def test_offline_failure_does_not_count(tmp_path, monkeypatch):
 
 def test_unreadable_failure_counts(tmp_path, monkeypatch):
     db = Database(str(tmp_path / "v.db"))
-    rec_dir = tmp_path / "rec"; rec_dir.mkdir()
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
     fn = "2026_0618_203643_0001F.MP4"
     _seed(db, fn, camera="F")
 
@@ -366,7 +366,8 @@ def test_unreadable_failure_counts(tmp_path, monkeypatch):
 def test_truncated_read_counts_as_unreadable(tmp_path, monkeypatch):
     from viofosync_lib import TruncatedRead
     db = Database(str(tmp_path / "v.db"))
-    rec_dir = tmp_path / "rec"; rec_dir.mkdir()
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
     fn = "2026_0618_203643_0001F.MP4"
     _seed(db, fn, camera="F")
 

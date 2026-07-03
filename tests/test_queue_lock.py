@@ -1,12 +1,17 @@
 """queue.set_locked: flips the user 'locked' flag on both tables + audit log."""
 from __future__ import annotations
 
+import time
 from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
 
 
 def _env(tmp_path: Path):
     from web.db import Database
-    rec = tmp_path / "rec"; rec.mkdir()
+    rec = tmp_path / "rec"
+    rec.mkdir()
     return rec, Database(str(rec / "v.db"))
 
 
@@ -62,10 +67,6 @@ def test_set_locked_empty_is_noop(tmp_path):
 
 
 # --- endpoint smoke test ---
-
-import time
-import pytest
-from fastapi.testclient import TestClient
 
 
 def _insert_queue(c, filename, state="done"):

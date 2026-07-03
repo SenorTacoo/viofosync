@@ -379,7 +379,7 @@ def _seed_gpx_clip(app, recordings_dir, clip_id, fn, day, start_dt):
     (daydir / (fn + ".gpx")).write_text(
         _moving_gpx(53.0, -2.0, 6, start_dt)
     )
-    ts = int(start_dt.replace(tzinfo=_dt.timezone.utc).timestamp())
+    ts = int(start_dt.replace(tzinfo=_dt.UTC).timestamp())
     with app.state.db.write() as c:
         c.execute(
             "INSERT INTO clip_index "
@@ -447,7 +447,7 @@ def test_timeline_queued_parking_bounds_editor_window(
             "(id, path, basename, group_name, timestamp, camera, "
             " sequence, event_type, has_gpx, gps_examined, scanned_at, duration_s) "
             "VALUES (?,?,?,?,?,?,?,?,0,0,?,?)",
-            (2, f"/rec/pre_{clip_before_parking}.MP4", f"pre.MP4", day,
+            (2, f"/rec/pre_{clip_before_parking}.MP4", "pre.MP4", day,
              clip_before_parking, "F", 2, "normal", clip_before_parking, 5.0),
         )
 

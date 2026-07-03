@@ -5,7 +5,6 @@ from __future__ import annotations
 from web.db import Database
 from web.routers import archive
 
-
 DATE = "2026-06-18"
 
 
