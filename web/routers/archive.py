@@ -204,6 +204,7 @@ def get_day(
     driving: bool = Query(True),
     parking: bool = Query(True),
     ro: bool = Query(True),
+    show_geofenced: bool = Query(False),
 ) -> dict:
     """All clips for a date, paired front+rear by
     (timestamp, sequence)."""
@@ -299,7 +300,7 @@ def get_day(
     if _settings(request).gps_triage:
         kind_ok = {"normal": driving, "parking": parking, "ro": ro}
         by_key = {(cl["timestamp"], cl["event_type"]): cl for cl in clips}
-        for rc in remote_day_clips(_db(request), date):
+        for rc in remote_day_clips(_db(request), date, show_geofenced):
             if not kind_ok.get(rc["event_type"], True):
                 continue
             if not _in_range(rc["timestamp"]):
@@ -387,7 +388,9 @@ def geofence_skipped_by_day(db, date_from=None, date_to=None) -> dict[str, int]:
     return {r["day"]: r["n"] for r in rows}
 
 
-def remote_day_clips(db, date: str) -> list[dict]:
+def remote_day_clips(
+    db, date: str, include_geofenced: bool = False,
+) -> list[dict]:
     """Queued, not-downloaded clips for a day, paired front+rear and flagged
     remote. Mirrors get_day's pair shape so the frontend renders them in the
     same grid/journey layout.
@@ -407,8 +410,18 @@ def remote_day_clips(db, date: str) -> list[dict]:
     parking — or not yet triaged) and orphan non-GPS clips stay in the Queue
     tab until they're downloaded. This mirrors ``day_tracks.day_gpx_paths``'
     skeleton filter so a grid tile always has a matching track on the journey
-    map."""
+    map.
+
+    With ``include_geofenced`` (the archive's opt-in "GPS-excluded" view),
+    geofence-auto-skipped rows are returned too; user-skipped rows never are.
+    """
     day = _queue_day_expr()
+    state_clause = "dq.state IN ('pending','failed','downloading')"
+    if include_geofenced:
+        state_clause = (
+            "(dq.state IN ('pending','failed','downloading') "
+            "OR (dq.state = 'skipped' AND dq.skip_reason = 'geofence'))"
+        )
     with db.conn() as c:
         rows = c.execute(
             f"""
@@ -416,7 +429,7 @@ def remote_day_clips(db, date: str) -> list[dict]:
                    dq.recorded_at, dq.triaged_at, dq.gps_points, dq.state,
                    dq.skip_reason, dq.locked
             FROM download_queue dq
-            WHERE dq.state IN ('pending','failed','downloading')
+            WHERE {state_clause}
               AND {day.replace('filename', 'dq.filename')} = ?
               AND (
                 EXISTS (
@@ -482,7 +495,10 @@ def remote_day_clips(db, date: str) -> list[dict]:
     return out
 
 
-def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
+def build_route_payload(
+    db, recordings, date: str, geocoder, places=(),
+    include_geofenced: bool = False,
+) -> dict:
     """Merged GPS track for a day plus detected journeys/stops, as a
     JSON-able dict. Shared by GET /day/{date}/route and GET /timeline.
 
@@ -494,8 +510,24 @@ def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
     ``geocoder`` is the app's geocoder (or None); only its synchronous
     ``cache_lookup`` is used here — uncached labels are fetched lazily
     by the UI via /geocode after first paint.
+
+    ``include_geofenced`` weaves the day's geofence-skipped skeleton tracks
+    into journey detection (the archive's opt-in "GPS-excluded" view), and
+    adds per-clip overlay geometry under ``geofenced_tracks`` so the UI can
+    draw the recovered stretches distinctly from the rest of the journey.
     """
     gpx_paths = day_tracks.day_gpx_paths(db, recordings, date)
+    geo_paths: list[str] = []
+    if include_geofenced:
+        # The archive's "GPS-excluded" view: geofence-skipped skeletons
+        # join journey detection. The cache signature covers the combined
+        # file set, so on/off variants are distinct cache entries.
+        geo_paths = [
+            p for p in day_tracks.geofence_skipped_gpx_paths(
+                db, recordings, date)
+            if p not in gpx_paths
+        ]
+        gpx_paths = gpx_paths + geo_paths
 
     sig = route_cache.signature(gpx_paths)
     payload = route_cache.load(recordings, date, sig)
@@ -510,6 +542,11 @@ def build_route_payload(db, recordings, date: str, geocoder, places=()) -> dict:
         )
         payload = _assemble_route(date, points, stops, journeys)
         route_cache.store(recordings, date, sig, payload)
+
+    if include_geofenced:
+        # Per-clip overlay geometry, applied on read (never cached): lets
+        # the UI draw recovered stretches dashed over the journey lines.
+        payload["geofenced_tracks"] = _geofenced_tracks(geo_paths)
 
     _apply_group_windows(db, date, payload)
     _trim_stops_to_journeys(payload)
@@ -571,6 +608,37 @@ def _assemble_route(date: str, points, stops, journeys) -> dict:
             for s in stops
         ],
     }
+
+
+def _geofenced_tracks(paths: list[str]) -> list[dict]:
+    """Per-clip skeleton traces for geofence-skipped clips. Unparseable or
+    single-point skeletons are dropped — nothing to draw. Each track carries
+    a parallel ``times`` array (one epoch-second per coordinate) so the client
+    can scope it to the owning journey's window — without it, every journey
+    map on a multi-journey day would draw every day's recovered stretch."""
+    tracks = []
+    for p in paths:
+        try:
+            pts = gps_service._parse_gpx(p)
+        except Exception:
+            continue
+        if len(pts) < 2:
+            continue
+        name = os.path.basename(p)
+        if name.endswith(".gpx"):
+            name = name[:-4]
+        tracks.append({
+            "filename": name,
+            "times": [pt.t.timestamp() for pt in pts],
+            "geojson": {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[pt.lon, pt.lat] for pt in pts],
+                },
+            },
+        })
+    return tracks
 
 
 def _apply_labels(payload: dict, geocoder, places=()) -> None:
@@ -712,7 +780,7 @@ def _apply_completion(db, date: str, payload: dict) -> None:
     for the tooltip. Front clips only (the GPS-bearing lens; counting the rear
     too would double the duration). Skipped clips are already absent from both
     sources, so they're excluded from the denominator — a fully-geofenced
-    journey reads complete. Empty window -> 1.0.
+    journey reads complete. Empty window -> None (the UI omits the pie).
 
     Runs on read, in the chain ``_apply_group_windows`` -> ``_reframe_journeys``
     -> this. It needs the padded window; it reads ``group_start_ts`` /
@@ -768,7 +836,9 @@ def _apply_completion(db, date: str, payload: dict) -> None:
                 if dled:
                     dl_s += d
                     n_dl += 1
-        j["completion"] = 1.0 if total_s <= 0 else round(dl_s / total_s, 4)
+        j["completion"] = (
+            None if total_s <= 0 else round(dl_s / total_s, 4)
+        )
         j["completion_detail"] = {
             "downloaded_s": round(dl_s),
             "total_s": round(total_s),
@@ -778,7 +848,9 @@ def _apply_completion(db, date: str, payload: dict) -> None:
 
 
 @router.get("/day/{date}/route")
-def get_route(request: Request, date: str) -> dict:
+def get_route(
+    request: Request, date: str, show_geofenced: bool = Query(False),
+) -> dict:
     """Merged GPS track for the day plus detected journeys."""
     try:
         _dt.date.fromisoformat(date)
@@ -787,7 +859,7 @@ def get_route(request: Request, date: str) -> dict:
     geocoder = getattr(request.app.state, "geocode", None)
     return build_route_payload(
         _db(request), _settings(request).recordings, date, geocoder,
-        _settings(request).locations,
+        _settings(request).locations, include_geofenced=show_geofenced,
     )
 
 

@@ -7,7 +7,9 @@ geofence's stop detection aligned with what the journey map shows.
 
 The route view wants the in-flight skeletons (``pending``/``failed``/
 ``downloading``) so every clip shown as a grid tile has a matching track on the
-map; skipped clips drop off the map. The geofence evaluator passes a broader
+map; skipped clips drop off the map unless the archive's opt-in "GPS-excluded"
+view adds geofence-skipped skeletons back via
+:func:`geofence_skipped_gpx_paths`. The geofence evaluator passes a broader
 ``queue_states`` so a clip already auto-skipped still contributes its track to
 dwell detection.
 """
@@ -58,6 +60,32 @@ def day_gpx_paths(
         if os.path.exists(sk):
             gpx_paths.append(sk)
     return gpx_paths
+
+
+def geofence_skipped_gpx_paths(
+    db: Database, recordings: str, date: str,
+) -> list[str]:
+    """Triage-skeleton paths for ``date``'s geofence-skipped clips
+    (``state='skipped' AND skip_reason='geofence'``, with a GPS fix).
+    Powering the archive's opt-in "GPS-excluded" view; kept separate from
+    :func:`day_gpx_paths` so the defaults every other caller relies on
+    (geofence evaluator included) cannot drift. User-skipped clips are
+    never returned — a manual skip means "don't show me this"."""
+    day_expr = day_key_sql()
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT filename FROM download_queue "
+            f"WHERE state = 'skipped' AND skip_reason = 'geofence' "
+            f"  AND triaged_at IS NOT NULL AND gps_points > 0 "
+            f"  AND {day_expr} = ?",
+            (date,),
+        ).fetchall()
+    out: list[str] = []
+    for r in rows:
+        sk = triage_service.skeleton_path(recordings, r["filename"])
+        if os.path.exists(sk):
+            out.append(sk)
+    return out
 
 
 def day_parking_spans(db: Database, date: str) -> list[tuple[float, float]]:

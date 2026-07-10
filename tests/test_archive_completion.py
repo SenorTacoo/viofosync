@@ -120,7 +120,8 @@ def test_empty_journey_reads_complete(tmp_path):
     db = Database(str(tmp_path / "v.db"))
     p = _payload((1000, 1200))
     archive._apply_completion(db, DATE, p)
-    assert p["journeys"][0]["completion"] == 1.0
+    # Empty window (no clips at all) -> no pie, not a misleading 100%.
+    assert p["journeys"][0]["completion"] is None
     assert p["journeys"][0]["completion_detail"]["total_clips"] == 0
 
 
@@ -130,7 +131,19 @@ def test_untriaged_pending_excluded(tmp_path):
     p = _payload((900, 1200))
     archive._apply_completion(db, DATE, p)
     assert p["journeys"][0]["completion_detail"]["total_clips"] == 0
-    assert p["journeys"][0]["completion"] == 1.0
+    # Empty window (nothing counted) -> no pie, not a misleading 100%.
+    assert p["journeys"][0]["completion"] is None
+
+
+def test_geofenced_only_window_has_no_pie(tmp_path):
+    # A journey recovered purely from geofence-skipped skeletons has no
+    # downloadable clips in its window: the pie is omitted (None), not a
+    # misleading 100%.
+    db = Database(str(tmp_path / "v.db"))
+    _queued(db, 1060, state="skipped", skip="geofence")
+    p = _payload((1000, 1200))
+    archive._apply_completion(db, DATE, p)
+    assert p["journeys"][0]["completion"] is None
 
 
 def test_pending_without_gps_lock_excluded(tmp_path):

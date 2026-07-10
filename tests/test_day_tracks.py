@@ -25,13 +25,16 @@ def _index_downloaded(db: Database, path: str, day: str, ts: int) -> None:
         )
 
 
-def _queue_triaged(db: Database, filename: str, *, state="pending") -> None:
+def _queue_triaged(
+    db: Database, filename: str, *, state="pending", skip_reason=None,
+) -> None:
     with db.write() as c:
         c.execute(
             "INSERT INTO download_queue "
-            "(filename, source_dir, state, triaged_at, gps_points, enqueued_at) "
-            "VALUES (?,?,?,?,?,0)",
-            (filename, "/DCIM/Movie", state, 1, 5),
+            "(filename, source_dir, state, skip_reason, triaged_at, "
+            " gps_points, enqueued_at) "
+            "VALUES (?,?,?,?,?,?,0)",
+            (filename, "/DCIM/Movie", state, skip_reason, 1, 5),
         )
 
 
@@ -66,6 +69,30 @@ def test_skipped_skeletons_only_with_broader_states(db: Database, tmp_path: Path
         queue_states=("pending", "failed", "skipped", "downloading"),
     )
     assert str(sk) in paths
+
+
+def test_geofence_skipped_gpx_paths_filters_by_reason(
+    db: Database, tmp_path: Path,
+) -> None:
+    rec = tmp_path / "rec"
+    (rec / ".triage").mkdir(parents=True)
+    sk_geo = rec / ".triage" / "2026_0618_200100_0002F.MP4.gpx"
+    sk_geo.write_text("<gpx/>")
+    _queue_triaged(db, "2026_0618_200100_0002F.MP4",
+                   state="skipped", skip_reason="geofence")
+    sk_user = rec / ".triage" / "2026_0618_200200_0003F.MP4.gpx"
+    sk_user.write_text("<gpx/>")
+    _queue_triaged(db, "2026_0618_200200_0003F.MP4",
+                   state="skipped", skip_reason="user")
+    sk_pend = rec / ".triage" / "2026_0618_200300_0004F.MP4.gpx"
+    sk_pend.write_text("<gpx/>")
+    _queue_triaged(db, "2026_0618_200300_0004F.MP4")  # pending
+
+    paths = day_tracks.geofence_skipped_gpx_paths(db, str(rec), "2026-06-18")
+    assert paths == [str(sk_geo)]
+    # And the default day set still excludes ALL skipped rows.
+    day = day_tracks.day_gpx_paths(db, str(rec), "2026-06-18")
+    assert str(sk_geo) not in day and str(sk_user) not in day
 
 
 def test_day_parking_spans_unions_clip_index_and_queue(db: Database) -> None:
