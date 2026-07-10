@@ -33,13 +33,18 @@ import urllib.request
 from typing import Optional
 
 import viofosync_lib as vfs
+from viofosync_lib import _control as control
 
 from ..db import Database
 from ..settings import SettingsProvider
 from . import queue as q
 from . import retention as _retention
 from . import scanner
+from . import geofence as _geofence
+from . import locations as _locations
+from . import triage as _triage
 from .hub import Hub
+from .naming import capture_key_sql as _capture_key_sql
 
 log = logging.getLogger("viofosync.sync_worker")
 
@@ -50,6 +55,7 @@ BACKOFF_STEPS = [10, 30, 120, 600]  # seconds
 # still sweeps immediately after a drain; this loop is what keeps the
 # archive bounded when the camera is offline or has nothing new.
 RETENTION_INTERVAL_SECONDS = 300  # 5 minutes
+GEOFENCE_INTERVAL_SECONDS = 60  # incremental home-skip cadence during triage
 
 # Upper bound on how long stop() waits for the cycle/retention tasks
 # before abandoning them — keeps SIGTERM shutdown bounded even when a
@@ -305,6 +311,37 @@ class _ArgsShim:
         self.gps_extract = gps_extract
 
 
+def run_recording_status_release(db, *, recording_state) -> int:
+    """Release the newest capture group for triage + download when the camera
+    reports it is NOT recording.
+
+    ``recording_state`` is the camera's record flag: ``0`` stopped, ``1``
+    recording, ``None`` unknown (no/unsupported status command, camera
+    unreachable, or unparseable). Only an explicit ``0`` releases — it sets
+    ``remote_complete=1`` on every still-unconfirmed lens of the newest capture
+    group. ``1`` or ``None`` release nothing, so the newest segment stays held
+    by default; a later supersession (a newer capture appears, so the held one
+    is no longer ``MAX(capture_key)``) frees the previous one via
+    ``next_pending``'s guard. Returns the number of rows released.
+
+    Why not per-file: the record flag is camera-global, and on this firmware
+    every lens of the newest capture is the one being written, so the whole
+    newest group is released together. Belt-and-suspenders against a stopped
+    read landing mid-finalize: the download drain's outgrows-expected-size
+    abort still defers a clip that turns out to still be growing."""
+    if recording_state != 0:
+        return 0
+    with db.write() as c:
+        cur = c.execute(
+            "UPDATE download_queue SET remote_complete=1 "
+            "WHERE state IN ('pending','failed') AND remote_complete IS NULL "
+            "  AND " + _capture_key_sql("filename") + " = ("
+            "     SELECT MAX(" + _capture_key_sql("filename") + ") "
+            "     FROM download_queue WHERE state <> 'gone')"
+        )
+        return cur.rowcount
+
+
 class SyncWorker:
     def __init__(
         self,
@@ -317,6 +354,12 @@ class SyncWorker:
         self.hub = hub
         self._task: Optional[asyncio.Task] = None
         self._retention_task: Optional[asyncio.Task] = None
+        self._geofence_task: Optional[asyncio.Task] = None
+        # Per-day {day: signature} cache shared by the periodic loop and the
+        # per-cycle sweep, so an idle tick is two queries, not a GPX re-parse.
+        self._geofence_seen: dict[str, int] = {}
+        # Serialises the periodic loop against the per-cycle / backfill sweeps.
+        self._geofence_lock = asyncio.Lock()
         self._stop = asyncio.Event()
         self._cancel_current = threading.Event()
         self._kick = asyncio.Event()
@@ -375,6 +418,18 @@ class SyncWorker:
         self._retention_task = asyncio.run_coroutine_threadsafe(
             self._retention_loop(), self._loop
         )
+        # Skip home-parked clips incrementally as triage fills in skeletons,
+        # rather than only after the whole backlog finishes.
+        self._geofence_task = asyncio.run_coroutine_threadsafe(
+            self._geofence_loop(), self._loop
+        )
+        # Report in immediately so the hub's sync_state (and the computed
+        # status badge) reflect the real running/paused state from the first
+        # snapshot. Without this, a running-but-idle worker never emits a
+        # sync_state until its first download, so compute_sync_status falls back
+        # to its "worker hasn't reported yet → paused" default — which made the
+        # toggle's first click pause for real (two clicks to resume).
+        self._broadcast_sync_state()
 
     def _is_running(self) -> bool:
         if self._task is None:
@@ -388,7 +443,7 @@ class SyncWorker:
         self._cancel_current.set()
         self._kick.set()
         import concurrent.futures
-        for task in (self._task, self._retention_task):
+        for task in (self._task, self._retention_task, self._geofence_task):
             if task is None:
                 continue
             # ``task`` may be an asyncio.Task or a
@@ -453,6 +508,9 @@ class SyncWorker:
         log.info("sync resumed")
         self._paused.clear()
         self.db.kv_set(_PAUSED_KV_KEY, "0")
+        # Drop the cancel the pause set, so the resumed cycle's probe/listing
+        # and triage pass aren't suppressed by a stale abort flag.
+        self._cancel_current.clear()
         self._broadcast_sync_state()
         self.kick()
 
@@ -605,6 +663,120 @@ class SyncWorker:
             except asyncio.TimeoutError:
                 pass
 
+    async def _run_triage_pass(self) -> int:
+        """Extract skeleton GPS tracks for queued clips (GPS_TRIAGE). Triages
+        the whole un-triaged backlog before the download drain so the journey
+        map is complete first; results are cached on the queue row, so
+        steady-state cost is only newly-listed clips.
+
+        Returns the number of clips triaged this pass (0 if disabled, no
+        camera, or the pass made no progress) so the cycle can choose a quick
+        retry vs back-off when triage is still incomplete."""
+        snap = self._provider.get()
+        if not getattr(snap, "gps_triage", False):
+            return 0
+        if not self._active_address:
+            return 0
+        # Clear any stale cancel from a prior pause/skip so a resumed cycle's
+        # triage pass isn't suppressed (the flag is otherwise only cleared by
+        # _download_one, which may not run if the queue has nothing to download).
+        self._cancel_current.clear()
+        base = f"http://{self._active_address}"
+
+        def _progress(triaged: int, total: int, eta_s) -> None:
+            # Called from the triage worker thread; schedule_broadcast hops back
+            # onto the loop thread-safely.
+            self.hub.schedule_broadcast(
+                self._loop,
+                {"type": "triage_progress", "active": True,
+                 "triaged": triaged, "total": total, "eta_s": eta_s},
+            )
+
+        triaged = 0
+        try:
+            summary = await asyncio.to_thread(
+                _triage.run_pass,
+                self.db, base, snap.recordings,
+                timeout=snap.timeout,
+                cancel_check=self._cancel_current.is_set,
+                progress_cb=_progress,
+            )
+            if isinstance(summary, dict):
+                triaged = int(summary.get("triaged", 0))
+        except Exception:  # pragma: no cover — never kill the cycle
+            log.exception("triage pass failed")
+        finally:
+            # Always clear the triaging substate (completion, pause-abort, or
+            # error) so the status never gets stuck on "triaging".
+            await self.hub.broadcast({"type": "triage_progress", "active": False})
+        return triaged
+
+    async def _run_recording_status_pass(self) -> None:
+        """Release the newest capture group once the camera reports it is no
+        longer recording, so triage + the drain can pick it up. Runs
+        unconditionally each cycle. A camera with no/unknown record command
+        yields ``None`` and the newest capture stays held (safe default); a
+        newer segment later supersedes and frees it. See
+        docs/superpowers/specs/2026-07-02-active-recording-guard-design.md."""
+        if not self._active_address:
+            return
+        state = await asyncio.to_thread(
+            control.record_state, self._active_address
+        )
+        await asyncio.to_thread(
+            run_recording_status_release, self.db, recording_state=state,
+        )
+
+    async def _run_geofence_pass(self, *, seen: dict | None = None) -> None:
+        """Auto-skip queued clips dwelling in a location flagged for exclusion.
+        Runs after the triage pass, on the periodic loop while triage fills in
+        skeletons, and on a settings change. Works on local data, so it doesn't
+        need the camera online.
+
+        Pass ``seen=self._geofence_seen`` for the cheap incremental sweeps
+        (loop + per-cycle): only days with newly-triaged skeletons are
+        re-parsed. A full sweep (``seen=None``, the settings-change backfill)
+        drops that cache so every day is re-evaluated under the new zones."""
+        snap = self._provider.get()
+        if not getattr(snap, "gps_triage", False):
+            return
+        zones = _locations.exclusion_zones(getattr(snap, "locations", ()) or ())
+        if not zones:
+            return
+        async with self._geofence_lock:
+            # Clear inside the lock: a full sweep (backfill, seen=None) must not
+            # reset the cache while the periodic loop's worker thread is still
+            # mutating it under the lock.
+            if seen is None:
+                self._geofence_seen.clear()
+            try:
+                n = await asyncio.to_thread(
+                    _geofence.sweep_all, self.db, snap.recordings, zones,
+                    seen=seen,
+                )
+            except Exception:  # pragma: no cover — never kill the cycle
+                log.exception("geofence pass failed")
+                return
+        if n:
+            q.emit_queue_changed(self.db, self.hub)
+
+    async def _geofence_loop(self) -> None:
+        """Re-skip home-parked clips on a fixed cadence while a triage pass is
+        filling in skeletons, instead of only once after the whole backlog.
+        The per-day signature cache keeps an idle tick to a couple of indexed
+        queries, so this is cheap to run often. Same lifecycle as the worker."""
+        while not self._stop.is_set():
+            try:
+                await self._run_geofence_pass(seen=self._geofence_seen)
+            except Exception:  # pragma: no cover — never kill the loop
+                log.exception("periodic geofence sweep failed")
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=GEOFENCE_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                pass
+
     async def _run_retention_sweep(self) -> None:
         """Run one retention pass against the live settings, then
         refresh the broadcast disk %. Offloaded to a thread because
@@ -739,6 +911,33 @@ class SyncWorker:
             })
             return False
 
+        # Release the newest capture for triage + the drain once the camera
+        # reports record=0; hold it otherwise (it may still be recording, and
+        # the camera lies about size). See _run_recording_status_pass.
+        await self._run_recording_status_pass()
+
+        # Triage queued clips (if enabled) before downloading any, so the
+        # journey view shows where clips were recorded first.
+        triaged_n = await self._run_triage_pass()
+
+        # Auto-skip clips parked at home (if enabled) once skeleton tracks
+        # exist, so they never enter the download drain below.
+        await self._run_geofence_pass(seen=self._geofence_seen)
+
+        # Never start downloads while settled clips still need triage. The
+        # per-clip gate (next_pending) only holds the un-triaged clips, but a
+        # partial/aborted triage pass (e.g. after a pause/resume or a camera
+        # hiccup) would otherwise let the drain download the already-triaged
+        # clips ahead of the rest. Hold the whole drain until triage is done;
+        # a clip merely settling or given up does not count, so this can't
+        # block forever. Quick retry if we made progress, else back off.
+        snap = self._provider.get()
+        if getattr(snap, "gps_triage", False) and _triage.has_pending_targets(
+            self.db
+        ):
+            log.info("holding downloads until GPS triage completes")
+            return bool(triaged_n)
+
         # Drain the queue. After each successful download the
         # loop re-checks ``next_pending`` so a priority update
         # mid-cycle takes effect immediately.
@@ -746,9 +945,12 @@ class SyncWorker:
         while not self._stop.is_set():
             if self._paused.is_set():
                 break
+            snap = self._provider.get()
             item = q.next_pending(
                 self.db,
-                ro_only=self._provider.get().sync_ro_only,
+                ro_only=snap.sync_ro_only,
+                triage_gate=getattr(snap, "gps_triage", False),
+                active_guard=True,
             )
             if item is None:
                 break
@@ -894,6 +1096,8 @@ class SyncWorker:
                                 "gpx extract failed for %s: %s",
                                 item.filename, e,
                             )
+                    # The real sidecar supersedes any triage skeleton.
+                    _triage.remove_skeleton(snap.recordings, item.filename)
                     _maybe_delete_from_dashcam(
                         item=item,
                         dest_path=dest_path,
@@ -905,6 +1109,12 @@ class SyncWorker:
             except vfs.DownloadCancelled:
                 # Deliberate abort (pause/stop/unreachable): not a
                 # failure, so the caller must not burn an attempt.
+                return False, None, True, False
+            except vfs.DownloadDeferred:
+                # The file is still recording (stream outgrew its expected
+                # size). Like a cancellation: requeue without burning an
+                # attempt — the completeness guard holds it until it finalizes,
+                # so it must never exhaust max_attempts and get stuck 'failed'.
                 return False, None, True, False
             except OSError as e:
                 if e.errno == _errno.ENOSPC:

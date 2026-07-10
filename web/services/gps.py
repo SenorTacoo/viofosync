@@ -38,6 +38,15 @@ MIN_JOURNEY_DISTANCE_M = 200.0    # drop trivial driveway shuffles
 # parked elsewhere) can't be drawn as a single journey.
 SESSION_GAP_SECONDS = 1800        # 30 minutes
 
+# Invariant relied on by the archive's journey reframe: a confirmed stop is
+# >= MIN_STOP_DURATION_S (300 s) and journeys are separated by a stop or a
+# session gap (1800 s). expand_journey_window pads each edge by at most
+# MAX_JOURNEY_BUFFER_S (120 s), and 120 + 120 < 300, so two journeys' padded
+# windows can never overlap. If MIN_STOP_DURATION_S ever drops below
+# 2 * MAX_JOURNEY_BUFFER_S, the reframe needs a per-journey overlap clamp.
+# (Locked by tests/test_archive_group_window.py::
+#  test_adjacent_journey_windows_never_overlap.)
+
 
 @dataclass
 class Point:
@@ -415,3 +424,43 @@ def aggregate_day(
         all_journeys.extend(journeys)
 
     return merged, all_stops, all_journeys
+
+
+# Journey-window buffer. GPS stop boundaries land ~STOP_RADIUS_M (50m) inside the
+# real drive, so the pull-away clip at the start and the pull-in clip at the end
+# sit outside the raw journey window — "missing the start" / "cut short on
+# arrival". Pad each edge outward, but no further than the nearest parking-mode
+# clip on that side (the genuine "car is parked" boundary) and never more than
+# this cap. The cap matters because the dashcam can be knocked out of parking
+# mode by the car's electrics waking, producing spurious driving clips — so we
+# don't trust an arbitrary parking->driving switch to mark the journey edge; we
+# only lean on a *parking* clip as a hard stop.
+MAX_JOURNEY_BUFFER_S = 120.0
+# Cold-start residual: this pad moves the journey's *time* window, but the
+# trace/markers can only follow GPS fixes that exist. A journey whose GPS fix
+# came a minute after power-on stays anchored at that first fix; the grid may
+# still reach an earlier clip via the padded window. That gap is expected.
+
+
+def expand_journey_window(
+    start_ts: float, end_ts: float,
+    parking_spans: list[tuple[float, float]],
+) -> tuple[float, float]:
+    """Pad a GPS journey window ``[start_ts, end_ts]`` outward to catch the
+    pull-away / pull-in footage that sits just outside the GPS stop radius.
+
+    Each edge expands by at most ``MAX_JOURNEY_BUFFER_S``, but stops at the
+    nearest parking-mode clip on that side so we never swallow parked footage.
+    ``parking_spans`` is ``[(start_ts, end_ts), ...]`` for the day's parking
+    clips. A parking clip straddling an edge means we're already at the
+    boundary, so that edge doesn't expand at all. See ``MAX_JOURNEY_BUFFER_S``
+    for why the cap, not the mode switch, is the backstop.
+    """
+    new_start = start_ts - MAX_JOURNEY_BUFFER_S
+    new_end = end_ts + MAX_JOURNEY_BUFFER_S
+    for ps, pe in parking_spans:
+        if ps < start_ts:          # parking (partly) before the window
+            new_start = max(new_start, min(pe, start_ts))
+        if pe > end_ts:            # parking (partly) after the window
+            new_end = min(new_end, max(ps, end_ts))
+    return new_start, new_end

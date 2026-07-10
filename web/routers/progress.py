@@ -41,13 +41,21 @@ async def progress(ws: WebSocket) -> None:
         return
 
     hub = ws.app.state.hub
-    await hub.connect(ws)
+    if not await hub.connect(ws):
+        return  # client vanished during the handshake
     try:
         while True:
             # Read messages just to detect disconnects; we
             # don't expect the client to send anything useful.
             await ws.receive_text()
     except WebSocketDisconnect:
+        pass
+    except RuntimeError:
+        # A hub broadcast can fail-send while we're parked in
+        # receive_text(), which makes starlette mark the socket
+        # DISCONNECTED under our feet; the loop's next state
+        # check then raises RuntimeError rather than
+        # WebSocketDisconnect. Same meaning: client is gone.
         pass
     finally:
         await hub.disconnect(ws)

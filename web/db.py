@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS clip_index (
     size_bytes    INTEGER,
     has_gpx       INTEGER NOT NULL DEFAULT 0,
     gps_examined  INTEGER NOT NULL DEFAULT 0,
+    locked        INTEGER NOT NULL DEFAULT 0,  -- user "retain indefinitely"
     duration_s    REAL,
     scanned_at    INTEGER NOT NULL
 );
@@ -112,6 +113,10 @@ CREATE INDEX IF NOT EXISTS idx_clip_index_ts
     ON clip_index(timestamp);
 CREATE INDEX IF NOT EXISTS idx_clip_index_group
     ON clip_index(group_name);
+-- basename lookups: the archive's GPS-sibling probe (prefix range) and the
+-- delete/lock paths all address clips by basename.
+CREATE INDEX IF NOT EXISTS idx_clip_index_basename
+    ON clip_index(basename);
 
 CREATE TABLE IF NOT EXISTS download_queue (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +134,13 @@ CREATE TABLE IF NOT EXISTS download_queue (
     enqueued_at     INTEGER NOT NULL,
     started_at      INTEGER,
     finished_at     INTEGER,
-    manual          INTEGER NOT NULL DEFAULT 0
+    manual          INTEGER NOT NULL DEFAULT 0,
+    skip_reason     TEXT,             -- 'geofence' (auto) | 'user' | NULL
+    geofence_released_at INTEGER,     -- set when a geofence-skip is manually released
+    locked          INTEGER NOT NULL DEFAULT 0, -- user "retain indefinitely"
+    triage_attempts INTEGER NOT NULL DEFAULT 0,  -- failed-triage retry counter
+    triage_last_attempt_at INTEGER,              -- last triage attempt (backoff)
+    remote_complete INTEGER                      -- 1 = finalized moov seen; NULL = unconfirmed
 );
 CREATE INDEX IF NOT EXISTS idx_queue_state
     ON download_queue(state, priority DESC, enqueued_at ASC);
@@ -251,6 +262,40 @@ class Database:
         # even after the output is later removed).
         _add_column("export_jobs", "output_size", "INTEGER")
         _add_column("export_jobs", "output_duration_s", "REAL")
+
+        # GPS Triage: skeleton-track state for queued, not-yet-downloaded
+        # clips. triaged_at NULL = not triaged; gps_points NULL = not
+        # triaged, 0 = triaged but no fix (never retried), >0 = points found.
+        _add_column("download_queue", "triaged_at", "INTEGER")
+        _add_column("download_queue", "gps_points", "INTEGER")
+
+        # Triage retry bookkeeping (resilient-gps-triage): attempt counter +
+        # last-attempt timestamp so failed triage reads back off and give up
+        # after a bounded number of *unreadable* attempts. triage_attempts is
+        # bumped only for clip-specific failures, never for camera-offline.
+        _add_column(
+            "download_queue", "triage_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        _add_column("download_queue", "triage_last_attempt_at", "INTEGER")
+
+        # Geofence exclusion: skip provenance + permanent-release marker.
+        # skip_reason 'geofence' = auto-skipped while parked at home,
+        # 'user' = manually skipped, NULL = legacy / not skipped.
+        # geofence_released_at: when a user un-skips a geofence clip, so the
+        # geofence never re-skips it.
+        _add_column("download_queue", "skip_reason", "TEXT")
+        _add_column("download_queue", "geofence_released_at", "INTEGER")
+
+        # User "retain indefinitely" flag. Distinct from event_type='ro'
+        # (dashcam-locked): a user pin that retention always honours.
+        _add_column("clip_index", "locked", "INTEGER NOT NULL DEFAULT 0")
+        _add_column("download_queue", "locked", "INTEGER NOT NULL DEFAULT 0")
+
+        # Active-recording guard: 1 once a finalized moov is confirmed on the
+        # camera; NULL = unconfirmed (newest capture may still be recording).
+        # One-way — finalization is irreversible, so it never needs clearing.
+        _add_column("download_queue", "remote_complete", "INTEGER")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:

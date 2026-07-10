@@ -137,7 +137,8 @@ def test_attrs_sync_status_carries_reason_when_error():
     from web.services.mqtt_state import attrs_sync_status
     hub = _hub_with_state({})
     attrs = attrs_sync_status(hub, None, _stub_snapshot(address=None))
-    assert attrs == {"reason": "camera address not configured"}
+    assert attrs["reason"] == "camera address not configured"
+    assert attrs["triage_active"] is False
 
 
 def test_attrs_sync_status_reason_none_when_not_error():
@@ -148,7 +149,8 @@ def test_attrs_sync_status_reason_none_when_not_error():
         "current_item": {"filename": "x.mp4"},
     })
     attrs = attrs_sync_status(hub, None, _stub_snapshot())
-    assert attrs == {"reason": None}
+    assert attrs["reason"] is None
+    assert attrs["triage_active"] is False
 
 
 # ---- queue counts

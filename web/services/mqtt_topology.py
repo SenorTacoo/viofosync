@@ -169,6 +169,7 @@ TOPOLOGY: list[EntityDef] = [
             "queue_changed",
             "dashcam_online", "dashcam_offline",
             "disk_pct", "sync_error",
+            "triage_progress",
         ),
         attrs_fn=_st.attrs_sync_status,
     ),

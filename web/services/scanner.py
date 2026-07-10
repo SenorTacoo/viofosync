@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Iterable, List
 
 import viofosync_lib as vfs
+from viofosync_lib.cameras import GPS_CAMERA_LETTER
 
 from ..db import Database
 
@@ -91,7 +92,10 @@ def _clip_meta_for(
     if not os.path.isfile(path):
         return None
 
-    camera_field = m.group("camera")
+    # Compact single-channel names have no camera suffix (empty group);
+    # the sole lens is the GPS-bearing one, so default to the registry's
+    # GPS letter. Event type falls out naturally: no P/E prefix → normal.
+    camera_field = m.group("camera") or GPS_CAMERA_LETTER
     return ClipMeta(
         path=path,
         basename=filename,
@@ -255,6 +259,16 @@ def scan(db: Database, destination: str, grouping: str, hub=None, loop=None) -> 
         except Exception:
             c.execute("ROLLBACK")
             raise
+
+    # Carry a queued "retain indefinitely" lock into the freshly-indexed clip.
+    # Only sets locked 0->1 (never clears), so a lock set on the index after
+    # download — or a later unlock — is preserved across rescans.
+    with db.write() as c:
+        c.execute(
+            "UPDATE clip_index SET locked = 1 "
+            "WHERE locked = 0 AND basename IN "
+            "(SELECT filename FROM download_queue WHERE locked = 1)"
+        )
 
     if hub is not None:
         event = {"type": "clip_indexed", "total": len(seen_paths)}

@@ -64,11 +64,21 @@ def state_sync_status(hub, db, snapshot) -> Optional[str]:
 
 
 def attrs_sync_status(hub, db, snapshot) -> Optional[dict]:
-    """JSON attributes payload for the sync_status sensor. Always
-    returns a dict with a ``reason`` key so HA templating doesn't have
-    to guard for a missing attribute."""
+    """JSON attributes payload for the sync_status sensor. Always returns a
+    dict with ``reason`` and ``triage_active`` so HA templating needn't guard
+    for missing keys. When a triage pass is running, the progress fields are
+    included so automations can read it."""
     _state, reason = compute_sync_status(hub, db, snapshot)
-    return {"reason": reason}
+    attrs: dict = {"reason": reason, "triage_active": False}
+    triage = (getattr(hub, "last_state", None) or {}).get("triage") or {}
+    if triage.get("active"):
+        attrs.update(
+            triage_active=True,
+            triaged=triage.get("triaged"),
+            triage_total=triage.get("total"),
+            triage_eta_s=triage.get("eta_s"),
+        )
+    return attrs
 
 
 # ---- queue counts

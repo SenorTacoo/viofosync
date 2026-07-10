@@ -39,21 +39,32 @@ const state = {
   queueExpanded: new Set(),
   queueHoursExpanded: new Set(), // keys: "YYYY-MM-DD HH" (HH may be "??")
   queueSelected: new Set(),// filenames ticked
-  filters: { driving: true, parking: true, ro: true },
+  filters: { driving: true, parking: true, ro: true, location: "",
+             geofenced: localStorage.getItem("vfs.showGeofenced") === "1" },
   showMaps: localStorage.getItem("vfs.showMaps") !== "0",
   archiveSelected: new Map(),  // pair_id → { ts, front, rear, tele, interior }
   archiveExpanded: new Set(),  // open archive day keys ("YYYY-MM-DD"); persists
                                // open days across in-app navigation (re-render)
+  archiveStale: false,         // a change event arrived while the archive was
+                               // hidden; reload the day list on next tab entry
+  journeyExpanded: new Set(),  // open journey/stop card keys ("date|kind|ts");
+                               // restores expansion across day-body re-renders
+  journeyMapViews: new Map(),  // card key → {center, zoom}; restores a map's
+                               // view across re-renders instead of re-running
+                               // the animated fitBounds (a visible zoom jump)
   map: null,
   routeLayer: null,
   ws: null,
   syncRunning: false,
   syncPaused: false,
+  triage: { active: false },   // GPS triage progress: {active, triaged, total, eta_s}
   currentFilename: null,
   // Mirrored from /api/settings on login + on Save so display
   // helpers (fmtDistance) don't need to read from settingsState
   // (which is only loaded when the Settings tab is visited).
   distanceUnits: "km",
+  locations: [],           // named locations mirrored from /api/settings, for the
+                           // archive location filter dropdown
   logsFilter: null,        // { level, logger, q } currently shown in Logs tab
   logsOldestId: null,      // smallest id loaded, for "Load older" pagination
 };
@@ -128,16 +139,14 @@ async function showApp() {
     // The WS snapshot will deliver the server-computed sync_status
     // shortly; no direct updateSyncState call needed here.
   } catch {}
-  try {
-    const gs = await api("/api/archive/extract-gps/status");
-    setExtractButton(gs);
-  } catch {}
 }
 
 async function refreshDisplayPrefs() {
   try {
     const body = await api("/api/settings");
     state.distanceUnits = body.editable.DISTANCE_UNITS || "km";
+    state.locations = body.editable.LOCATIONS || [];
+    buildLocationFilter();
   } catch { /* keep defaults */ }
 }
 
@@ -208,6 +217,26 @@ document.getElementById("sync-toggle").addEventListener("click", async () => {
   // updateSyncState here — the server-computed status is the truth.
 });
 
+// Format a seconds-remaining estimate for the triage badge.
+function fmtTriageEta(s) {
+  if (s == null || !isFinite(s) || s < 0) return "";
+  if (s < 60) return `~${Math.round(s)}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `~${m} min`;
+  const h = Math.floor(m / 60);
+  return `~${h}h ${m % 60}m`;
+}
+
+// Build the "Triaging GPS 40/876 · ~12 min left" badge text from state.triage.
+function triageBadgeText() {
+  const t = state.triage || {};
+  let s = "Triaging GPS";
+  if (t.total) s += ` ${t.triaged || 0}/${t.total}`;
+  const eta = fmtTriageEta(t.eta_s);
+  if (eta) s += ` · ${eta} left`;
+  return s;
+}
+
 // state.syncStatus is one of: "downloading", "waiting", "paused", "error", null
 // state.syncStatusReason is a short human-readable string (only set in error)
 function updateSyncState(status) {
@@ -228,6 +257,8 @@ function updateSyncState(status) {
   let show, title, klass;
   if (status === "downloading") {
     show = iconSync; title = "Pause downloading"; klass = "active";
+  } else if (status === "triaging") {
+    show = iconSync; title = "Pause"; klass = "triaging";
   } else if (status === "waiting") {
     show = iconSync; title = "Pause downloading"; klass = "waiting";
   } else if (status === "paused") {
@@ -249,7 +280,7 @@ function updateSyncState(status) {
   setVisible(iconPause, show === iconPause);
   setVisible(iconSync, show === iconSync);
   setVisible(iconWarn, show === iconWarn);
-  btn.classList.remove("active", "paused", "waiting", "error");
+  btn.classList.remove("active", "paused", "waiting", "error", "triaging");
   if (klass) btn.classList.add(klass);
   btn.title = title;
 }
@@ -289,7 +320,13 @@ function routeTo(hash) {
     }
   }
   if (tab === "archive") {
-    loadDays();
+    // Rebuild the day list only when something actually changed while the
+    // view was hidden (archiveStale, set by the WS handlers below) or it was
+    // never rendered. Skipping the reload preserves open days, expanded
+    // journey cards and their live Leaflet maps — switching to the timeline
+    // and back should feel instant, not re-fetch the world.
+    const days = document.getElementById("days");
+    if (state.archiveStale || !days.children.length) loadDays();
     refreshExportJobs();
   }
   if (tab === "downloads") loadQueue();
@@ -327,10 +364,110 @@ function refreshArchiveOnIndexChange() {
   if (_archiveRefreshTimer) clearTimeout(_archiveRefreshTimer);
   _archiveRefreshTimer = setTimeout(() => {
     _archiveRefreshTimer = null;
-    if (document.getElementById("view-archive").hidden) return;
+    if (document.getElementById("view-archive").hidden) {
+      // Don't drop the event: remember the list is out of date so the
+      // next visit to the tab reloads it (routeTo checks this flag).
+      state.archiveStale = true;
+      return;
+    }
     if (document.querySelector("#days .day .day-body:not([hidden])")) return;
     loadDays();
   }, 400);
+}
+
+// ---- FLIP animation for day-body re-renders --------------------------
+// A day-body refresh (skip, download-next, WS queue_changed) rebuilds its
+// DOM, which reads as an abrupt snap: tiles vanish and neighbours teleport.
+// FLIP smooths it: capture each keyed element's position before the swap,
+// then animate survivors from their old position to the new one; elements
+// that only exist in the new DOM fade in. Keys live in data-flip-key
+// (clip pairs, journey/stop/ungrouped cards). Positions are stored relative
+// to the day body so a page-scroll shift between capture and play can't
+// skew the deltas. Disabled under prefers-reduced-motion.
+const _REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)");
+const FLIP_MS = 220;
+
+function flipCapture(body) {
+  if (_REDUCED_MOTION.matches) return null;
+  const ref = body.getBoundingClientRect();
+  const rects = new Map();
+  for (const el of body.querySelectorAll("[data-flip-key]")) {
+    const r = el.getBoundingClientRect();
+    rects.set(el.dataset.flipKey,
+      { x: r.left - ref.left, y: r.top - ref.top });
+  }
+  return rects.size ? rects : null;   // null = first render, nothing to play
+}
+
+function flipPlay(body, prev) {
+  if (!prev) return;
+  const ref = body.getBoundingClientRect();
+  for (const el of body.querySelectorAll("[data-flip-key]")) {
+    const r = el.getBoundingClientRect();
+    const was = prev.get(el.dataset.flipKey);
+    if (!was) {
+      // Newcomer (e.g. a clip that just finished downloading).
+      el.animate(
+        [{ opacity: 0, transform: "scale(0.97)" },
+         { opacity: 1, transform: "none" }],
+        { duration: FLIP_MS, easing: "ease-out" });
+      continue;
+    }
+    const dx = was.x - (r.left - ref.left);
+    const dy = was.y - (r.top - ref.top);
+    if (dx || dy) {
+      el.animate(
+        [{ transform: `translate(${dx}px, ${dy}px)` },
+         { transform: "none" }],
+        { duration: FLIP_MS, easing: "ease-in-out" });
+    }
+  }
+}
+
+// Fade the selected clip tiles out before an action that removes them from
+// the archive (skip, delete), so the removal reads as intentional rather
+// than a glitch. Resolves when the fade completes; the follow-up re-render
+// then FLIPs the surviving neighbours into the freed space.
+function animateOutSelectedPairs() {
+  if (_REDUCED_MOTION.matches) return Promise.resolve();
+  const anims = [];
+  for (const pairId of state.archiveSelected.keys()) {
+    document
+      .querySelectorAll(`.clip-pair[data-pair-id="${CSS.escape(pairId)}"]`)
+      .forEach((el) => {
+        anims.push(
+          el.animate(
+            [{ opacity: 1, transform: "none" },
+             { opacity: 0, transform: "scale(0.95)" }],
+            { duration: 160, easing: "ease-in", fill: "forwards" }
+          ).finished.catch(() => {})
+        );
+      });
+  }
+  return Promise.all(anims);
+}
+
+// Re-render any currently-open archive day so per-clip status icons reflect
+// the latest queue state. Unlike refreshArchiveOnIndexChange (which skips open
+// days to avoid disrupting browsing), this targets the open day directly —
+// used after a Download Action and on queue_changed.
+let _openDayRefreshTimer = null;
+function refreshOpenArchiveDays() {
+  document.querySelectorAll("#days .day").forEach((dayEl) => {
+    const body = dayEl.querySelector(".day-body");
+    if (body && !body.hidden) renderDayBody(body, dayEl.dataset.day);
+  });
+}
+function scheduleOpenArchiveRefresh() {
+  if (_openDayRefreshTimer) clearTimeout(_openDayRefreshTimer);
+  _openDayRefreshTimer = setTimeout(() => {
+    _openDayRefreshTimer = null;
+    if (document.getElementById("view-archive").hidden) {
+      state.archiveStale = true;   // reload on next tab entry instead
+      return;
+    }
+    refreshOpenArchiveDays();
+  }, 300);
 }
 
 // ---------- Archive ----------
@@ -345,6 +482,59 @@ function wireArchiveFilter(id, key) {
 wireArchiveFilter("f-driving", "driving");
 wireArchiveFilter("f-parking", "parking");
 wireArchiveFilter("f-ro", "ro");
+
+// "GPS-excluded": reveal clips auto-skipped by the home geofence and
+// weave their recovered skeleton tracks into the day's journeys.
+// Persisted — it's a mode, like the maps toggle, not a per-visit filter.
+(() => {
+  const cb = document.getElementById("f-geofenced");
+  cb.checked = state.filters.geofenced;
+  cb.addEventListener("change", (e) => {
+    state.filters.geofenced = e.target.checked;
+    localStorage.setItem("vfs.showGeofenced", e.target.checked ? "1" : "0");
+    state.page = 1;
+    loadDays();
+  });
+})();
+
+// Location filter: client-side, narrows the open day timeline to journeys
+// (start or end) and stops at the selected named location. Populated from
+// state.locations (mirrored from /api/settings); hidden when none are defined.
+function buildLocationFilter() {
+  const wrap = document.getElementById("f-location-wrap");
+  const sel = document.getElementById("f-location");
+  if (!wrap || !sel) return;
+  const locs = state.locations || [];
+  if (!locs.length) {
+    wrap.hidden = true;
+    state.filters.location = "";
+    sel.value = "";
+    return;
+  }
+  // Home first, then alphabetical; name doubles as the option value (filtering
+  // matches by place name).
+  const ordered = [...locs].sort((a, b) =>
+    (b.is_home ? 1 : 0) - (a.is_home ? 1 : 0) ||
+    (a.name || "").localeCompare(b.name || ""));
+  const prev = state.filters.location;
+  const names = ordered.map((l) => l.name);
+  sel.innerHTML =
+    '<option value="">All locations</option>' +
+    ordered.map((l) =>
+      `<option value="${escHtml(l.name)}">${escHtml(l.name)}</option>`).join("");
+  if (prev && names.includes(prev)) {
+    sel.value = prev;
+  } else {
+    sel.value = "";
+    state.filters.location = "";
+  }
+  wrap.hidden = false;
+}
+
+document.getElementById("f-location").addEventListener("change", (e) => {
+  state.filters.location = e.target.value;
+  refreshOpenArchiveDays();
+});
 
 // "GPS Journey Splits" is a view option, not a filter: it gates the
 // journey machinery (Leaflet, route fetch, reverse-geocode) on
@@ -380,48 +570,12 @@ document.getElementById("rescan").addEventListener("click", async () => {
   }
 });
 
-function setExtractButton({ running, done, total, extracted, empty, errors }) {
-  const btn = document.getElementById("extract-gps");
-  if (running) {
-    btn.disabled = true;
-    btn.textContent = total
-      ? `Extracting GPS ${done}/${total}…`
-      : "Extracting GPS…";
-  } else {
-    btn.disabled = false;
-    btn.textContent = "Extract GPS";
-  }
-  if (!running && total > 0 && (extracted != null)) {
-    btn.title = `Last run: ${extracted} extracted · ${empty} empty · ${errors} errors`;
-  }
-}
-
-document.getElementById("extract-gps").addEventListener("click", async (e) => {
-  // Shift+click forces re-extraction of clips that already
-  // have a sidecar — use this after tweaking the spike filter.
-  const force = e.shiftKey;
-  if (force && !confirm(
-    "Re-extract GPS for every clip in the archive? This overwrites existing .gpx sidecars."
-  )) return;
-  try {
-    const url = force ? "/api/archive/extract-gps?force=true" : "/api/archive/extract-gps";
-    const r = await api(url, { method: "POST" });
-    if (!r.started) {
-      const btn = document.getElementById("extract-gps");
-      btn.textContent = r.total === 0 ? "No clips need GPS" : "Extract GPS";
-      setTimeout(() => { btn.textContent = "Extract GPS"; }, 2000);
-      return;
-    }
-    setExtractButton({ running: true, done: 0, total: r.total });
-  } catch (e) {
-    console.warn("extract-gps failed", e);
-  }
-});
 
 function archiveKindParams(q) {
   q.set("driving", state.filters.driving ? "true" : "false");
   q.set("parking", state.filters.parking ? "true" : "false");
   q.set("ro", state.filters.ro ? "true" : "false");
+  if (state.filters.geofenced) q.set("show_geofenced", "true");
 }
 
 // Tear down Leaflet instances under `root` before its innerHTML is
@@ -438,6 +592,14 @@ function destroyJourneyMaps(root) {
   }
 }
 
+function destroyLocationMaps(root) {
+  for (const div of root.querySelectorAll(".loc-map")) {
+    const m = div._locMap;
+    if (m) { try { m.remove(); } catch {} }
+    div._locMap = null;
+  }
+}
+
 async function loadDays() {
   // Stale-response guard (same token pattern as loadQueue): WS
   // pushes, filter changes, and pagination can race; only the most
@@ -451,6 +613,7 @@ async function loadDays() {
 
   const data = await api("/api/archive/days?" + q);
   if (reqId !== state.daysRequestId) return; // superseded
+  state.archiveStale = false;                // rendering fresh data
   const container = document.getElementById("days");
   destroyJourneyMaps(container);
   container.innerHTML = "";
@@ -474,6 +637,8 @@ function renderDayCard(d) {
   const open = state.archiveExpanded.has(d.day);
   el.innerHTML = `
     <div class="day-header">
+      <input type="checkbox" class="day-check"
+             title="Select all clips in this day" />
       <h3>${d.day}</h3>
       <div class="meta">
         ${d.clip_count} clips${
@@ -482,7 +647,13 @@ function renderDayCard(d) {
             d.parking_count ? `${d.parking_count} parking` : null,
             d.ro_count ? `${d.ro_count} read-only` : null,
           ].filter(Boolean).map((s) => ` · ${s}`).join("")
-        } · ${fmtBytes(d.total_bytes)}${d.gpx_count ? " · GPS" : ""}
+        } · ${fmtBytes(d.total_bytes)}${d.gpx_count ? " · GPS" : ""}${
+          d.remote_count ? ` · ${d.remote_count} on camera` : ""
+        }${
+          d.geofence_skipped_count
+            ? ` · ${d.geofence_skipped_count} GPS-excluded`
+            : ""
+        }
       </div>
     </div>
     <div class="day-body" ${open ? "" : "hidden"}></div>
@@ -496,16 +667,59 @@ function renderDayCard(d) {
     }
     body.hidden = false;
     state.archiveExpanded.add(d.day);
-    body.innerHTML = "<p>Loading…</p>";
-    await renderDayBody(body, d.day);
+    await loadDayBody(el);
   });
+  wireDayCheck(el);
   // Restore a remembered-open day: populate its body immediately. Async; the
   // card is returned synchronously and fills in when the fetch resolves.
   if (open) {
-    body.innerHTML = "<p>Loading…</p>";
-    renderDayBody(body, d.day);
+    loadDayBody(el);
   }
   return el;
+}
+
+// Load (or reload) a day's body, then sync its select-all checkbox. Centralised
+// so the day-header toggle, a remembered-open day, and the day-level select-all
+// all populate the body the same way and mark it loaded for refreshDayCheck.
+async function loadDayBody(dayEl) {
+  const body = dayEl.querySelector(".day-body");
+  // Only show the placeholder on a body that has never rendered; a refresh
+  // of an already-populated day keeps the old content on screen until the
+  // new payload arrives (renderDayBody swaps it in one go).
+  if (!body.dataset.loaded) body.innerHTML = "<p>Loading…</p>";
+  await renderDayBody(body, dayEl.dataset.day);
+  body.dataset.loaded = "1";
+  refreshDayCheck(dayEl);
+}
+
+// A pair carries GPS if it's a remote tile (already gated to gps_points>0) or
+// any downloaded camera slot has a sidecar. Used to decide whether a clip that
+// snaps to no journey/stop is worth an Ungrouped card or should be dropped.
+function pairHasGps(pair) {
+  if (pair.remote) return true;
+  return CAMERAS.some((c) => pair[c.channel] && pair[c.channel].has_gpx);
+}
+
+// True if a timeline event involves the named location: a journey whose start
+// OR end is that place, or a stop at that place. Matches on the server's
+// `named` flag + the place name, so a coincidental geocoded label can't match.
+function eventMatchesLocation(ev, name) {
+  if (ev.kind === "journey") {
+    const j = ev.data;
+    return (j.start_named && j.start_label === name) ||
+           (j.end_named && j.end_label === name);
+  }
+  const s = ev.data;
+  return !!(s.named && s.label === name);
+}
+
+// Placeholder shown in an expanded day that has nothing to/from the filtered
+// location (uses textContent — `name` is user-supplied).
+function renderNoLocationActivity(name) {
+  const note = document.createElement("p");
+  note.style.cssText = "color:var(--muted);font-size:12px";
+  note.textContent = `No activity to/from ${name} on this day.`;
+  return note;
 }
 
 async function renderDayBody(body, date) {
@@ -521,7 +735,8 @@ async function renderDayBody(body, date) {
     const promises = [api(`/api/archive/day/${date}?` + q)];
     if (state.showMaps) {
       promises.push(
-        api(`/api/archive/day/${date}/route`)
+        api(`/api/archive/day/${date}/route`
+            + (state.filters.geofenced ? "?show_geofenced=true" : ""))
           .catch((e) => { console.warn("route failed", e); return null; }),
       );
     } else {
@@ -534,13 +749,23 @@ async function renderDayBody(body, date) {
     return;
   }
 
+  // FLIP: snapshot keyed positions before the swap, animate after (below).
+  const flipPrev = flipCapture(body);
+
   destroyJourneyMaps(body);
   body.innerHTML = "";
 
   const journeys = (route && route.journeys) || [];
   const stops = (route && route.stops) || [];
   const hasGps = journeys.length > 0 || stops.length > 0;
+  const locFilter = state.filters.location;
   if (!hasGps) {
+    // With a location filter active, a day with no journeys/stops has nothing
+    // to/from that place — show the note rather than an unfiltered flat grid.
+    if (locFilter) {
+      body.appendChild(renderNoLocationActivity(locFilter));
+      return;
+    }
     // No journeys and no stops — fall back to a flat grid.
     const grid = document.createElement("div");
     grid.className = "clip-grid";
@@ -552,6 +777,7 @@ async function renderDayBody(body, date) {
       note.textContent = "No GPS data for this day.";
       body.appendChild(note);
     }
+    flipPlay(body, flipPrev);
     return;
   }
 
@@ -561,43 +787,79 @@ async function renderDayBody(body, date) {
   // there directly; the rest snap to whichever event is
   // closest in time, so everything is anchored to *some*
   // visible context instead of a flat "other" pile.
-  const events = [
-    ...journeys.map((j, idx) => ({
-      kind: "journey", data: j, clips: [], idx,
-      start: j.start_ts, end: j.end_ts,
-    })),
-    ...stops.map((s, idx) => ({
-      kind: "stop", data: s, clips: [], idx,
-      start: s.start_ts, end: s.end_ts,
-    })),
-  ];
-  // Newest first — most recent activity at the top of the day.
-  events.sort((a, b) => b.start - a.start);
+  // Journeys group with a PADDED window (group_start_ts/group_end_ts from the
+  // server — the same _expand_journey_window the timeline uses) so the pull-away
+  // and pull-in clips that sit just outside the raw GPS journey (the stop
+  // boundary lands ~50 m inside the real drive) land on the journey card. Fall
+  // back to the raw window for older payloads.
+  const journeyEvents = journeys.map((j, idx) => ({
+    kind: "journey", data: j, clips: [], idx,
+    start: j.group_start_ts ?? j.start_ts,
+    end: j.group_end_ts ?? j.end_ts,
+  }));
+  const stopEvents = stops.map((s, idx) => ({
+    kind: "stop", data: s, clips: [], idx,
+    start: s.start_ts, end: s.end_ts,
+  }));
+  // Newest first — most recent activity at the top of the day. Render order and
+  // the snap fallback below scan this combined list.
+  const events = [...journeyEvents, ...stopEvents].sort((a, b) => b.start - a.start);
+
+  // A loose clip (no event contains its timestamp) snaps to the nearest event
+  // only if it's within this gap; otherwise it collects in an "Ungrouped" card
+  // so a not-yet-skipped home clip can't drag across the whole day onto a journey.
+  const SNAP_MAX_GAP_S = 1800; // 30 min — matches the GPS session-gap splitter
+  const ungrouped = [];
 
   for (const pair of data.clips) {
     const ts = pair.timestamp;
-    let target = events.find((e) => ts >= e.start && ts <= e.end);
+    // Journeys win over an overlapping stop at the boundary: a pull-in clip that
+    // falls inside both the padded journey and the following stop belongs to the
+    // drive, not the dwell.
+    let target =
+      journeyEvents.find((e) => ts >= e.start && ts <= e.end) ||
+      stopEvents.find((e) => ts >= e.start && ts <= e.end);
     if (!target) {
-      // Snap to the closest event by time gap.
       let best = null, bestGap = Infinity;
       for (const e of events) {
         const gap = ts < e.start ? e.start - ts : ts - e.end;
         if (gap < bestGap) { bestGap = gap; best = e; }
       }
-      target = best;
+      target = bestGap <= SNAP_MAX_GAP_S ? best : null;
     }
     if (target) target.clips.push(pair);
+    else if (pairHasGps(pair)) ungrouped.push(pair);
+    // A no-GPS pair with nothing within snap range has no place in the
+    // journey-organised view (its real context — e.g. a home dwell built from
+    // skipped clips — is invisible here), so drop it rather than float it in an
+    // Ungrouped card. Extends the trace-gate principle to downloaded clips. A
+    // no-GPS clip that DID snap to a journey/stop is kept (handled above).
   }
 
-  for (const ev of events) {
+  const shown = locFilter
+    ? events.filter((ev) => eventMatchesLocation(ev, locFilter))
+    : events;
+
+  for (const ev of shown) {
     if (ev.kind === "journey") {
-      body.appendChild(renderJourneyCard(ev.data, ev.clips, ev.idx, date));
+      body.appendChild(renderJourneyCard(
+        ev.data, ev.clips, ev.idx, date,
+        (route && route.geofenced_tracks) || [],
+      ));
     } else {
-      body.appendChild(renderStopCard(ev.data, ev.clips, ev.idx));
+      body.appendChild(renderStopCard(ev.data, ev.clips, ev.idx, date));
     }
+  }
+
+  if (locFilter) {
+    // The Ungrouped pile isn't tied to a place, so it's hidden while filtering.
+    if (!shown.length) body.appendChild(renderNoLocationActivity(locFilter));
+  } else if (ungrouped.length) {
+    body.appendChild(renderUngroupedCard(ungrouped, date));
   }
 
   wireClipPairMapClicks(body);
+  flipPlay(body, flipPrev);
 }
 
 // Clicking anywhere on a clip-pair (except the thumbnail image,
@@ -687,7 +949,7 @@ function fmtEta(seconds) {
   return fmtDuration(seconds);
 }
 
-function renderStopCard(stop, clips, idx) {
+function renderStopCard(stop, clips, idx, date) {
   const startT = new Date(stop.start_time).toLocaleTimeString();
   const endT = new Date(stop.end_time).toLocaleTimeString();
   const hasClips = clips && clips.length > 0;
@@ -698,10 +960,11 @@ function renderStopCard(stop, clips, idx) {
   if (!hasClips) {
     const el = document.createElement("div");
     el.className = "stop-banner";
+    el.dataset.flipKey = `${date}|sb|${stop.start_ts}`;
     el.innerHTML = `
       <span class="stop-icon" aria-hidden="true">⏸</span>
       <span>Stopped for <strong>${fmtDuration(stop.duration_s)}</strong>
-        at <span class="stop-label">${escHtml(placeLabel)}</span></span>
+        at <span class="stop-label">${placeGlyph(stop.home, stop.named)}${escHtml(placeLabel)}</span></span>
       <span class="stop-when">${startT} – ${endT}</span>
     `;
     if (!stop.label) {
@@ -722,14 +985,14 @@ function renderStopCard(stop, clips, idx) {
       <input type="checkbox" class="journey-check"
              title="Select all clips in this stop" />
       <span class="journey-times">${startT} – ${endT}</span>
-      <span class="stop-icon" aria-hidden="true">⏸</span>
       <strong class="journey-title">
-        <span class="stop-label">${escHtml(placeLabel)}</span>
+        <span class="stop-label">${placeGlyph(stop.home, stop.named)}${escHtml(placeLabel)}</span>
       </strong>
       <span class="journey-meta">
         ${fmtDuration(stop.duration_s)} ·
         ${clips.length} clip${clips.length === 1 ? "" : "s"}
       </span>
+      <span class="stop-icon" aria-hidden="true">⏸</span>
     </div>
     <div class="journey-body" hidden>
       <div id="${mapId}" class="journey-map stop-map"></div>
@@ -744,6 +1007,8 @@ function renderStopCard(stop, clips, idx) {
   const grid = el.querySelector(".clip-grid");
   for (const pair of clips) grid.appendChild(renderClipPair(pair));
 
+  const cardKey = `${date}|s|${stop.start_ts}`;
+  el.dataset.flipKey = cardKey;
   let mapInited = false;
   const initMap = () => {
     if (mapInited) return;
@@ -763,18 +1028,64 @@ function renderStopCard(stop, clips, idx) {
     }).addTo(map).bindTooltip(
       `Parked ${fmtDuration(stop.duration_s)}`
     );
-    map.setView(center, 16);
+    // Restore the pre-re-render view (see the journey card's initMap for
+    // why the save listener is attached before the initial view is set).
+    map.on("moveend zoomend", () => {
+      state.journeyMapViews.set(cardKey,
+        { center: map.getCenter(), zoom: map.getZoom() });
+    });
+    const saved = state.journeyMapViews.get(cardKey);
+    if (saved) map.setView(saved.center, saved.zoom, { animate: false });
+    else map.setView(center, 16, { animate: false });
     mapDiv._journeyMap = { map };
   };
 
-  wireJourneyToggle(el, initMap);
+  wireJourneyToggle(el, initMap, cardKey);
   wireJourneyCheck(el);
   return el;
 }
 
-function renderJourneyCard(j, clips, idx, date) {
+function renderUngroupedCard(clips, date) {
   const el = document.createElement("div");
-  el.className = "journey-card collapsible";
+  el.className = "journey-card stop-card collapsible";
+  el.dataset.flipKey = `${date}|u`;
+  el.innerHTML = `
+    <div class="journey-header">
+      <span class="caret">▸</span>
+      <input type="checkbox" class="journey-check"
+             title="Select all clips in this group" />
+      <strong class="journey-title">Ungrouped</strong>
+      <span class="journey-meta">
+        ${clips.length} clip${clips.length === 1 ? "" : "s"}
+      </span>
+    </div>
+    <div class="journey-body" hidden>
+      <div class="clip-grid"></div>
+    </div>
+  `;
+  const grid = el.querySelector(".clip-grid");
+  for (const pair of clips) grid.appendChild(renderClipPair(pair));
+  wireJourneyToggle(el, () => {}, `${date}|u`);
+  wireJourneyCheck(el);
+  return el;
+}
+
+function renderCompletionPie(j) {
+  if (j.completion == null) return "";
+  const p = Math.round(j.completion * 100);
+  const done = p >= 100;
+  const d = j.completion_detail || {};
+  const dlMin = Math.round((d.downloaded_s || 0) / 60);
+  const totMin = Math.round((d.total_s || 0) / 60);
+  const tip = done
+    ? `Journey complete — ${totMin} min · ${d.total_clips || 0} clips downloaded`
+    : `${dlMin} of ${totMin} min · ${d.downloaded_clips || 0} of ${d.total_clips || 0} clips downloaded`;
+  return `<span class="journey-pie${done ? " is-complete" : ""}" role="img" style="--pp:${p}" title="${escHtml(tip)}" aria-label="${escHtml(tip)}"></span>`;
+}
+
+function renderJourneyCard(j, clips, idx, date, extraTracks) {
+  const el = document.createElement("div");
+  el.className = "journey-card collapsible drive";
   const mapId = `journey-map-${j.start_ts}-${idx}`;
   const distance = fmtDistance(j.distance_m);
   const startT = new Date(j.start_time).toLocaleTimeString();
@@ -792,12 +1103,12 @@ function renderJourneyCard(j, clips, idx, date) {
              title="Select all clips in this journey" />
       <span class="journey-times">${startT} – ${endT}</span>
       <strong class="journey-title">
-        <span class="start-label" data-lat="${j.start_lat}" data-lon="${j.start_lon}">${escHtml(startLabel)}</span>
+        <span class="start-label" data-lat="${j.start_lat}" data-lon="${j.start_lon}">${placeGlyph(j.start_home, j.start_named)}${escHtml(startLabel)}</span>
         <span class="journey-arrow">→</span>
-        <span class="end-label" data-lat="${j.end_lat}" data-lon="${j.end_lon}">${escHtml(endLabel)}</span>
+        <span class="end-label" data-lat="${j.end_lat}" data-lon="${j.end_lon}">${placeGlyph(j.end_home, j.end_named)}${escHtml(endLabel)}</span>
       </strong>
       <span class="journey-meta">
-        ${fmtDuration(j.duration_s)} · ${distance} · ${clips.length} clip${clips.length === 1 ? "" : "s"}
+        ${renderCompletionPie(j)}${fmtDuration(j.duration_s)} · ${distance} · ${clips.length} clip${clips.length === 1 ? "" : "s"}
       </span>
       <button type="button" class="journey-open-tl"
               title="Open this journey in the timeline view">Timeline</button>
@@ -837,6 +1148,8 @@ function renderJourneyCard(j, clips, idx, date) {
   // Lazy Leaflet init: defer until the journey is first opened.
   // With many journeys per day this saves mounting a dozen maps
   // upfront.
+  const cardKey = `${date}|j|${j.start_ts}`;
+  el.dataset.flipKey = cardKey;
   let mapInited = false;
   const initMap = () => {
     if (mapInited) return;
@@ -857,6 +1170,25 @@ function renderJourneyCard(j, clips, idx, date) {
     const err = cssVar("--err");
     const errText = cssVar("--err-text");
     const line = L.polyline(coords, { color: accent, weight: 5 }).addTo(map);
+    // Recovered (geofence-skipped) stretches: dashed and muted so they read
+    // apart from downloaded track. extraTracks is the WHOLE day's list, so
+    // each is clipped to THIS journey's padded window (same window that
+    // buckets clips to the card) via its per-point times — otherwise every
+    // journey map would draw every day's recovered stretch.
+    const gStart = j.group_start_ts ?? j.start_ts;
+    const gEnd = j.group_end_ts ?? j.end_ts;
+    for (const t of extraTracks || []) {
+      const tt = t.times || [];
+      const g = t.geojson.geometry.coordinates
+        .map(([lon, lat], i) => [lat, lon, tt[i]])
+        .filter(([, , ts]) => ts == null || (ts >= gStart && ts <= gEnd))
+        .map(([lat, lon]) => [lat, lon]);
+      if (g.length < 2) continue;
+      L.polyline(g, {
+        color: cssVar("--muted"), weight: 3,
+        dashArray: "6 6", opacity: 0.85,
+      }).addTo(map);
+    }
     L.circleMarker([j.start_lat, j.start_lon], {
       radius: 6, color: ok, fillColor: ok, fillOpacity: 1,
     }).addTo(map).bindTooltip("Start");
@@ -888,7 +1220,24 @@ function renderJourneyCard(j, clips, idx, date) {
       if (pairEl) flashClip(pairEl);
     });
 
-    map.fitBounds(line.getBounds(), { padding: [20, 20] });
+    // Restore the view a re-render tore down (day-body refresh after a
+    // queue action) — an animated re-fit reads as an unprompted zoom jump
+    // and loses the user's pan/zoom. Fresh cards fit the trace as before.
+    // The save listener is attached BEFORE the initial view is set:
+    // fitBounds fires moveend synchronously, and capturing that first fit
+    // is what lets an untouched map survive a re-render (otherwise the
+    // fallback re-fit runs against a not-yet-laid-out container and lands
+    // on a garbage zoom).
+    map.on("moveend zoomend", () => {
+      state.journeyMapViews.set(cardKey,
+        { center: map.getCenter(), zoom: map.getZoom() });
+    });
+    const saved = state.journeyMapViews.get(cardKey);
+    if (saved) {
+      map.setView(saved.center, saved.zoom, { animate: false });
+    } else {
+      map.fitBounds(line.getBounds(), { padding: [20, 20], animate: false });
+    }
 
     mapDiv._journeyMap = {
       map, coords, times, showPin,
@@ -897,7 +1246,7 @@ function renderJourneyCard(j, clips, idx, date) {
     };
   };
 
-  wireJourneyToggle(el, initMap);
+  wireJourneyToggle(el, initMap, cardKey);
   wireJourneyCheck(el);
   const tlBtn = el.querySelector(".journey-open-tl");
   if (tlBtn) {
@@ -913,13 +1262,14 @@ function renderJourneyCard(j, clips, idx, date) {
 // First expansion triggers Leaflet init; subsequent expansions
 // call invalidateSize() so the map re-measures after the body
 // goes from display:none back to visible.
-function wireJourneyToggle(el, initMap) {
+// ``key`` (optional) persists the expansion in state.journeyExpanded so a
+// day-body re-render (queue refresh, stale reload on tab return) restores
+// the card instead of collapsing it.
+function wireJourneyToggle(el, initMap, key) {
   const header = el.querySelector(".journey-header");
   const body = el.querySelector(".journey-body");
   const caret = el.querySelector(".caret");
-  header.addEventListener("click", (e) => {
-    if (e.target.closest("input, a, button")) return;
-    const opening = body.hidden;
+  const setOpen = (opening) => {
     body.hidden = !opening;
     caret.textContent = opening ? "▾" : "▸";
     if (opening) {
@@ -931,7 +1281,25 @@ function wireJourneyToggle(el, initMap) {
         requestAnimationFrame(() => bundle.map.invalidateSize());
       }
     }
+  };
+  header.addEventListener("click", (e) => {
+    if (e.target.closest("input, a, button")) return;
+    const opening = body.hidden;
+    if (key) {
+      if (opening) state.journeyExpanded.add(key);
+      else state.journeyExpanded.delete(key);
+    }
+    setOpen(opening);
   });
+  // Restore an expansion remembered across re-renders. Unhide immediately
+  // (no visual pop-in), but defer the map init a frame: this runs while the
+  // card is still detached (the renderer hasn't appended it yet), and
+  // Leaflet reading a zero-size container computes a garbage zoom.
+  if (key && state.journeyExpanded.has(key)) {
+    body.hidden = false;
+    caret.textContent = "▾";
+    requestAnimationFrame(() => setOpen(true));
+  }
 }
 
 function nearestCoordIdx(coords, latlng) {
@@ -987,20 +1355,70 @@ function flashClip(el) {
   });
 }
 
+// House glyph (SVG, no emoji) for the Home location — settings marker + labels.
+const HOME_GLYPH =
+  '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 7l6-4 6 4M4 6.5V13h8V6.5"/></svg>';
+
+// Generic map-pin glyph (SVG, no emoji) for non-Home named places.
+const PIN_GLYPH =
+  '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 14s4.5-4.2 4.5-7.5a4.5 4.5 0 0 0-9 0C3.5 9.8 8 14 8 14z"/><circle cx="8" cy="6.5" r="1.5"/></svg>';
+
+// Label glyph: house for the designated Home, pin for any other named place,
+// nothing for a plain geocoded label.
+function placeGlyph(isHome, isNamed) {
+  return isHome ? HOME_GLYPH : (isNamed ? PIN_GLYPH : "");
+}
+
+// Small inline SVG status icons for not-yet-downloaded clips (no emoji).
+const TRIAGE_STATE_ICON = {
+  pending: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8M5 7l3 3 3-3M3 13h10"/></svg>',
+  downloading: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" class="spin"><path d="M8 2a6 6 0 1 1-6 6"/></svg>',
+  failed: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5 15 14H1zM8 6v3.5M8 11.5h.01"/></svg>',
+  skipped: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="6"/><path d="M4 4l8 8"/></svg>',
+  geofence: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 7l6-4 6 4M4 6.5V13h8V6.5"/></svg>',
+};
+const TRIAGE_STATE_TITLE = {
+  pending: "Queued for download",
+  downloading: "Downloading",
+  failed: "Download failed",
+  skipped: "Skipped (excluded from download)",
+  geofence: "Skipped: parked at home",
+};
+
 function renderClipPair(pair) {
   const el = document.createElement("div");
   el.className = "clip-pair";
   el.dataset.pairId = `${pair.timestamp}_${pair.sequence}`;
+  el.dataset.flipKey = `p|${el.dataset.pairId}`;
   el.dataset.ts = pair.timestamp;
   const time = new Date(pair.iso).toLocaleTimeString();
-  const thumb = (c, cam) =>
-    c ? `<div class="thumb" data-camera="${cam}"
+  const thumb = (c, cam) => {
+    if (c && c.remote) {
+      const st = c.state || "pending";
+      // A geofence auto-skip gets a distinct house glyph + accent so it
+      // reads apart from a manual skip.
+      const geo = st === "skipped" && c.skip_reason === "geofence";
+      const key = geo ? "geofence" : st;
+      const icon = TRIAGE_STATE_ICON[key] || TRIAGE_STATE_ICON.pending;
+      const title = TRIAGE_STATE_TITLE[key] || TRIAGE_STATE_TITLE.pending;
+      const unskipBtn = geo
+        ? `<button class="unskip-btn" data-filename="${escHtml(c.filename)}"
+              title="Un-skip: queue this clip for download">Un-skip</button>`
+        : "";
+      return `<div class="thumb remote state-${st}${geo ? " geofence" : ""}" data-camera="${cam}">
+        <div class="remote-badge" title="${title}">${icon}</div>
+        <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
+        ${unskipBtn}
+      </div>`;
+    }
+    return c ? `<div class="thumb" data-camera="${cam}"
                data-clip-id="${c.id}" data-ts="${pair.timestamp}">
         <img src="/api/archive/clip/${c.id}/thumb" data-id="${c.id}"
              alt="" loading="lazy" decoding="async" />
         <div class="film-scrub" aria-hidden="true"></div>
         <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
       </div>` : `<div class="thumb empty"><div class="label">—</div></div>`;
+  };
   // Kind badge: shown for parking / read-only pairs only. Driving
   // pairs are the common case so we leave them un-badged to keep
   // the grid quiet — absence of a chip reads as "driving".
@@ -1008,7 +1426,8 @@ function renderClipPair(pair) {
     if (pair.event_type === "parking") {
       return `<span class="kind-badge kind-parking">Parking</span>`;
     }
-    if (pair.event_type === "ro") {
+    if (pair.event_type === "ro" || pair.locked) {
+      // Dashcam-locked (ro) OR user-pinned (locked) both read as "retained".
       return `<span class="kind-badge kind-ro">Read-only</span>`;
     }
     return "";
@@ -1027,6 +1446,16 @@ function renderClipPair(pair) {
         : pair[c.channel] ? thumb(pair[c.channel], c.letter) : ""
     ).join("")}</div>
   `;
+  el.querySelectorAll(".unskip-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      btn.disabled = true;
+      // On success the day re-renders (this button is gone); on failure
+      // runQueueAction swallows the error, so re-enable to allow a retry.
+      try { await runQueueAction("retry", [btn.dataset.filename]); }
+      finally { btn.disabled = false; }
+    });
+  });
   el.querySelectorAll(".thumb img").forEach((img) => {
     img.addEventListener("click", (e) => {
       const thumbEl = e.currentTarget.closest(".thumb");
@@ -1060,6 +1489,9 @@ function renderClipPair(pair) {
       };
       state.archiveSelected.set(pairId, {
         ts: Number(el.dataset.ts),
+        filenames: CAMERAS
+          .map((c) => pair[c.channel] && pair[c.channel].basename)
+          .filter(Boolean),
         ...Object.fromEntries(
           CAMERAS.map((c) => [c.channel, clipId(c.letter)]),
         ),
@@ -1073,6 +1505,9 @@ function renderClipPair(pair) {
     // unchecked as appropriate.
     const card = el.closest(".journey-card");
     if (card) refreshCardCheck(card);
+    // Also reflect up to the day-level "select all" header checkbox.
+    const dayEl = el.closest(".day");
+    if (dayEl) refreshDayCheck(dayEl);
   });
 
   return el;
@@ -1083,6 +1518,7 @@ function renderClipPair(pair) {
 function setCardSelection(cardEl, select) {
   cardEl.querySelectorAll('.clip-pair input[type="checkbox"]')
     .forEach((cb) => {
+      if (cb.disabled) return;            // skip any explicitly-disabled checkbox
       if (cb.checked !== select) {
         cb.checked = select;
         // Reuse the per-clip change handler to update
@@ -1097,7 +1533,8 @@ function setCardSelection(cardEl, select) {
 function refreshCardCheck(cardEl) {
   const headerCb = cardEl.querySelector(".journey-check");
   if (!headerCb) return;
-  const pairs = cardEl.querySelectorAll('.clip-pair input[type="checkbox"]');
+  const pairs = cardEl.querySelectorAll(
+    '.clip-pair input[type="checkbox"]:not([disabled])');
   const total = pairs.length;
   if (total === 0) {
     headerCb.disabled = true;
@@ -1128,6 +1565,58 @@ function wireJourneyCheck(cardEl) {
   refreshCardCheck(cardEl);
 }
 
+// ---- Day-level "select all" ----
+
+function refreshDayCheck(dayEl) {
+  const cb = dayEl.querySelector(".day-check");
+  if (!cb) return;
+  const body = dayEl.querySelector(".day-body");
+  // A collapsed / not-yet-loaded day keeps its checkbox actionable — clicking
+  // it loads the body and selects everything. We just can't reflect counts yet.
+  if (!body || body.dataset.loaded !== "1" || body.hidden) {
+    cb.disabled = false;
+    cb.indeterminate = false;
+    return;
+  }
+  const pairs = dayEl.querySelectorAll(
+    '.day-body .clip-pair input[type="checkbox"]:not([disabled])');
+  const total = pairs.length;
+  if (total === 0) {          // loaded but nothing selectable (e.g. remote-only)
+    cb.disabled = true;
+    cb.checked = false;
+    cb.indeterminate = false;
+    return;
+  }
+  let checked = 0;
+  pairs.forEach((p) => { if (p.checked) checked++; });
+  cb.disabled = false;
+  cb.checked = checked === total;
+  cb.indeterminate = checked > 0 && checked < total;
+}
+
+function wireDayCheck(dayEl) {
+  const cb = dayEl.querySelector(".day-check");
+  if (!cb) return;
+  // Keep the tick from also toggling the day's expand/collapse (same header).
+  cb.addEventListener("click", (e) => e.stopPropagation());
+  cb.addEventListener("change", async (e) => {
+    const body = dayEl.querySelector(".day-body");
+    if (e.target.checked) {
+      // Selecting a whole day needs its clips in the DOM, so expand + load
+      // first if it hasn't been opened yet, then tick every clip.
+      if (body.hidden) {
+        body.hidden = false;
+        state.archiveExpanded.add(dayEl.dataset.day);
+      }
+      if (body.dataset.loaded !== "1") await loadDayBody(dayEl);
+      setCardSelection(body, true);
+    } else {
+      setCardSelection(body, false);
+    }
+    refreshDayCheck(dayEl);
+  });
+}
+
 function updateArchiveActions() {
   const n = state.archiveSelected.size;
   const label = document.getElementById("selection-count");
@@ -1139,45 +1628,10 @@ function updateArchiveActions() {
     label.textContent = `${n} selected`;
     bar.classList.add("has-selection");
   }
-  // Per-camera selection counts, plus front+partner pair counts
-  // for the PiP buttons.
-  const count = Object.fromEntries(CAMERAS.map((c) => [c.channel, 0]));
-  const withFront = Object.fromEntries(
-    CAMERAS.map((c) => [c.channel, 0]),
-  );
-  for (const v of state.archiveSelected.values()) {
-    for (const c of CAMERAS) {
-      if (v[c.channel]) count[c.channel]++;
-      if (v.front && v[c.channel]) withFront[c.channel]++;
-    }
-  }
-  const hasFront = count.front > 0, hasRear = count.rear > 0;
-  const hasPair = withFront.rear > 0;
-  document.getElementById("dl-orig-front").disabled = !hasFront;
-  document.getElementById("dl-orig-rear").disabled = !hasRear;
-  document.getElementById("export-join-front").disabled = !hasFront;
-  document.getElementById("export-join-rear").disabled = !hasRear;
-  document.getElementById("export-pip-front").disabled = !hasPair;
-  document.getElementById("export-pip-rear").disabled = !hasPair;
-  // Third-camera actions: the whole button group stays hidden until
-  // the selection contains a clip from that camera, so 2-camera
-  // setups see the original action bar unchanged.
-  for (const c of EXTRA_CAMERAS) {
-    const group = document.getElementById(`actions-${c.channel}`);
-    if (!group) continue;
-    const present = count[c.channel] > 0;
-    group.hidden = !present;
-    if (!present) continue;
-    document.getElementById(`dl-orig-${c.channel}`).disabled = false;
-    document.getElementById(`export-join-${c.channel}`).disabled = false;
-    document.getElementById(`export-pip-${c.channel}`).disabled =
-      withFront[c.channel] === 0;
-  }
-  document.getElementById("clear-selection").disabled = n === 0;
+  document.getElementById("clip-action-apply").disabled = n === 0;
+  document.getElementById("clip-action-clear").disabled = n === 0;
+  rebuildClipActionMenu();
 }
-
-// Call once on load so the disabled buttons render correctly.
-updateArchiveActions();
 
 function clearSelection() {
   state.archiveSelected.clear();
@@ -1188,6 +1642,11 @@ function clearSelection() {
   // checkbox so it goes back to unchecked too.
   document.querySelectorAll("#view-archive .journey-card")
     .forEach(refreshCardCheck);
+  // And every day-level "select all" header checkbox.
+  document.querySelectorAll("#view-archive .day-check").forEach((cb) => {
+    cb.checked = false;
+    cb.indeterminate = false;
+  });
   updateArchiveActions();
 }
 
@@ -1295,21 +1754,147 @@ document.getElementById("exports-toggle").addEventListener("click", () => {
   setExportsPanelOpen(!open);
 });
 
-// One originals/join/pip button trio per camera. "pip" is the
-// legacy name of the front-main job; every other camera's PiP is
-// pip_<channel>.
-for (const c of CAMERAS) {
-  const ch = c.channel;
-  document.getElementById(`dl-orig-${ch}`)
-    .addEventListener("click", () => downloadOriginals(ch));
-  document.getElementById(`export-join-${ch}`)
-    .addEventListener("click", () => submitExport(`join_${ch}`));
-  document.getElementById(`export-pip-${ch}`)
-    .addEventListener("click", () =>
-      submitExport(ch === "front" ? "pip" : `pip_${ch}`));
+// ---- Consolidated "Clip actions" control (sticky toolbar) ----
+
+const CAMERA_LABEL_BY_CHANNEL = Object.fromEntries(CAMERAS.map((c) => [c.channel, c.label]));
+const EXPORT_CAMERAS_ALWAYS = ["front", "rear"];
+
+// Rebuild the Export optgroup: Front/Rear always; Tele/Interior only when the
+// current selection contains such clips. Originals first, then Joined (the order
+// the user reads top-to-bottom). Preserves the current selection if still valid.
+function rebuildClipActionMenu() {
+  const sel = document.getElementById("clip-action");
+  const grp = document.getElementById("clip-action-export");
+  if (!sel || !grp) return;
+  const present = new Set();
+  for (const v of state.archiveSelected.values()) {
+    for (const c of EXTRA_CAMERAS) if (v[c.channel]) present.add(c.channel);
+  }
+  const cams = [
+    ...EXPORT_CAMERAS_ALWAYS,
+    ...EXTRA_CAMERAS.filter((c) => present.has(c.channel)).map((c) => c.channel),
+  ];
+  // Only rewrite the optgroup when the camera set actually changed — avoids
+  // churning the DOM (and closing an open dropdown) on every checkbox tick.
+  const newValues = cams.flatMap((cam) => [`originals-${cam}`, `join-${cam}`]);
+  // grp is an <optgroup> (no .options — that's a <select>-only property); its
+  // <option>s are its direct children.
+  const oldValues = [...grp.children].map((o) => o.value);
+  if (newValues.join() === oldValues.join()) return;
+  const prev = sel.value;
+  grp.innerHTML =
+    cams.map((cam) =>
+      `<option value="originals-${cam}">Originals · ${CAMERA_LABEL_BY_CHANNEL[cam]}</option>`).join("") +
+    cams.map((cam) =>
+      `<option value="join-${cam}">Joined · ${CAMERA_LABEL_BY_CHANNEL[cam]}</option>`).join("");
+  // If the previously-selected option vanished (a tele/interior option that's no
+  // longer offered), fall back to the first Queue action.
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  else sel.value = "download-next";
 }
-document.getElementById("clear-selection")
-  .addEventListener("click", clearSelection);
+
+function selectionHasCamera(cam) {
+  for (const v of state.archiveSelected.values()) if (v[cam]) return true;
+  return false;
+}
+
+const QUEUE_ENDPOINT = {
+  "download-next": "/api/queue/download-next",
+  "skip": "/api/queue/skip",
+};
+
+async function runQueueAction(action, filenames) {
+  try {
+    // Skipping removes the tiles from the archive — fade them out first so
+    // the removal reads as intentional; the re-render below then FLIPs the
+    // surviving neighbours into the freed space.
+    if (action === "skip") await animateOutSelectedPairs();
+    let res;
+    if (action === "retry") {
+      // Retry also clears any user/geofence skip on the selection first.
+      await api("/api/queue/unskip", { method: "POST", body: JSON.stringify({ filenames }) });
+      res = await api("/api/queue/retry", { method: "POST", body: JSON.stringify({ filenames }) });
+    } else {
+      const endpoint = QUEUE_ENDPOINT[action];
+      if (!endpoint) { toast(`Unknown action: ${action}`, { type: "error" }); return; }
+      res = await api(endpoint, { method: "POST", body: JSON.stringify({ filenames }) });
+    }
+    toast(`${action.replaceAll("-", " ")}: ${res.updated} updated`);
+    clearSelection();
+    refreshOpenArchiveDays();
+  } catch (e) {
+    toast(`Action failed: ${e.message || e}`, { type: "error" });
+  }
+}
+
+async function runQueueDelete(filenames) {
+  try {
+    await animateOutSelectedPairs();
+    const res = await api("/api/queue/delete", { method: "POST", body: JSON.stringify({ filenames }) });
+    toast(`Deleted ${res.deleted}, skipped ${res.skipped}`);
+    clearSelection();
+    refreshOpenArchiveDays();
+  } catch (e) {
+    toast(`Delete failed: ${e.message || e}`, { type: "error" });
+  }
+}
+
+async function applyClipAction() {
+  if (state.archiveSelected.size === 0) {
+    toast("Select some clips first.", { type: "error" });
+    return;
+  }
+  const action = document.getElementById("clip-action").value;
+
+  // Export actions operate on per-camera clip ids.
+  if (action.startsWith("originals-") || action.startsWith("join-")) {
+    const cam = action.slice(action.indexOf("-") + 1);
+    if (!selectionHasCamera(cam)) {
+      toast(`No ${CAMERA_LABEL_BY_CHANNEL[cam] || cam} clips selected.`, { type: "error" });
+      return;
+    }
+    if (action.startsWith("originals-")) downloadOriginals(cam);
+    else submitExport(`join_${cam}`);
+    return;
+  }
+
+  // Queue actions operate on filenames.
+  const filenames = [
+    ...new Set([...state.archiveSelected.values()].flatMap((v) => v.filenames || [])),
+  ];
+  if (!filenames.length) {
+    toast("Select some clips first.", { type: "error" });
+    return;
+  }
+  if (action === "mark-ro") {
+    try {
+      const res = await api("/api/queue/lock",
+        { method: "POST", body: JSON.stringify({ filenames }) });
+      toast(`Marked ${res.updated} read-only`);
+      clearSelection();
+      refreshOpenArchiveDays();
+    } catch (e) {
+      toast(`Failed: ${e.message || e}`, { type: "error" });
+    }
+    return;
+  }
+  if (action === "delete") {
+    if (!confirm(
+      `Delete ${filenames.length} downloaded clip(s) from storage and skip them ` +
+      `so they won't re-download? Files on the camera aren't affected.`,
+    )) return;
+    await runQueueDelete(filenames);
+    return;
+  }
+  await runQueueAction(action, filenames);
+}
+
+document.getElementById("clip-action-apply").addEventListener("click", applyClipAction);
+document.getElementById("clip-action-clear").addEventListener("click", clearSelection);
+
+// Prime the toolbar's disabled state + camera-aware menu on load. Placed here
+// (not at updateArchiveActions's definition) so the consts above are initialised.
+updateArchiveActions();
 
 async function refreshExportJobs() {
   try {
@@ -1961,10 +2546,30 @@ function renderKindBadge(it) {
   } else if (evt === "event") {
     parts.push(`<span class="kind-badge kind-event">Event</span>`);
   }
-  if (it.kind_ro) {
-    parts.push(`<span class="kind-badge kind-ro">RO</span>`);
+  if (it.kind_ro || it.locked) {
+    // Dashcam-locked (kind_ro) OR user-pinned (locked) — both retained.
+    const title = it.locked ? "Read-only — retained" : "Read-only";
+    parts.push(`<span class="kind-badge kind-ro" title="${title}">RO</span>`);
   }
   return parts.join(" ");
+}
+
+// GPS triage indicator for a queue row. gps_state comes from the API:
+// "ok" = fetched, "none" = no GPS / unreadable, "pending" = awaiting triage.
+const GPS_BADGE = {
+  ok:      { sym: "✓", cls: "gps-ok",      title: "GPS fetched" },
+  none:    { sym: "✗", cls: "gps-none",    title: "No GPS / unreadable" },
+  pending: { sym: "–", cls: "gps-pending", title: "Awaiting triage" },
+};
+function renderGpsBadge(it) {
+  // GPS is a capture-level fact carried by one lens (the front). The server
+  // (driven by the camera registry) derives gps_state from that lens's own
+  // triage columns and *implies* the same state onto its sibling lenses, so
+  // every clip of a capture shows the badge; only an orphan non-GPS clip
+  // (no front at its timestamp) stays blank — no camera logic needed here.
+  if (!it.gps_state) return "";
+  const b = GPS_BADGE[it.gps_state] || GPS_BADGE.pending;
+  return `<span class="gps-badge ${b.cls}" title="${b.title}">${b.sym}</span>`;
 }
 
 // Kept as a thin alias so existing call sites still resolve;
@@ -2154,6 +2759,7 @@ function renderHourBody(day, hh, items) {
       <th></th>
       <th>Time</th>
       <th>Kind</th>
+      <th>GPS</th>
       <th>File</th>
       <th>Size</th>
       <th>State</th>
@@ -2179,6 +2785,7 @@ function renderHourBody(day, hh, items) {
             ${checked ? "checked" : ""} /></td>
       <td>${ts}</td>
       <td>${kind}</td>
+      <td class="gps-cell">${renderGpsBadge(it)}</td>
       <td>${escHtml(it.filename)}</td>
       <td>${size}</td>
       <td class="state-${it.state}">${it.state}</td>
@@ -2326,6 +2933,22 @@ const QUEUE_ACTIONS = {
                      body: (f) => ({ filenames: f }), label: "un-skipped" },
   "retry-failed":  { url: "/api/queue/retry",
                      body: (f) => ({ filenames: f }), label: "re-queued" },
+  "mark-ro":       { url: "/api/queue/lock",
+                     body: (f) => ({ filenames: f }), label: "marked read-only" },
+  "delete-from-camera": {
+    url: "/api/queue/delete-from-camera",
+    body: (f) => ({ filenames: f }),
+    confirm: (n) =>
+      `Delete ${n} clip(s) from the dashcam SD card? This cannot be undone.`,
+    // The route returns {deleted, skipped, errors} (not {updated}), and
+    // {ok:false,error} when no camera is configured.
+    toast: (r) => r.ok === false
+      ? `Failed: ${r.error || "no dashcam configured"}`
+      : `Deleted ${r.deleted} from camera`
+        + (r.skipped ? `, ${r.skipped} protected` : "")
+        + (r.errors ? `, ${r.errors} error(s)` : ""),
+    toastType: (r) => (r.ok === false || r.errors) ? "error" : "success",
+  },
 };
 
 async function applyQueueAction() {
@@ -2337,19 +2960,24 @@ async function applyQueueAction() {
     toast("Select some files first.", { type: "error" });
     return;
   }
+  if (spec.confirm && !confirm(spec.confirm(filenames.length))) return;
   const btn = document.getElementById("q-apply");
   btn.disabled = true;
   try {
     const r = await api(spec.url, {
       method: "POST", body: JSON.stringify(spec.body(filenames)),
     });
-    const n = r.updated ?? 0;
-    toast(n
-      ? `${n} file${n === 1 ? "" : "s"} ${spec.label}`
-      : "No applicable items in selection.",
-          { type: n ? "success" : "error" });
+    if (spec.toast) {
+      toast(spec.toast(r),
+        { type: spec.toastType ? spec.toastType(r) : "success" });
+    } else {
+      const n = r.updated ?? 0;
+      toast(n
+        ? `${n} file${n === 1 ? "" : "s"} ${spec.label}`
+        : "No applicable items in selection.",
+            { type: n ? "success" : "error" });
+    }
     state.queueSelected.clear();
-    sel.value = "";
     await loadQueue();
   } catch (e) {
     toast(`Action failed: ${e.message || e}`, { type: "error" });
@@ -2357,7 +2985,17 @@ async function applyQueueAction() {
     btn.disabled = false;
   }
 }
+
+// Clear the queue tick selection in place (mirrors the archive "Clear"),
+// unchecking every row/hour/day checkbox without a re-fetch.
+function clearQueueSelection() {
+  state.queueSelected.clear();
+  document.querySelectorAll('#queue-days input[type="checkbox"]')
+    .forEach((cb) => { cb.checked = false; cb.indeterminate = false; });
+  renderQueueMeta();
+}
 document.getElementById("q-apply").addEventListener("click", applyQueueAction);
+document.getElementById("q-clear").addEventListener("click", clearQueueSelection);
 
 // Download most recent X hours first
 document.getElementById("q-prio-recent").addEventListener("click", async () => {
@@ -2600,6 +3238,7 @@ function handleEvent(ev) {
   const statusEl = document.getElementById("sync-status");
   const STATUS_LABEL = {
     downloading: "Downloading",
+    triaging: "Triaging GPS",
     waiting: "Waiting",
     paused: "Paused",
     error: "Error",
@@ -2613,6 +3252,8 @@ function handleEvent(ev) {
     let badgeText = STATUS_LABEL[status] || "";
     if (status === "error" && reason) {
       badgeText = "Error: " + reason;
+    } else if (status === "triaging") {
+      badgeText = triageBadgeText();
     }
     statusEl.textContent = badgeText;
     statusEl.className = "status " + (status || "");
@@ -2629,7 +3270,25 @@ function handleEvent(ev) {
       // on a timer.
       refreshArchiveOnIndexChange();
       break;
+    case "triage_progress":
+      state.triage = ev.active
+        ? { active: true, triaged: ev.triaged, total: ev.total, eta_s: ev.eta_s }
+        : { active: false };
+      if (ev.active) {
+        if (state.syncStatus === "triaging") {
+          document.getElementById("sync-status").textContent = triageBadgeText();
+        }
+        document.getElementById("current-download").textContent = triageBadgeText();
+        refreshArchiveOnIndexChange();
+      } else {
+        document.getElementById("current-download").textContent = "";
+        refreshArchiveOnIndexChange();
+      }
+      break;
     case "snapshot":
+      if (ev.state.triage) {
+        state.triage = ev.state.triage;
+      }
       if (ev.state.sync_status) {
         applyStatus(ev.state.sync_status, ev.state.sync_status_reason);
       }
@@ -2673,23 +3332,21 @@ function handleEvent(ev) {
     case "session_stats":
       updateSessionStats(ev);
       break;
+    case "queue_changed":
+      refreshQueueIfVisible();
+      scheduleOpenArchiveRefresh();
+      break;
     case "queue_reconciled":
     case "sync_done":
       refreshQueueIfVisible();
       break;
-    case "gps_extract_started":
-    case "gps_extract_progress":
-      setExtractButton({
-        running: true, done: ev.done || 0, total: ev.total || 0,
-      });
-      break;
     case "gps_extract_done":
-      setExtractButton({
-        running: false,
-        done: ev.done, total: ev.total,
-        extracted: ev.extracted, empty: ev.empty, errors: ev.errors,
-      });
-      if (!document.getElementById("view-archive").hidden) {
+      // The Extract GPS toolbar button was removed; a force re-extract can
+      // still be triggered via the API, so refresh the open archive when one
+      // finishes (or mark it stale for the next visit).
+      if (document.getElementById("view-archive").hidden) {
+        state.archiveStale = true;
+      } else {
         loadDays();
       }
       break;
@@ -2854,6 +3511,7 @@ function renderSettingsSection(name) {
     clearInterval(_mqttStatusTimer);
     _mqttStatusTimer = null;
   }
+  destroyLocationMaps(pane);
   pane.innerHTML = "";
   (fns[name] || fns.dashcam)(pane);
 }
@@ -3089,11 +3747,316 @@ function renderSyncSection(pane) {
 
 function renderGpsSection(pane) {
   renderField(pane, "GPS_EXTRACT", "Extract GPX after each download", checkbox("GPS_EXTRACT"));
+  renderField(pane, "GPS_TRIAGE",
+              "GPS triage queued clips before download", checkbox("GPS_TRIAGE"));
+  const tnote = document.createElement("p");
+  tnote.className = "hint";
+  tnote.textContent =
+    "Reads each queued clip's GPS track straight off the camera (a few KB per " +
+    "clip) before downloading it, so the journey map shows where clips were " +
+    "recorded with placeholder thumbnails — letting you pick what to download.";
+  pane.appendChild(tnote);
   renderField(pane, "GEOCODE_ENABLED", "Reverse-geocode journey endpoints", checkbox("GEOCODE_ENABLED"));
   renderField(pane, "NOMINATIM_EMAIL", "Contact email for Nominatim (optional)",
               textInput("NOMINATIM_EMAIL"));
   renderField(pane, "DISTANCE_UNITS", "Distance units",
               select("DISTANCE_UNITS", ["km", "miles"]));
+  renderLocations(pane);
+  renderGpsMaintenance(pane);
+}
+
+// Discreet maintenance action: flush stale geofence decisions + the journey
+// (route) cache and re-evaluate from existing GPS data. No camera / re-triage.
+function renderGpsMaintenance(pane) {
+  const h = document.createElement("h3");
+  h.textContent = "Maintenance";
+  h.style.marginTop = "24px";
+  pane.appendChild(h);
+
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent =
+    "Rebuilds location labels and journey grouping from existing GPS data; use " +
+    "after changing locations. Nothing is re-downloaded, but clips no longer " +
+    "excluded by a location may be queued for download.";
+  pane.appendChild(note);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "Re-evaluate geofence & journeys";
+  btn.addEventListener("click", async () => {
+    if (!confirm(
+      "Re-evaluate named locations and rebuild journey grouping from existing " +
+      "GPS data?\n\nThis may queue some previously-skipped clips for download.",
+    )) return;
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = "Re-evaluating…";
+    try {
+      const r = await api("/api/archive/rebuild-grouping", { method: "POST" });
+      toast(`Re-evaluated: ${r.unskipped} un-skipped, ${r.reskipped} re-skipped.`);
+    } catch (e) {
+      toast(`Re-evaluate failed: ${e.message || e}`, { type: "error" });
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  });
+  pane.appendChild(btn);
+}
+
+// Reusable single-location editor: map + name + radius + exclude + actions.
+// Pure widget — edits flow out through callbacks; owns one Leaflet map that the
+// host MUST tear down via the returned destroy() (mirrors destroyJourneyMaps).
+// { location, gpsTriageOn, onChange(updated), onSetHome(), onDelete() } -> { el, destroy }
+function createLocationEditor({ location, gpsTriageOn, onChange, onSetHome, onDelete }) {
+  const loc = { ...location };
+  const wrap = document.createElement("div");
+  wrap.className = "loc-editor";
+
+  const mapDiv = document.createElement("div");
+  mapDiv.className = "loc-map";
+  wrap.appendChild(mapDiv);
+
+  // name
+  const nameRow = document.createElement("div");
+  nameRow.className = "form-row";
+  const nameLbl = document.createElement("label");
+  nameLbl.textContent = "Name";
+  const nameInp = document.createElement("input");
+  nameInp.type = "text";
+  nameInp.value = loc.name || "";
+  nameInp.addEventListener("input", () => {
+    loc.name = nameInp.value;
+    onChange({ ...loc });
+  });
+  nameRow.appendChild(nameLbl);
+  nameRow.appendChild(nameInp);
+  wrap.appendChild(nameRow);
+
+  // radius slider with a live value in the label
+  const radRow = document.createElement("div");
+  radRow.className = "form-row";
+  const radLbl = document.createElement("label");
+  const radText = () => `Radius — ${loc.radius_m} m`;
+  radLbl.textContent = radText();
+  const radInp = document.createElement("input");
+  radInp.type = "range";
+  radInp.min = 5;
+  radInp.max = 500;
+  radInp.step = 5;
+  radInp.value = loc.radius_m;
+  radInp.addEventListener("input", () => {
+    loc.radius_m = Number(radInp.value);
+    radLbl.textContent = radText();
+    if (circle) circle.setRadius(loc.radius_m);
+    onChange({ ...loc });
+  });
+  radRow.appendChild(radLbl);
+  radRow.appendChild(radInp);
+  wrap.appendChild(radRow);
+
+  // exclude toggle (requires GPS triage)
+  if (gpsTriageOn) {
+    const exRow = document.createElement("div");
+    exRow.className = "form-row";
+    const exLbl = document.createElement("label");
+    exLbl.textContent = "Exclude recordings made here";
+    const exInp = document.createElement("input");
+    exInp.type = "checkbox";
+    exInp.className = "switch";
+    exInp.checked = !!loc.exclude_recordings;
+    exInp.addEventListener("change", () => {
+      loc.exclude_recordings = exInp.checked;
+      onChange({ ...loc });
+    });
+    exRow.appendChild(exLbl);
+    exRow.appendChild(exInp);
+    wrap.appendChild(exRow);
+  } else {
+    const exNote = document.createElement("p");
+    exNote.className = "hint";
+    exNote.textContent =
+      "Enable “GPS triage” above to auto-skip recordings made at this location.";
+    wrap.appendChild(exNote);
+  }
+
+  // actions
+  const actions = document.createElement("div");
+  actions.className = "loc-actions";
+  const homeBtn = document.createElement("button");
+  homeBtn.type = "button";
+  homeBtn.className = "btn-secondary loc-home-btn";
+  homeBtn.textContent = loc.is_home ? "Current Home" : "Set as Home";
+  homeBtn.disabled = !!loc.is_home;
+  homeBtn.addEventListener("click", () => onSetHome());
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "btn-secondary loc-del-btn";
+  delBtn.textContent = "Delete";
+  delBtn.addEventListener("click", () => onDelete());
+  actions.appendChild(homeBtn);
+  actions.appendChild(delBtn);
+  wrap.appendChild(actions);
+
+  // Leaflet map: click-to-set / draggable pin + radius circle
+  const map = L.map(mapDiv).setView([loc.lat, loc.lon], 16);
+  mapDiv._locMap = map;
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "© OpenStreetMap",
+  }).addTo(map);
+  setTimeout(() => map.invalidateSize(), 0);
+
+  const icon = L.divIcon({
+    html: `<span class="home-marker">${loc.is_home ? HOME_GLYPH : PIN_GLYPH}</span>`,
+    className: "home-marker-wrap",
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
+  });
+  const marker = L.marker([loc.lat, loc.lon], { draggable: true, icon }).addTo(map);
+  let circle = L.circle([loc.lat, loc.lon], {
+    radius: loc.radius_m, color: "#3b82f6",
+  }).addTo(map);
+
+  function moveTo(lat, lon) {
+    loc.lat = lat;
+    loc.lon = lon;
+    marker.setLatLng([lat, lon]);
+    circle.setLatLng([lat, lon]);
+    onChange({ ...loc });
+  }
+  marker.on("dragend", () => {
+    const p = marker.getLatLng();
+    moveTo(p.lat, p.lng);
+  });
+  map.on("click", (e) => moveTo(e.latlng.lat, e.latlng.lng));
+
+  return {
+    el: wrap,
+    destroy() { map.remove(); mapDiv._locMap = null; },
+  };
+}
+
+// Inline list of named locations (add / edit / set-home / delete). Replaces the
+// single "Home location" block. All edits flow into settingsState.pending so the
+// existing Save footer persists them; the existing LOCATIONS-change backfill
+// (geofence + journey rebuild) runs server-side on save.
+function renderLocations(pane) {
+  const h = document.createElement("h3");
+  h.textContent = "Locations";
+  h.style.marginTop = "24px";
+  pane.appendChild(h);
+
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent =
+    "Named places used to label and filter journeys and stops. With GPS Triage " +
+    "on, a place can also auto-skip recordings made while parked there.";
+  pane.appendChild(note);
+
+  const listWrap = document.createElement("div");
+  listWrap.className = "loc-list";
+  pane.appendChild(listWrap);
+
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.className = "loc-add";
+  addBtn.textContent = "+ Add location";
+  pane.appendChild(addBtn);
+
+  // Deep working copy; the backend stores it under LOCATIONS.
+  let list = JSON.parse(JSON.stringify(valueOf("LOCATIONS") || []));
+  let openIdx = -1;
+  let editor = null;
+  const gpsTriageOn = !!valueOf("GPS_TRIAGE");
+
+  function persist() {
+    setPending("LOCATIONS", JSON.parse(JSON.stringify(list)));
+  }
+  function closeEditor() {
+    if (editor) { editor.destroy(); editor = null; }
+  }
+  function metaText(loc) {
+    return `${Number(loc.lat).toFixed(4)}, ${Number(loc.lon).toFixed(4)} · ${loc.radius_m} m`;
+  }
+
+  function rerender() {
+    closeEditor();
+    listWrap.innerHTML = "";
+    if (!list.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint loc-empty";
+      empty.textContent = "No locations yet. Add one to label journeys and stops.";
+      listWrap.appendChild(empty);
+    }
+    list.forEach((loc, i) => {
+      const row = document.createElement("div");
+      row.className = "loc" + (i === openIdx ? " open" : "");
+
+      const head = document.createElement("div");
+      head.className = "loc-row";
+      head.innerHTML = `
+        <span class="loc-ico">${loc.is_home ? HOME_GLYPH : PIN_GLYPH}</span>
+        <span class="loc-name">${escHtml(loc.name || "(unnamed)")}</span>
+        ${loc.is_home ? '<span class="loc-badge home">Home</span>' : ""}
+        ${loc.exclude_recordings ? '<span class="loc-badge excl">Excluded</span>' : ""}
+        <span class="loc-meta">${metaText(loc)}</span>
+        <span class="loc-caret">${i === openIdx ? "▴" : "▾"}</span>
+      `;
+      head.addEventListener("click", () => {
+        openIdx = (openIdx === i) ? -1 : i;
+        rerender();
+      });
+      row.appendChild(head);
+
+      if (i === openIdx) {
+        editor = createLocationEditor({
+          location: loc,
+          gpsTriageOn,
+          onChange: (updated) => {
+            list[i] = updated;
+            persist();
+            // keep the row's name/meta live without tearing down the open map
+            head.querySelector(".loc-name").textContent = updated.name || "(unnamed)";
+            head.querySelector(".loc-meta").textContent = metaText(updated);
+          },
+          onSetHome: () => {
+            list.forEach((l, j) => { l.is_home = (j === i); });
+            persist();
+            rerender();
+          },
+          onDelete: () => {
+            const wasHome = list[i].is_home;
+            list.splice(i, 1);
+            if (wasHome && list.length) list[0].is_home = true;
+            openIdx = -1;
+            persist();
+            rerender();
+          },
+        });
+        row.appendChild(editor.el);
+      }
+      listWrap.appendChild(row);
+    });
+  }
+
+  addBtn.addEventListener("click", () => {
+    const base = list[0] || { lat: 53.0, lon: -2.0 };
+    list.push({
+      name: "New location",
+      lat: base.lat,
+      lon: base.lon,
+      radius_m: 30,
+      exclude_recordings: false,
+      is_home: list.length === 0,  // the very first place added is Home
+    });
+    openIdx = list.length - 1;
+    persist();
+    rerender();
+  });
+
+  rerender();
 }
 
 function renderThumbnailsSection(pane) {
@@ -3476,6 +4439,10 @@ if (settingsSave) {
       if (body.editable && body.editable.DISTANCE_UNITS) {
         state.distanceUnits = body.editable.DISTANCE_UNITS;
       }
+      if (body.editable && body.editable.LOCATIONS) {
+        state.locations = body.editable.LOCATIONS;
+        buildLocationFilter();
+      }
       await loadSettings();
     } catch (e) {
       alert(`Save failed: ${e}`);
@@ -3658,9 +4625,14 @@ window.addEventListener("hashchange", () => {
         }),
       });
       if (r.ok) {
-        const present = new Set((await r.json()).present || []);
-        queue = picked.filter((p) => !present.has(p.file.name));
+        const body = await r.json();
+        const present = new Set(body.present || []);
+        const skipped = new Set(body.skipped || []);
+        queue = picked.filter(
+          (p) => !present.has(p.file.name) && !skipped.has(p.file.name),
+        );
         if (present.size) tally.already_present = present.size;
+        if (skipped.size) tally.skipped = skipped.size;
       }
     } catch (_) { /* fall back to uploading everything */ }
 
@@ -3749,7 +4721,7 @@ window.addEventListener("hashchange", () => {
     const el = $("import-summary");
     el.textContent =
       `Imported ${t.imported || 0}, duplicate ${t.already_present || 0}, ` +
-      `skipped (over quota) ${t.over_quota_older || 0}, ` +
+      `skipped ${t.skipped || 0}, over quota ${t.over_quota_older || 0}, ` +
       `unrecognised ${t.not_recognised || 0}, errors ${t.errors || 0}.`;
     show(el);
     if (!document.getElementById("view-archive").hidden) loadDays();

@@ -163,3 +163,12 @@ def test_database_init_does_not_migrate(
         "legacy file contents must be untouched"
     assert not (rec / ".viofosync.db.migrated").exists(), \
         "legacy file must NOT have been renamed by Database()"
+
+
+def test_remote_complete_column_exists(tmp_path):
+    from web.db import Database
+
+    db = Database(str(tmp_path / "v.db"))
+    with db.conn() as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(download_queue)")}
+    assert "remote_complete" in cols

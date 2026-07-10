@@ -53,6 +53,7 @@ from .services.mqtt import MqttService
 from .services.sync_worker import SyncWorker
 from .services import derive_worker
 from .services.derive_worker import DeriveWorker
+from .services import locations as _locations
 from .setup_mode import SetupModeMiddleware
 
 log = logging.getLogger("viofosync.web")
@@ -72,6 +73,17 @@ def _sync_worker_action(keys: set, snap) -> str | None:
     if snap.enable_scheduled_sync and snap.address:
         return "start"
     return "stop"
+
+
+def _geofence_backfill_needed(keys: set, snap) -> bool:
+    """True when a settings change should trigger an immediate geofence
+    re-evaluation of the existing queue: a LOCATIONS change while GPS triage is
+    on and at least one location is flagged for exclusion."""
+    if "LOCATIONS" not in keys:
+        return False
+    if not getattr(snap, "gps_triage", False):
+        return False
+    return bool(_locations.exclusion_zones(getattr(snap, "locations", ()) or ()))
 
 
 @asynccontextmanager
@@ -127,6 +139,14 @@ async def lifespan(app: FastAPI):
         _exp_mod.sweep_orphan_exports(app.state.db, s.recordings)
     except Exception:  # pragma: no cover — non-fatal
         log.exception("export orphan sweep failed")
+
+    # GPS Triage: drop skeleton sidecars orphaned by a crash (clip since
+    # downloaded / rotated off / row gone).
+    try:
+        from .services import triage as _triage_mod
+        _triage_mod.sweep_orphans(app.state.db, s.recordings)
+    except Exception:  # pragma: no cover — non-fatal
+        log.exception("triage startup sweep failed")
 
     log.info(
         "viofosync web UI ready on http://%s:%d", s.host, s.port
@@ -279,6 +299,33 @@ async def lifespan(app: FastAPI):
         provider.subscribe(_on_derive_settings_changed)
     )
 
+    def _on_triage_settings_changed(keys, snap) -> None:
+        # When GPS triage is turned off, drop the .triage skeleton cache and
+        # clear the triage columns so stale skeletons don't linger.
+        if "GPS_TRIAGE" in keys and not snap.gps_triage:
+            from .services import triage as _triage_mod
+            try:
+                _triage_mod.purge_all(app.state.db, snap.recordings)
+            except Exception:  # pragma: no cover — non-fatal
+                log.exception("triage purge on disable failed")
+
+    app.state.settings_unsubscribes.append(
+        provider.subscribe(_on_triage_settings_changed)
+    )
+
+    def _on_geofence_settings_changed(keys, snap) -> None:
+        # Re-evaluate the existing queue immediately when the home zone is
+        # set/changed, so the backlog is skipped without waiting for a cycle.
+        if _geofence_backfill_needed(keys, snap):
+            _tasks.spawn(
+                app.state.sync_worker._run_geofence_pass(),
+                name="geofence-backfill",
+            )
+
+    app.state.settings_unsubscribes.append(
+        provider.subscribe(_on_geofence_settings_changed)
+    )
+
     app.state.mqtt = MqttService(
         db=app.state.db,
         provider=provider,
@@ -343,7 +390,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="Viofosync",
-        version="2.4",
+        version="2.5",
         lifespan=lifespan,
         docs_url=None,       # no swagger in prod build
         redoc_url=None,

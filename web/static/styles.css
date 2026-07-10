@@ -179,9 +179,14 @@ input[type="radio"] {
 /* Waiting: match the sync-status badge's amber so the button and badge
  * read as the same state. */
 .icon-btn.waiting { color: var(--warn); border-color: var(--warn); }
+.icon-btn.triaging { color: var(--accent); border-color: var(--accent); }
 /* When the syncing icon is the visible one, give it a gentle
  * continuous spin so the button reads as "in progress". */
 .icon-btn.active #sync-icon-sync:not([hidden]) {
+  animation: vfs-spin 1.6s linear infinite;
+  transform-origin: 50% 50%;
+}
+.icon-btn.triaging #sync-icon-sync:not([hidden]) {
   animation: vfs-spin 1.6s linear infinite;
   transform-origin: 50% 50%;
 }
@@ -309,6 +314,7 @@ nav a.active { background: var(--panel-2); }
  * dark/light themes stay coherent — extend the palette only if a
  * future revision adds new accent tokens. */
 .status.downloading { color: var(--ok); border-color: var(--ok); }
+.status.triaging    { color: var(--accent); border-color: var(--accent); }
 .status.waiting     { color: var(--warn); border-color: var(--warn); }
 .status.paused      { color: var(--err-text); border-color: var(--err); }
 .status.error {
@@ -337,6 +343,8 @@ main {
 }
 .archive-filters .spacer { flex: 1; }
 .archive-filters .kind-label { flex-direction: row; }
+.archive-filters .loc-filter { align-items: center; gap: 6px; }
+.archive-filters .loc-filter select { max-width: 170px; }
 
 .archive-actions {
   display: flex; align-items: center; gap: 8px;
@@ -550,6 +558,13 @@ main {
   align-items: baseline;
 }
 .day-header:hover { background: rgba(255, 255, 255, 0.015); }
+.day-header .day-check {
+  flex: 0 0 auto;
+  align-self: center;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
 /* The date is the strongest landmark on the archive page;
  * it deserves more weight than the metadata that follows it.
  * Pre-bolder this was 15px/600 (≈1.07× the 14px body — flat).
@@ -636,16 +651,47 @@ main {
 /* Filenames are debug-y data; fade them and clip to one line.
  * Hover reveals the full string via the title attribute on the
  * label element (set in the renderer). */
-.clip-pair .label {
-  font-size: 10px;
-  color: var(--muted);
-  font-family: "SF Mono", "Menlo", monospace;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  opacity: 0.75;
+/* Per-clip filename labels are noise in the archive grid — the new
+ * Download Actions selection + journey context identify clips instead. */
+.clip-pair .label { display: none; }
+.clip-pair .thumb.remote {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 16 / 9;            /* match a real thumb's footprint */
+  background: repeating-linear-gradient(
+    45deg, var(--panel), var(--panel) 8px, var(--bg) 8px, var(--bg) 16px);
+  opacity: 0.85;
 }
-.clip-pair:hover .label { opacity: 1; }
+.clip-pair .thumb.remote .remote-badge {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 14px;
+  opacity: 0.8;
+}
+.clip-pair .thumb.remote .remote-badge svg { display: block; }
+.clip-pair .thumb.remote.state-pending     .remote-badge { color: var(--accent); }
+.clip-pair .thumb.remote.state-downloading .remote-badge { color: var(--accent); }
+.clip-pair .thumb.remote.state-failed      .remote-badge { color: var(--err); }
+.clip-pair .thumb.remote.state-skipped     .remote-badge { color: var(--muted); }
+.clip-pair .thumb.remote.state-skipped { opacity: 0.5; }
+.clip-pair .thumb.remote.geofence .remote-badge { color: var(--accent); }
+.clip-pair .thumb.remote .remote-badge .spin { animation: vfs-spin 1.6s linear infinite; transform-origin: 50% 50%; }
+.clip-pair .thumb.remote .unskip-btn {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.clip-pair .thumb.remote .unskip-btn:hover { border-color: var(--accent); }
+.clip-pair .thumb.remote .unskip-btn:disabled { opacity: 0.5; cursor: default; }
 .clip-pair.flash {
   outline: 2px solid var(--accent);
   animation: flash-pulse 1.5s ease-out;
@@ -656,6 +702,11 @@ main {
 }
 
 #map { height: 340px; border-radius: 8px; margin: 16px 0; }
+.home-marker { color: var(--accent); display: block; }
+.home-marker-wrap { display: flex; align-items: center; justify-content: center; }
+.journey-title .start-label svg,
+.journey-title .end-label svg,
+.stop-label svg { vertical-align: -2px; margin-right: 3px; color: var(--accent); }
 
 .journey-table {
   width: 100%; border-collapse: collapse;
@@ -680,6 +731,11 @@ main {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 14px;
   flex-wrap: wrap;
+  /* Reserve the Timeline button's row height (only drive cards carry it) so a
+     button-less stop / ungrouped header is the same height as a drive's. With
+     box-sizing: border-box this clamps every header — whatever its padding — to
+     one height; align-items: center keeps the content vertically centred. */
+  min-height: 50px;
 }
 .journey-card.collapsible .journey-header {
   cursor: pointer;
@@ -715,7 +771,13 @@ main {
 .start-label, .end-label, .stop-label {
   overflow-wrap: anywhere;
 }
-.journey-header .journey-times { color: var(--text); font-size: 13px; }
+/* tabular-nums keeps every HH:MM:SS range the same width, so the journey-title
+   column starts at the same x on drive and stop cards. */
+.journey-header .journey-times {
+  color: var(--text); font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
 .journey-header .journey-meta {
   color: var(--muted); font-size: 12px;
   margin-left: auto;
@@ -728,8 +790,23 @@ main {
 .journey-card .clip-grid { padding: 12px; }
 
 .stop-card .journey-header { background: rgba(241, 196, 15, 0.05); }
-.stop-card .stop-icon { font-size: 14px; color: var(--warn); }
+/* In the stop-card header the icon sits in the right-hand action slot — the
+   same place the Timeline button occupies on drive cards (8px past the meta,
+   matching the button's margin). */
+.stop-card .journey-header .stop-icon {
+  font-size: 14px; color: var(--warn);
+  flex: 0 0 auto; margin-left: 8px;
+}
 .stop-card .journey-map { height: 200px; }
+
+/* Drives are the spine of the day: accent rail + graded header wash + bold title.
+   Stops recede (the existing faint amber header stays; just dim + tighten it). */
+.journey-card.drive { border-left: 3px solid var(--accent); }
+.journey-card.drive .journey-header {
+  background: linear-gradient(to right, var(--accent-18), transparent 55%), var(--panel-2);
+}
+.journey-card.drive .journey-title { font-weight: 700; }
+.stop-card .journey-header { opacity: 0.85; padding: 6px 14px; }
 
 .stop-banner {
   display: flex; align-items: center; gap: 10px;
@@ -1483,6 +1560,7 @@ main {
   .queue-filters,
   .archive-actions { padding: 10px; }
   .filters .spacer,
+  .queue-filters .spacer,
   .archive-actions .spacer,
   .archive-filters .spacer { display: none; }
 
@@ -1670,6 +1748,7 @@ main {
     border: none;
   }
   .status.downloading { background: var(--ok); }
+  .status.triaging    { background: var(--accent); }
   .status.waiting     { background: var(--warn); }
   .status.paused      { background: var(--err); }
   .status.error       { background: #7f1d1d; }
@@ -2417,4 +2496,103 @@ main {
 .switch:checked { background: var(--accent-45); border-color: var(--accent); }
 .switch:checked::before { transform: translateX(20px); background: var(--on-accent); }
 .switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* --- Named locations list (Settings → GPS) --- */
+.loc-list { margin: 8px 0 4px; }
+.loc {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 7px 0;
+  background: var(--panel);
+  overflow: hidden;
+}
+.loc.open { border-color: var(--accent); }
+.loc-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.loc-ico { color: var(--accent); display: inline-flex; }
+.loc-name { font-weight: 600; color: var(--text); }
+.loc-badge {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+}
+.loc-badge.home { color: var(--warn); border-color: var(--warn); }
+.loc-badge.excl { color: var(--accent); border-color: var(--accent-45); }
+.loc-meta {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.loc-caret { color: var(--muted); }
+.loc-editor {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+  background: var(--panel-2);
+}
+.loc-map { height: 220px; border-radius: 8px; margin: 0 0 10px; }
+.loc-actions { display: flex; gap: 8px; margin-top: 12px; }
+.loc-del-btn { margin-left: auto; color: var(--err-text); border-color: var(--err); }
+.loc-add {
+  width: 100%;
+  border: 1px dashed var(--border-hover);
+  border-radius: 8px;
+  padding: 11px;
+  margin-top: 9px;
+  background: transparent;
+  color: var(--muted);
+}
+.loc-add:hover { background: var(--panel-2); color: var(--text); }
+.loc-empty { margin: 8px 2px; }
 .switch:disabled { opacity: 0.5; cursor: default; }
+.clip-action-group { display: flex; align-items: center; gap: 6px; }
+.clip-action-group select { max-width: 190px; }
+/* The Downloads bar reuses .clip-action-group; give its label the same muted
+   treatment as the archive action label so the two bars read identically. */
+.queue-filters .action-label {
+  font-size: 12px; color: var(--muted);
+  font-weight: 500; margin-right: 2px;
+}
+
+/* GPS triage badge — per-file indicator in the Downloads queue table. */
+.gps-badge {
+  display: inline-block;
+  min-width: 1.2em;
+  text-align: center;
+  font-weight: 600;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.gps-badge.gps-ok      { color: var(--ok); }
+.gps-badge.gps-none    { color: var(--muted); }
+.gps-badge.gps-pending { color: var(--muted); opacity: 0.7; }
+.queue-items td.gps-cell { text-align: center; }
+
+/* Journey completion pie — small conic-gradient circle in the journey header. */
+.journey-pie {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  vertical-align: -2px;
+  margin-right: 8px;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.journey-pie::before {
+  content: "";
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: conic-gradient(var(--muted) calc(var(--pp) * 1%), transparent 0);
+}
+.journey-pie.is-complete::before {
+  background: var(--ok);
+}

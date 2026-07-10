@@ -1171,24 +1171,55 @@ class ExportWorker:
         with self.db.conn() as c:
             rows = c.execute(
                 """
-                SELECT path, camera, timestamp, duration_s
+                SELECT id, path, camera, timestamp, duration_s
                 FROM clip_index
                 WHERE timestamp < ?
-                  AND timestamp + COALESCE(duration_s, 0) > ?
+                  AND (
+                        timestamp + COALESCE(duration_s, 0) > ?
+                        OR (duration_s IS NULL AND timestamp > ?)
+                      )
                 """,
-                (hi, lo),
+                (hi, lo, lo - _TIMELINE_PROTECT_MARGIN_S),
             ).fetchall()
+
+        # A clip whose duration_s hasn't been filled in yet — the async
+        # duration sweep lags indexing, most visibly right after a bulk
+        # SD-card import — is invisible to build_switch_pieces, which treats
+        # an unknown duration as zero-length and would drop the selection's
+        # only footage ("no footage in selection"). The NULL branch in the
+        # query above reaches back one clip-length so we can probe those
+        # candidates on demand and persist the result, rather than failing an
+        # export of footage that is actually present.
+        probed: dict[int, Optional[float]] = {}
+        for r in rows:
+            if r["duration_s"] is None:
+                probed[r["id"]] = await durations.probe_and_store(
+                    self.db, r["id"], r["path"],
+                )
         clips = [
             {
                 "path": r["path"],
                 "channel": channel_of(r["camera"]),
                 "start_ts": r["timestamp"],
-                "duration_s": r["duration_s"],
+                "duration_s": (
+                    probed[r["id"]] if r["duration_s"] is None
+                    else r["duration_s"]
+                ),
             }
             for r in rows
         ]
         pieces = build_switch_pieces(segments, clips)
         if not pieces:
+            # Leave a breadcrumb: the bare "no footage" job error is otherwise
+            # unlogged, so a failed timeline export is invisible in the logs.
+            log.warning(
+                "timeline export %s: no footage in selection [%.0f, %.0f] — "
+                "%d candidate clip(s), channels=%s, %d with unknown duration "
+                "after probing",
+                job["id"], lo, hi, len(clips),
+                sorted({c["channel"] for c in clips}),
+                sum(1 for c in clips if not c["duration_s"]),
+            )
             self._finish(job["id"], False, "no footage in selection", None)
             return
 

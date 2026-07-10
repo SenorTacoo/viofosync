@@ -1,5 +1,42 @@
 # Changelog
 
+## v2.5 — 2026-07-10
+
+### Added
+
+#### GPS Triage
+
+viofosync can now fetch a clip's **GPS track before downloading the recording itself** — a skeleton trace pulled in seconds over Wi-Fi, rather than minutes of transferring the full MP4. With triage on, every queued clip is scouted for its route first, so the archive's journey maps, stops, and place names appear ahead of the footage arriving, and the download queue can be organised around where you actually drove. Off by default — enable **GPS triage** in Settings.
+
+#### Sync Filtering
+
+GPS-driven controls over what actually syncs — more sync policies to come:
+
+- **Read-only-only sync** — restrict syncing to locked (event) clips, so only footage the camera has protected is pulled.
+- **Location skip** — define **named locations** (Home by default) with a dwell radius; with GPS triage on, clips that dwell at a location flagged *exclude recordings* are auto-skipped, so parking-mode footage recorded on your own driveway never downloads. Location names also label journey and stop endpoints on the archive maps.
+
+#### Clip Locking & Delete-from-Camera
+
+You can now manually **mark a clip read-only** to retain it indefinitely — locked clips are protected from retention pruning and manual delete.
+
+#### Journeys & Archive UX
+
+- A **per-journey completion pie** shows at a glance how much of each detected trip has finished downloading.
+- Journey grouping is **padded past the GPS stop radius** so a trip takes in its pull-away and pull-in clips, with the trace, start, and end markers all unified to that same padded window.
+- Unified **clip actions dropdown** (queue / export / delete) replaces the scattered per-clip buttons.
+- Archive navigation now **preserves tab state, restores map views, and adds FLIP animations**, so the view no longer resets as clips index in.
+
+### Changed
+
+- Single-channel captures get **compact filenames** — no redundant camera suffix when only one lens is present — and a downloaded clip's sidecar GPS is used as a fallback source for its track. Thanks to @nittanygeek (#24).
+- Redundant **Extract GPS** button was removed now that triage handles extraction.
+
+### Fixed
+
+- The dashcam lists and serves the clip it is *still recording* and reports a stale size for it. An **active-recording guard** now holds every lens of the newest capture group out of triage and the download drain until the camera's `cmd=3014` record flag reports stopped, freeing superseded captures as new ones arrive and deferring any clip that keeps growing mid-download. (#26)
+- The sync worker now **reports its state on start**, so the status badge no longer shows a false "paused" before the first cycle.
+- `RangeReader` now raises `TruncatedRead` on a short range response instead of silently accepting a truncated GPS read.
+
 ## v2.4 — 2026-06-18
 
 ### Added

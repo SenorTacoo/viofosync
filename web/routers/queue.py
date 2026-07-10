@@ -108,6 +108,21 @@ def prioritize(body: Prioritize, request: Request) -> dict:
     return {"ok": True, "updated": n}
 
 
+class DownloadNext(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+@router.post("/queue/download-next", dependencies=[Depends(require_csrf)])
+def download_next(body: DownloadNext, request: Request) -> dict:
+    n = q.download_next(request.app.state.db, body.filenames)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    # Kick the worker so the prioritized clips download right away.
+    worker = getattr(request.app.state, "sync_worker", None)
+    if worker is not None:
+        worker.kick()
+    return {"ok": True, "updated": n}
+
+
 class Retry(BaseModel):
     # Omit/empty to retry every failed file; otherwise retry just these.
     filenames: List[str] = Field(default_factory=list)
@@ -141,6 +156,37 @@ class Unskip(BaseModel):
     filenames: List[str] = Field(default_factory=list)
 
 
+class Lock(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+class DeleteClips(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+class DeleteFromCamera(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
+@router.post("/queue/delete-from-camera", dependencies=[Depends(require_csrf)])
+def delete_from_camera_route(body: DeleteFromCamera, request: Request) -> dict:
+    snap = request.app.state.settings_provider.get()
+    addr = snap.address
+    if not addr:
+        return {"ok": False, "error": "no dashcam address configured"}
+    res = q.delete_from_camera(request.app.state.db, body.filenames, f"http://{addr}")
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    return {"ok": True, **res}
+
+
+@router.post("/queue/delete", dependencies=[Depends(require_csrf)])
+def delete_clips(body: DeleteClips, request: Request) -> dict:
+    recordings = request.app.state.settings_provider.get().recordings
+    res = q.delete_clips(request.app.state.db, body.filenames, recordings)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
+    return {"ok": True, **res}
+
+
 @router.post("/queue/unskip", dependencies=[Depends(require_csrf)])
 def unskip(body: Unskip, request: Request) -> dict:
     n = q.unskip(request.app.state.db, body.filenames)
@@ -149,6 +195,13 @@ def unskip(body: Unskip, request: Request) -> dict:
     worker = getattr(request.app.state, "sync_worker", None)
     if worker is not None:
         worker.kick()
+    return {"ok": True, "updated": n}
+
+
+@router.post("/queue/lock", dependencies=[Depends(require_csrf)])
+def lock(body: Lock, request: Request) -> dict:
+    n = q.set_locked(request.app.state.db, body.filenames, True)
+    q.emit_queue_changed(request.app.state.db, request.app.state.hub)
     return {"ok": True, "updated": n}
 
 

@@ -173,3 +173,30 @@ def test_make_room_honors_disk_pct_after_quota_satisfied(env, monkeypatch):
     )
     assert ok is True
     assert _ids(db) == set()  # evicted until disk usage dropped under 90%
+
+
+# ---------------------------------------------------------------------------
+# locked=1 protection — make_room_for must never evict a locked clip
+# ---------------------------------------------------------------------------
+
+def test_make_room_for_skips_locked_clip_protect_ro_false(env, monkeypatch):
+    """make_room_for must not evict a locked=1 clip even with protect_ro=False."""
+    rec, db = env
+    locked_id = _clip(rec, db, basename="LOCKED.MP4", ts=100, size=1)
+    with db.write() as c:
+        c.execute("UPDATE clip_index SET locked=1 WHERE id=?", (locked_id,))
+
+    # Always over quota so the loop would evict if it could.
+    _patch_quota(monkeypatch, used_bytes=2 * (1 << 30))
+    monkeypatch.setattr(
+        "web.services.retention._delete_clip_files",
+        lambda row, recordings: 1 << 30,
+    )
+
+    ok = ret.make_room_for(
+        db, str(rec), size=0, before_ts=300,
+        disk_pct=0, quota_gb=1, protect_ro=False,
+    )
+    # Locked clip is the only candidate — nothing can be evicted → False.
+    assert ok is False
+    assert _ids(db) == {"LOCKED.MP4"}

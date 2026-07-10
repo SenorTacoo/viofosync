@@ -10,8 +10,11 @@ Self-hosted web app for syncing, browsing, and exporting recordings from a Viofo
 
 - **Automatic Wi-Fi sync** - clips copy from the dashcam in your car when it joins your home wi-fi.
 - **Download control** - skip clips you don't want, retry failed ones, and prioritise recent footage, all from the download queue.
+- **GPS triage** - fetches each clip's GPS trace in seconds without downloading the full recording, so journeys, stops, and place names appear before the footage does — and the download queue can be organised around where you actually drove.
+- **Sync filtering** - restrict syncing to locked (event) clips only, or auto-skip anything recorded while parked at a named location such as home. GPS-driven, and the groundwork for richer download/delete ordering to come.
 - **Archive browser** - clips grouped by day, played in your browser; hover a clip to scrub a quick preview. Nothing to install on your phone or laptop.
 - **Journey maps** - automatic journey detection with each trip shown on a map with stops detected and place names looked up automatically.
+- **Clip retention control** - mark any clip read-only to keep it indefinitely (protected from pruning and delete), or delete a clip straight off the camera's SD card once it's safely saved.
 - **Video editor** - trim clips, cut between cameras, and add a picture-in-picture inset to any segment, then export a single video.
 - **Flexible exports** - original clips, joined front/rear, picture-in-picture, or edited cuts; hardware-accelerated where your system supports it.
 - **Storage management** - set a size or age limit and the oldest footage is pruned to fit; optional auto-delete clears the camera's SD card once a clip is safely saved.
@@ -53,10 +56,10 @@ Self-hosted web app for syncing, browsing, and exporting recordings from a Viofo
 
 viofosync targets any Viofo Wi-Fi dashcam that uses the standard `…F` / `…R` / `…T` / `…I` recording filenames, so models beyond those listed below should work — reports of other cameras are welcome.
 
-| Camera | Channels | Tested by |
-| --- | --- | --- |
-| Viofo A229 Pro | Front + Rear | maintainer |
-| Viofo A329 | Front + Rear + Telephoto | [@jusii](https://github.com/jusii) |
+| Camera         | 
+| -------------- | 
+| Viofo A229 Pro | 
+| Viofo A329     | 
 
 Three-camera models are supported with either a telephoto (`T`) or interior/cabin (`I`) third lens. The telephoto channel was validated live on the A329; the interior channel was validated against real cabin-cam footage contributed alongside that work.
 
@@ -239,6 +242,8 @@ viofosync is an open-source project built with substantial AI assistance, intend
 Camera control — reading and safely adjusting dashcam settings over Wi-Fi — was contributed by [@droomurray](https://github.com/droomurray) (#21).
 
 Three-camera support (telephoto and interior lenses), the single-source camera registry and other improvements were contributed by [@jusii](https://github.com/jusii) (#17, #18, #20).
+
+Single channel camera work by [@nittanygeek](https://github.com/nittanygeek) (#24).
 
 The GPX extraction logic uses the method described at [https://sergei.nz/extracting-gps-data-from-viofo-a119-and-other-novatek-powered-cameras/](https://sergei.nz/extracting-gps-data-from-viofo-a119-and-other-novatek-powered-cameras/).
 

@@ -20,13 +20,71 @@ State machine (see the plan for rationale):
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
-from viofosync_lib.cameras import CAMERA_LETTERS
+import viofosync_lib as vfs
+from viofosync_lib.cameras import (
+    CAMERA_LETTERS,
+    GPS_CAMERA_LETTER,
+    is_gps_camera,
+)
 
 from ..db import Database
+from .naming import camera_letter_sql, capture_key_sql, day_key_sql, gps_sibling_sql
+from .triage import TRIAGE_MAX_ATTEMPTS
+
+# INFO-level here is persisted to the app_log table by DBLogHandler (the
+# "viofosync.*" namespace is captured at INFO) — so user-initiated archive
+# mutations (delete/skip/unskip/retry/download-next/prioritize) leave an
+# audit trail in the activity log, not just the console.
+log = logging.getLogger("viofosync.queue")
+
+
+def _names(filenames: List[str], limit: int = 20) -> str:
+    """Compact, log-friendly rendering of a filename list (truncated)."""
+    shown = ", ".join(filenames[:limit])
+    extra = len(filenames) - limit
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _gps_state(d: dict) -> Optional[str]:
+    """Derive the per-file GPS indicator from triage columns.
+
+    'ok'      = GPS fetched (gps_points > 0)
+    'none'    = triaged with no fix, OR gave up after MAX unreadable attempts
+    'pending' = still awaiting triage
+    None      = non-GPS lens with no GPS sibling at its timestamp (orphan) —
+                there is no capture-level GPS fact to imply
+
+    GPS is a capture-level fact carried by one lens (the front): that row's
+    own triage columns speak for it, and the other lenses (rear/tele/interior,
+    which are never triaged themselves) *inherit* the state from their GPS
+    sibling's columns — selected as ``sib_*`` by the listing queries via
+    ``GPS_SIBLING_SQL``.
+
+    Camera identity is taken from the filename via the registry, not the
+    ``camera`` column, so historical rows with a NULL ``camera`` still resolve.
+    """
+    if is_gps_camera(_camera_from_filename(d.get("filename") or "")):
+        triaged_at = d.get("triaged_at")
+        gps_points = d.get("gps_points")
+        attempts = d.get("triage_attempts")
+    elif d.get("sib_id") is not None:
+        triaged_at = d.get("sib_triaged_at")
+        gps_points = d.get("sib_gps_points")
+        attempts = d.get("sib_triage_attempts")
+    else:
+        return None
+    if (gps_points or 0) > 0:
+        return "ok"
+    if triaged_at is not None:
+        return "none"            # triaged, no GPS fix
+    if (attempts or 0) >= TRIAGE_MAX_ATTEMPTS:
+        return "none"            # gave up after MAX unreadable attempts
+    return "pending"
 
 
 @dataclass
@@ -183,18 +241,27 @@ def reconcile(
     }
 
 
+# Compact single-channel names (``YYYYMMDDHHMMSS_NNNNNN.MP4``) carry no
+# event prefix or camera suffix; the sole lens is the GPS-bearing one.
+_COMPACT_FILENAME_RE = r"^\d{14}_\d+\.MP4$"
+
+
 def _camera_from_filename(filename: str) -> Optional[str]:
-    # Handles both ``…_0001F.MP4`` and ``…_0001PF.MP4`` /
-    # ``…_0001EF.MP4`` — the optional prefix letter encodes the
-    # event type (P=parking, E=event); the camera letter set
-    # comes from the registry.
+    # Handles ``…_0001F.MP4`` and ``…_0001PF.MP4`` / ``…_0001EF.MP4`` —
+    # the optional prefix letter encodes the event type (P=parking,
+    # E=event); the camera letter set comes from the registry. Compact
+    # suffix-less names default to the GPS-bearing lens.
     import re as _re
     m = _re.match(
         rf"^\d{{4}}_\d{{4}}_\d{{6}}_\d+[PE]?([{CAMERA_LETTERS}])\.MP4$",
         filename,
         _re.IGNORECASE,
     )
-    return m.group(1).upper() if m else None
+    if m:
+        return m.group(1).upper()
+    if _re.match(_COMPACT_FILENAME_RE, filename, _re.IGNORECASE):
+        return GPS_CAMERA_LETTER
+    return None
 
 
 def _event_from_filename(filename: str) -> Optional[str]:
@@ -204,36 +271,95 @@ def _event_from_filename(filename: str) -> Optional[str]:
         filename,
         _re.IGNORECASE,
     )
-    if not m:
-        return None
-    prefix = (m.group(1) or "").upper()
-    return {"P": "parking", "E": "event"}.get(prefix, "normal")
+    if m:
+        prefix = (m.group(1) or "").upper()
+        return {"P": "parking", "E": "event"}.get(prefix, "normal")
+    if _re.match(_COMPACT_FILENAME_RE, filename, _re.IGNORECASE):
+        return "normal"
+    return None
 
 
 # SQL expressions for deriving camera / event type straight
 # from the filename. Used for filtering so we don't depend on
 # historical rows having ``camera`` / ``event_type`` populated.
-# Filenames end in ``…NNNNN[PE]?[FRTI].MP4`` — the camera letter
-# is the character immediately before ``.MP4``, and the byte
-# before that is either a digit (normal) or P/E.
-_CAM_SQL = "upper(substr(filename, -5, 1))"
+# The camera letter comes from naming.camera_letter_sql (format-aware:
+# suffix-less compact names default to the GPS lens); for standard names
+# the byte before the letter is either a digit (normal) or P/E, and for
+# compact names it is always a digit — which the CASE consumers already
+# read as 'normal'.
+_CAM_SQL = camera_letter_sql()
 _EVT_PREFIX_SQL = "upper(substr(filename, -6, 1))"
+
+# Correlated match for a row's GPS-bearing sibling: ``f`` is the sibling
+# candidate, ``dq`` the row being tested. See naming.gps_sibling_sql for the
+# pairing rule (timestamp-prefix range, format-aware GPS-lens test; binds no
+# parameters — the registry letter is interpolated).
+GPS_SIBLING_SQL = gps_sibling_sql()
+
+# GPS-sibling join + columns for the listing queries: exposes the sibling's
+# triage columns as ``sib_*`` so :func:`_gps_state` can imply a non-GPS lens's
+# badge. Binds no parameters. Assumes one GPS-lens file per capture
+# timestamp — the same uniqueness every pairing consumer relies on (get_day,
+# the triage gate, remote_day_clips).
+_SIB_COLS_SQL = (
+    "f.id AS sib_id, f.triaged_at AS sib_triaged_at, "
+    "f.gps_points AS sib_gps_points, f.triage_attempts AS sib_triage_attempts"
+)
+_SIB_JOIN_SQL = f"LEFT JOIN download_queue f ON {GPS_SIBLING_SQL}"
+
+# The capture key of the newest non-gone queue row — the only capture that
+# can still be actively recording. Its lenses are held until remote_complete=1.
+_CAPTURE_KEY_SQL = capture_key_sql("dq.filename")
+_NEWEST_CAPTURE_SQL = (
+    "SELECT MAX(" + capture_key_sql("filename") + ") "
+    "FROM download_queue WHERE state <> 'gone'"
+)
 
 
 def next_pending(
-    db: Database, *, ro_only: bool = False,
+    db: Database, *, ro_only: bool = False, triage_gate: bool = False,
+    active_guard: bool = False,
 ) -> Optional[QueueItem]:
-    """Highest priority, oldest enqueue time. If ``ro_only`` is
-    set, only consider rows whose source_dir is under /RO/."""
-    sql = (
-        "SELECT * FROM download_queue "
-        "WHERE state='pending'"
-    )
+    """Highest priority, oldest enqueue time. If ``ro_only`` is set, only
+    consider rows whose source_dir is under /RO/.
+
+    If ``triage_gate`` is set (GPS_TRIAGE on), a row is held back while its
+    GPS-bearing sibling is still awaiting triage (``triaged_at IS NULL AND
+    triage_attempts < TRIAGE_MAX_ATTEMPTS``) — so we never download a clip, or
+    its paired lenses, ahead of triage. The sibling is the GPS-bearing lens
+    (letter from the registry) sharing the filename's timestamp prefix — NOT
+    the full stem: same-capture lenses share the recording second but can carry
+    different sequence numbers (see ``GPS_SIBLING_SQL``). The GPS lens is its
+    own sibling, and an orphan non-GPS clip (no GPS sibling) is not gated.
+    If ``active_guard`` is set, every lens of the newest capture group is held
+    until its ``remote_complete`` flag is set, since that capture may still be
+    recording."""
+    sql = "SELECT dq.* FROM download_queue dq WHERE dq.state='pending'"
+    params: List[object] = []
     if ro_only:
-        sql += " AND (source_dir LIKE '%/RO/%' OR source_dir LIKE '%/RO')"
-    sql += " ORDER BY priority DESC, enqueued_at ASC LIMIT 1"
+        sql += (
+            " AND (dq.source_dir LIKE '%/RO/%' "
+            "OR dq.source_dir LIKE '%/RO')"
+        )
+    if triage_gate:
+        sql += (
+            " AND NOT EXISTS ("
+            f"  SELECT 1 FROM download_queue f"
+            f"  WHERE {GPS_SIBLING_SQL}"
+            f"    AND f.state='pending'"
+            f"    AND f.triaged_at IS NULL"
+            f"    AND f.triage_attempts < ?"
+            " )"
+        )
+        params.append(TRIAGE_MAX_ATTEMPTS)
+    if active_guard:
+        sql += (
+            f" AND NOT ({_CAPTURE_KEY_SQL} = ({_NEWEST_CAPTURE_SQL})"
+            f"          AND dq.remote_complete IS NULL)"
+        )
+    sql += " ORDER BY dq.priority DESC, dq.enqueued_at ASC LIMIT 1"
     with db.conn() as c:
-        row = c.execute(sql).fetchone()
+        row = c.execute(sql, params).fetchone()
     if row is None:
         return None
     return QueueItem(
@@ -423,35 +549,36 @@ def list_page(
                    CASE
                        WHEN dq.state = 'downloading' THEN 0
                        ELSE p.queue_position
-                   END AS queue_position
+                   END AS queue_position,
+                   {_SIB_COLS_SQL}
             FROM download_queue dq
             LEFT JOIN positions p ON dq.id = p.id
+            {_SIB_JOIN_SQL}
             {where.replace("filename", "dq.filename") if where else ""}
             ORDER BY {order}
             LIMIT ? OFFSET ?
             """,
             params + [per_page, (page - 1) * per_page],
         ).fetchall()
+    items = [dict(r) for r in rows]
+    for d in items:
+        d["gps_state"] = _gps_state(d)
     return {
         "total": total,
         "page": page,
         "per_page": per_page,
         "sort_by": sort_by or "priority",
         "sort_dir": sort_dir,
-        "items": [dict(r) for r in rows],
+        "items": items,
     }
 
 
 def _day_expr() -> str:
-    """SQL expression for the YYYY-MM-DD day key derived from
-    the filename (``YYYY_MMDD_HHMMSS_NN<cam>.MP4``). Uses the
-    filename rather than ``recorded_at`` so grouping is
-    consistent even for rows missing a timestamp."""
-    return (
-        "substr(filename,1,4) || '-' || "
-        "substr(filename,6,2) || '-' || "
-        "substr(filename,8,2)"
-    )
+    """SQL expression for the YYYY-MM-DD day key derived from the filename
+    (format-aware — see naming.day_key_sql). Uses the filename rather than
+    ``recorded_at`` so grouping is consistent even for rows missing a
+    timestamp."""
+    return day_key_sql()
 
 
 _RO_SQL = "source_dir LIKE '%/RO/%'"
@@ -568,7 +695,7 @@ def list_day_items(
     download order (priority + enqueued_at) so the client can
     show "next up" cues independent of display order.
     """
-    day_expr = _day_expr()
+    day_expr = _day_expr().replace("filename", "dq.filename")
     clauses = [f"{day_expr} = ?"]
     params: List[object] = [day]
     if query:
@@ -607,15 +734,20 @@ def list_day_items(
                        WHEN 'E' THEN 'event'
                        ELSE 'normal'
                    END AS kind_event,
-                   CASE WHEN {ro_dq} THEN 1 ELSE 0 END AS kind_ro
+                   CASE WHEN {ro_dq} THEN 1 ELSE 0 END AS kind_ro,
+                   {_SIB_COLS_SQL}
             FROM download_queue dq
             LEFT JOIN positions p ON dq.id = p.id
+            {_SIB_JOIN_SQL}
             {where}
             ORDER BY dq.filename DESC
             """,
             params,
         ).fetchall()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    for d in items:
+        d["gps_state"] = _gps_state(d)
+    return items
 
 
 def pending_bytes(db: Database) -> int:
@@ -671,6 +803,9 @@ def prioritize(
             f"WHERE filename IN ({ph}) AND state='pending'",
             [target] + filenames,
         )
+        if cur.rowcount:
+            log.info("archive prioritize (%s): %d clip(s) — %s",
+                     position, cur.rowcount, _names(filenames))
         return cur.rowcount
 
 
@@ -685,6 +820,9 @@ def retry(db: Database, filenames: List[str]) -> int:
             f"WHERE filename IN ({ph}) AND state='failed'",
             filenames,
         )
+        if cur.rowcount:
+            log.info("archive retry: %d failed clip(s) requeued — %s",
+                     cur.rowcount, _names(filenames))
         return cur.rowcount
 
 
@@ -698,12 +836,61 @@ def skip(db: Database, filenames: List[str]) -> int:
     with db.write() as c:
         ph = ",".join("?" * len(filenames))
         cur = c.execute(
-            f"UPDATE download_queue SET state='skipped' "
+            f"UPDATE download_queue SET state='skipped', skip_reason='user' "
             f"WHERE filename IN ({ph}) "
             f"AND state IN ('pending', 'failed')",
             filenames,
         )
+        if cur.rowcount:
+            log.info("archive skip: %d clip(s) skipped — %s",
+                     cur.rowcount, _names(filenames))
         return cur.rowcount
+
+
+def delete_clips(db: Database, filenames: List[str], recordings: str) -> dict:
+    """User-initiated delete: remove downloaded files + clip_index rows and mark
+    the queue rows skipped. Clips the user has pinned read-only (clip_index or
+    download_queue locked=1) or dashcam-locked (event_type='ro') are skipped and
+    reported as 'protected'. Returns {deleted, skipped, protected}."""
+    if not filenames:
+        return {"deleted": 0, "skipped": 0, "protected": 0}
+    from . import retention as _retention
+    ph = ",".join("?" * len(filenames))
+    with db.conn() as c:
+        protected = {
+            r["name"] for r in c.execute(
+                f"SELECT basename AS name FROM clip_index "
+                f"WHERE basename IN ({ph}) "
+                f"AND (COALESCE(locked,0)=1 OR COALESCE(event_type,'')='ro') "
+                f"UNION "
+                f"SELECT filename AS name FROM download_queue "
+                f"WHERE filename IN ({ph}) AND COALESCE(locked,0)=1",
+                [*filenames, *filenames],
+            ).fetchall()
+        }
+    targets = [f for f in filenames if f not in protected]
+    deleted = 0
+    skipped = 0
+    if targets:
+        tph = ",".join("?" * len(targets))
+        with db.conn() as c:
+            rows = c.execute(
+                f"SELECT id, path, basename, event_type FROM clip_index "
+                f"WHERE basename IN ({tph})", targets,
+            ).fetchall()
+        for r in rows:
+            _retention.delete_clip(db, dict(r), recordings)
+            deleted += 1
+        with db.write() as c:
+            cur = c.execute(
+                f"UPDATE download_queue SET state='skipped', skip_reason='user' "
+                f"WHERE filename IN ({tph})", targets,
+            )
+            skipped = cur.rowcount  # rows actually marked, not len(targets)
+    if deleted or skipped or protected:
+        log.info("archive delete: removed %d clip(s), %d protected — %s",
+                 deleted, len(protected), _names(filenames))
+    return {"deleted": deleted, "skipped": skipped, "protected": len(protected)}
 
 
 def unskip(db: Database, filenames: List[str]) -> int:
@@ -716,11 +903,199 @@ def unskip(db: Database, filenames: List[str]) -> int:
         ph = ",".join("?" * len(filenames))
         cur = c.execute(
             f"UPDATE download_queue SET state='pending', "
-            f"attempts=0, last_error=NULL "
+            f"attempts=0, last_error=NULL, skip_reason=NULL, "
+            f"geofence_released_at=CASE WHEN skip_reason='geofence' "
+            f"  THEN ? ELSE geofence_released_at END "
             f"WHERE filename IN ({ph}) AND state='skipped'",
+            [int(time.time())] + filenames,
+        )
+        if cur.rowcount:
+            log.info("archive unskip: %d clip(s) returned to pending — %s",
+                     cur.rowcount, _names(filenames))
+        return cur.rowcount
+
+
+def geofence_skip(db: Database, filenames: List[str]) -> int:
+    """Auto-skip the given clips as parked-at-home: ``pending`` →
+    ``skipped``/``geofence``. Never touches non-pending rows or clips the user
+    has permanently released (``geofence_released_at`` set). Returns the count."""
+    if not filenames:
+        return 0
+    with db.write() as c:
+        ph = ",".join("?" * len(filenames))
+        cur = c.execute(
+            f"UPDATE download_queue SET state='skipped', skip_reason='geofence' "
+            f"WHERE filename IN ({ph}) AND state='pending' "
+            f"AND geofence_released_at IS NULL",
             filenames,
         )
         return cur.rowcount
+
+
+def unskip_geofence(db: Database) -> int:
+    """Reset every geofence auto-skipped clip back to ``pending`` so a fresh
+    sweep can re-evaluate it. Unlike :func:`unskip`, this deliberately does NOT
+    set ``geofence_released_at`` — we want the geofence to re-skip the genuine
+    home clips. Leaves user skips, user-released clips, and downloaded/other
+    rows untouched. Returns the count reset. Used by the maintenance flush."""
+    with db.write() as c:
+        cur = c.execute(
+            "UPDATE download_queue SET state='pending', "
+            "attempts=0, last_error=NULL, skip_reason=NULL "
+            "WHERE state='skipped' AND skip_reason='geofence' "
+            "AND geofence_released_at IS NULL"
+        )
+        return cur.rowcount
+
+
+def geofence_candidates(db: Database, day: str) -> List[dict]:
+    """Pending, time-stamped clips on ``day`` eligible for geofence auto-skip.
+
+    Excludes RO/locked clips and event recordings (the sparse, important
+    'something happened while parked' footage) and clips a user has
+    permanently released. Returns ``[{filename, recorded_at}, ...]``."""
+    day_expr = _day_expr()
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT filename, recorded_at FROM download_queue "
+            f"WHERE {day_expr} = ? AND state='pending' "
+            f"AND recorded_at IS NOT NULL "
+            f"AND geofence_released_at IS NULL "
+            # RO clips can be stored with or without a trailing slash
+            # (see next_pending); exclude both forms.
+            f"AND source_dir NOT LIKE '%/RO/%' AND source_dir NOT LIKE '%/RO' "
+            f"AND {_EVT_PREFIX_SQL} <> 'E'",
+            (day,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def geofence_day_signatures(db: Database, states: tuple) -> dict:
+    """Per-day count of clips that carry a GPS triage skeleton, across the
+    given queue ``states``. Monotonic as triage progresses (a skipped clip
+    stays counted), so an unchanged count means a day has no new detection
+    input — letting the geofence sweep skip re-parsing it.
+
+    Returns ``{ 'YYYY-MM-DD': count, ... }``."""
+    day_expr = _day_expr()
+    ph = ",".join("?" * len(states))
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT {day_expr} AS day, COUNT(*) AS n FROM download_queue "
+            f"WHERE state IN ({ph}) "
+            f"  AND triaged_at IS NOT NULL AND gps_points > 0 "
+            f"GROUP BY day",
+            tuple(states),
+        ).fetchall()
+    return {r["day"]: r["n"] for r in rows}
+
+
+def set_locked(db: Database, filenames: List[str], locked: bool = True) -> int:
+    """Set the user 'retain indefinitely' flag on the given clips, in BOTH
+    clip_index (by basename) and download_queue (by filename), so the state is
+    stable whether the clip is downloaded or still queued. Returns the count of
+    distinct filenames affected."""
+    if not filenames:
+        return 0
+    val = 1 if locked else 0
+    ph = ",".join("?" * len(filenames))
+    with db.write() as c:
+        c.execute(
+            f"UPDATE clip_index SET locked=? WHERE basename IN ({ph})",
+            [val, *filenames],
+        )
+        c.execute(
+            f"UPDATE download_queue SET locked=? WHERE filename IN ({ph})",
+            [val, *filenames],
+        )
+    verb = "read-only" if locked else "writable"
+    log.info("archive mark %s: %d clip(s) — %s", verb, len(filenames),
+             _names(filenames))
+    return len(filenames)
+
+
+def delete_from_camera(
+    db: Database, filenames: List[str], base_url: str, *, timeout: float = 10.0,
+) -> dict:
+    """Delete the given clips from the dashcam SD card (cmd=4003). Skips clips
+    the user has locked (retain indefinitely) and dashcam RO clips (source_dir
+    under /RO/ — firmware write-protected). On a successful delete the queue row
+    becomes 'gone' (no longer on the camera). Network failures are counted, not
+    raised. Returns {deleted, skipped, errors}."""
+    if not filenames:
+        return {"deleted": 0, "skipped": 0, "errors": 0}
+    ph = ",".join("?" * len(filenames))
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT filename, source_dir, locked FROM download_queue "
+            f"WHERE filename IN ({ph})", filenames,
+        ).fetchall()
+    deleted = skipped = errors = 0
+    gone: List[str] = []
+    for r in rows:
+        sd = r["source_dir"] or ""
+        if r["locked"] or "/RO/" in sd or sd.endswith("/RO"):
+            skipped += 1
+            continue
+        if vfs.delete_dashcam_file(base_url, sd, r["filename"], timeout=timeout):
+            gone.append(r["filename"])
+            deleted += 1
+        else:
+            errors += 1
+    if gone:
+        gph = ",".join("?" * len(gone))
+        with db.write() as c:
+            c.execute(
+                f"UPDATE download_queue SET state='gone' WHERE filename IN ({gph})",
+                gone,
+            )
+    log.info("delete from camera: %d deleted, %d skipped, %d error(s) — %s",
+             deleted, skipped, errors, _names(filenames))
+    return {"deleted": deleted, "skipped": skipped, "errors": errors}
+
+
+def skip_listed_names(db: Database, names: Sequence[str]) -> set[str]:
+    """Subset of ``names`` whose download_queue row is currently ``state='skipped'``
+    (any ``skip_reason`` — geofence auto-skip or a user skip). Empty input → empty
+    set with no query. ``filename`` is UNIQUE-indexed, so the lookup is cheap.
+
+    Single source of truth for the manual-import skip gate: a clip the triage
+    geofence (or the user) marked skipped is not re-imported via browser upload."""
+    names = list(names)
+    if not names:
+        return set()
+    ph = ",".join("?" * len(names))
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT filename FROM download_queue "
+            f"WHERE state='skipped' AND filename IN ({ph})",
+            names,
+        ).fetchall()
+    return {r["filename"] for r in rows}
+
+
+def pending_days(db: Database) -> List[str]:
+    """Distinct YYYY-MM-DD day keys that currently have ``pending`` clips."""
+    day_expr = _day_expr()
+    with db.conn() as c:
+        rows = c.execute(
+            f"SELECT DISTINCT {day_expr} AS day FROM download_queue "
+            f"WHERE state='pending'"
+        ).fetchall()
+    return [r["day"] for r in rows]
+
+
+def download_next(db: Database, filenames: List[str]) -> int:
+    """Re-queue the given clips for immediate download: un-skip and retry any
+    that were skipped/failed (both → ``pending``), then bump all of them to the
+    top of the queue. Returns the number prioritized. ``done`` clips are
+    untouched (``prioritize`` only affects ``pending``). Order matters: the
+    state moves must run before ``prioritize`` so the rows are ``pending``."""
+    if not filenames:
+        return 0
+    unskip(db, filenames)
+    retry(db, filenames)
+    return prioritize(db, filenames, "top")
 
 
 def retry_failed(db: Database) -> int:

@@ -1,7 +1,7 @@
 """Tests for the pure compute_sync_status() function.
 
 Inputs come from hub.last_state and the settings snapshot. Output is
-(state, reason) — never raises. Precedence: error > paused > downloading > waiting.
+(state, reason) — never raises. Precedence: error > paused > triaging > downloading > waiting.
 """
 from __future__ import annotations
 
@@ -177,3 +177,35 @@ def test_never_raises_on_garbage_state():
                current_item=42, dashcam_online="yes")
     state, _ = compute_sync_status(hub, None, _snap())
     assert state in ("downloading", "waiting", "paused", "error")
+
+
+# ---- triaging tier (between paused and downloading) ----
+
+def test_triaging_when_active():
+    hub = _hub(sync_state={"running": True, "paused": False},
+               dashcam_online=True,
+               triage={"active": True, "triaged": 40, "total": 876})
+    state, reason = compute_sync_status(hub, None, _snap())
+    assert state == "triaging"
+    assert reason is None
+
+
+def test_paused_outranks_triaging():
+    hub = _hub(sync_state={"running": True, "paused": True},
+               triage={"active": True, "triaged": 1, "total": 9})
+    state, _ = compute_sync_status(hub, None, _snap())
+    assert state == "paused"
+
+
+def test_error_outranks_triaging():
+    hub = _hub(sync_state={"running": True, "paused": False},
+               triage={"active": True, "triaged": 1, "total": 9})
+    state, _ = compute_sync_status(hub, None, _snap(address=None))
+    assert state == "error"
+
+
+def test_inactive_triage_falls_through_to_waiting():
+    hub = _hub(sync_state={"running": True, "paused": False},
+               dashcam_online=True, triage={"active": False})
+    state, _ = compute_sync_status(hub, None, _snap())
+    assert state == "waiting"

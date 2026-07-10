@@ -32,19 +32,30 @@ group_name_globs = {
     "yearly": "[0-9][0-9][0-9][0-9]",
 }
 
-# Downloaded recording filename glob pattern. The trailing
-# letter is the camera (see cameras.py for the registry).
-downloaded_filename_glob = (
+# Downloaded recording filename glob patterns. Two on-disk layouts exist:
+# - standard: YYYY_MMDD_HHMMSS_NNNN[PE]?<letter>.MP4 — the trailing letter
+#   is the camera (see cameras.py for the registry).
+# - compact:  YYYYMMDDHHMMSS_NNNNNN.MP4 — some single-channel units list
+#   recordings with no datetime separators and no camera suffix; the sole
+#   lens is the GPS-bearing one.
+downloaded_filename_globs = (
     "[0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9]"
     "_[0-9][0-9][0-9][0-9][0-9][0-9]"
-    f"_*[{CAMERA_LETTERS}].MP4"
+    f"_*[{CAMERA_LETTERS}].MP4",
+    "[0-9]" * 14 + "_*.MP4",
 )
 
-# Downloaded recording filename regular expression.
+# Kept for callers of the historical single-glob name (standard layout only).
+downloaded_filename_glob = downloaded_filename_globs[0]
+
+# Downloaded recording filename regular expression, matching both layouts:
+# the datetime separators are optional and the camera suffix may be absent
+# (compact names put a sequence digit where the letter would be, so an empty
+# ``camera`` group identifies them — callers default it to the GPS lens).
 downloaded_filename_re = re.compile(
-    r"^(?P<year>\d{4})_(?P<month>\d{2})(?P<day>\d{2})"
-    r"_(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})"
-    r"_(?P<sequence>\d+)(?P<camera>.+)\.MP4$",
+    r"^(?P<year>\d{4})_?(?P<month>\d{2})(?P<day>\d{2})"
+    r"_?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})"
+    r"_(?P<sequence>\d+)(?P<camera>[A-Za-z]*)\.MP4$",
     re.IGNORECASE,
 )
 
@@ -75,10 +86,11 @@ def get_group_name(recording_datetime, grouping):
 def get_downloaded_recordings(destination, grouping):
     """Reads destination dir and returns set of (filename, date)."""
     group_name_glob = group_name_globs[grouping]
-    filepath_glob = get_filepath(
-        destination, group_name_glob, downloaded_filename_glob
-    )
-    downloaded_filepaths = glob.glob(filepath_glob)
+    downloaded_filepaths = []
+    for name_glob in downloaded_filename_globs:
+        downloaded_filepaths.extend(glob.glob(
+            get_filepath(destination, group_name_glob, name_glob)
+        ))
 
     recordings = set()
     for filepath in downloaded_filepaths:
