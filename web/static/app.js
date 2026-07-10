@@ -39,7 +39,8 @@ const state = {
   queueExpanded: new Set(),
   queueHoursExpanded: new Set(), // keys: "YYYY-MM-DD HH" (HH may be "??")
   queueSelected: new Set(),// filenames ticked
-  filters: { driving: true, parking: true, ro: true, location: "" },
+  filters: { driving: true, parking: true, ro: true, location: "",
+             geofenced: localStorage.getItem("vfs.showGeofenced") === "1" },
   showMaps: localStorage.getItem("vfs.showMaps") !== "0",
   archiveSelected: new Map(),  // pair_id → { ts, front, rear, tele, interior }
   archiveExpanded: new Set(),  // open archive day keys ("YYYY-MM-DD"); persists
@@ -482,6 +483,20 @@ wireArchiveFilter("f-driving", "driving");
 wireArchiveFilter("f-parking", "parking");
 wireArchiveFilter("f-ro", "ro");
 
+// "GPS-excluded": reveal clips auto-skipped by the home geofence and
+// weave their recovered skeleton tracks into the day's journeys.
+// Persisted — it's a mode, like the maps toggle, not a per-visit filter.
+(() => {
+  const cb = document.getElementById("f-geofenced");
+  cb.checked = state.filters.geofenced;
+  cb.addEventListener("change", (e) => {
+    state.filters.geofenced = e.target.checked;
+    localStorage.setItem("vfs.showGeofenced", e.target.checked ? "1" : "0");
+    state.page = 1;
+    loadDays();
+  });
+})();
+
 // Location filter: client-side, narrows the open day timeline to journeys
 // (start or end) and stops at the selected named location. Populated from
 // state.locations (mirrored from /api/settings); hidden when none are defined.
@@ -560,6 +575,7 @@ function archiveKindParams(q) {
   q.set("driving", state.filters.driving ? "true" : "false");
   q.set("parking", state.filters.parking ? "true" : "false");
   q.set("ro", state.filters.ro ? "true" : "false");
+  if (state.filters.geofenced) q.set("show_geofenced", "true");
 }
 
 // Tear down Leaflet instances under `root` before its innerHTML is
@@ -719,7 +735,8 @@ async function renderDayBody(body, date) {
     const promises = [api(`/api/archive/day/${date}?` + q)];
     if (state.showMaps) {
       promises.push(
-        api(`/api/archive/day/${date}/route`)
+        api(`/api/archive/day/${date}/route`
+            + (state.filters.geofenced ? "?show_geofenced=true" : ""))
           .catch((e) => { console.warn("route failed", e); return null; }),
       );
     } else {
@@ -825,7 +842,10 @@ async function renderDayBody(body, date) {
 
   for (const ev of shown) {
     if (ev.kind === "journey") {
-      body.appendChild(renderJourneyCard(ev.data, ev.clips, ev.idx, date));
+      body.appendChild(renderJourneyCard(
+        ev.data, ev.clips, ev.idx, date,
+        (route && route.geofenced_tracks) || [],
+      ));
     } else {
       body.appendChild(renderStopCard(ev.data, ev.clips, ev.idx, date));
     }
@@ -1063,7 +1083,7 @@ function renderCompletionPie(j) {
   return `<span class="journey-pie${done ? " is-complete" : ""}" role="img" style="--pp:${p}" title="${escHtml(tip)}" aria-label="${escHtml(tip)}"></span>`;
 }
 
-function renderJourneyCard(j, clips, idx, date) {
+function renderJourneyCard(j, clips, idx, date, extraTracks) {
   const el = document.createElement("div");
   el.className = "journey-card collapsible drive";
   const mapId = `journey-map-${j.start_ts}-${idx}`;
@@ -1150,6 +1170,25 @@ function renderJourneyCard(j, clips, idx, date) {
     const err = cssVar("--err");
     const errText = cssVar("--err-text");
     const line = L.polyline(coords, { color: accent, weight: 5 }).addTo(map);
+    // Recovered (geofence-skipped) stretches: dashed and muted so they read
+    // apart from downloaded track. extraTracks is the WHOLE day's list, so
+    // each is clipped to THIS journey's padded window (same window that
+    // buckets clips to the card) via its per-point times — otherwise every
+    // journey map would draw every day's recovered stretch.
+    const gStart = j.group_start_ts ?? j.start_ts;
+    const gEnd = j.group_end_ts ?? j.end_ts;
+    for (const t of extraTracks || []) {
+      const tt = t.times || [];
+      const g = t.geojson.geometry.coordinates
+        .map(([lon, lat], i) => [lat, lon, tt[i]])
+        .filter(([, , ts]) => ts == null || (ts >= gStart && ts <= gEnd))
+        .map(([lat, lon]) => [lat, lon]);
+      if (g.length < 2) continue;
+      L.polyline(g, {
+        color: cssVar("--muted"), weight: 3,
+        dashArray: "6 6", opacity: 0.85,
+      }).addTo(map);
+    }
     L.circleMarker([j.start_lat, j.start_lon], {
       radius: 6, color: ok, fillColor: ok, fillOpacity: 1,
     }).addTo(map).bindTooltip("Start");
@@ -1362,9 +1401,14 @@ function renderClipPair(pair) {
       const key = geo ? "geofence" : st;
       const icon = TRIAGE_STATE_ICON[key] || TRIAGE_STATE_ICON.pending;
       const title = TRIAGE_STATE_TITLE[key] || TRIAGE_STATE_TITLE.pending;
+      const unskipBtn = geo
+        ? `<button class="unskip-btn" data-filename="${escHtml(c.filename)}"
+              title="Un-skip: queue this clip for download">Un-skip</button>`
+        : "";
       return `<div class="thumb remote state-${st}${geo ? " geofence" : ""}" data-camera="${cam}">
         <div class="remote-badge" title="${title}">${icon}</div>
         <div class="label" title="${escHtml(c.basename)}">${escHtml(c.basename)}</div>
+        ${unskipBtn}
       </div>`;
     }
     return c ? `<div class="thumb" data-camera="${cam}"
@@ -1402,6 +1446,16 @@ function renderClipPair(pair) {
         : pair[c.channel] ? thumb(pair[c.channel], c.letter) : ""
     ).join("")}</div>
   `;
+  el.querySelectorAll(".unskip-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      btn.disabled = true;
+      // On success the day re-renders (this button is gone); on failure
+      // runQueueAction swallows the error, so re-enable to allow a retry.
+      try { await runQueueAction("retry", [btn.dataset.filename]); }
+      finally { btn.disabled = false; }
+    });
+  });
   el.querySelectorAll(".thumb img").forEach((img) => {
     img.addEventListener("click", (e) => {
       const thumbEl = e.currentTarget.closest(".thumb");
