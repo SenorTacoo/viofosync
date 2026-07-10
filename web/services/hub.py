@@ -86,7 +86,13 @@ class Hub:
             "triage": {"active": False},
         }
 
-    async def connect(self, ws: WebSocket) -> None:
+    async def connect(self, ws: WebSocket) -> bool:
+        """Accept the socket and send the state snapshot. Returns
+        False when the client vanished during the handshake — the
+        socket is already marked disconnected by starlette at that
+        point, so the caller must not enter its receive loop
+        (receive_text on it raises RuntimeError, not
+        WebSocketDisconnect)."""
         await ws.accept()
         async with self._lock:
             self._clients.add(ws)
@@ -96,15 +102,14 @@ class Hub:
             )
         except (WebSocketDisconnect, RuntimeError, OSError):
             # Client closed during the handshake (e.g. tab hot-
-            # reloaded between accept and the first send). The
-            # route's finally-clause will remove us from
-            # _clients via disconnect(); no need to raise out of
-            # the route handler as a 500.
+            # reloaded between accept and the first send).
             log.debug(
                 "client disconnected before initial snapshot",
             )
             async with self._lock:
                 self._clients.discard(ws)
+            return False
+        return True
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
