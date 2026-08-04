@@ -1,0 +1,55 @@
+# Portainer stack for THIS fork's image (the one .github/workflows/
+# docker-publish.yml pushes to Docker Hub). docker-compose.yml stays on
+# upstream's robxyz/viofosync so it keeps merging cleanly; that image
+# does not contain the local patches.
+#
+# Portainer → Stacks → Add stack → Web editor: paste this file, then set
+# these under "Environment variables" (Advanced mode takes KEY=value lines):
+#
+#   VIOFOSYNC_IMAGE=<your-dockerhub-user>/viofosync:latest
+#   VIOFOSYNC_CONFIG=/srv/viofosync/config
+#   VIOFOSYNC_RECORDINGS=/mnt/nas/dashcam
+#   PUID=1000
+#   PGID=1000
+#
+# Editing them later is just "Update the stack" — no repo commit, which
+# is the whole reason this is a Web-editor stack and not a Repository one.
+#
+# To take a new build: enable "Re-pull image" on Update, or
+#   docker compose pull && docker compose up -d
+# on the host. The :latest tag moves with every push to main.
+
+services:
+  viofosync:
+    image: ${VIOFOSYNC_IMAGE:?set VIOFOSYNC_IMAGE, e.g. youruser/viofosync:latest}
+    container_name: viofosync
+    restart: unless-stopped
+
+    ports:
+      - "${VIOFOSYNC_PORT:-8080}:8080"
+
+    volumes:
+      # Config + state DB (config.json, viofosync.db). Small and write-heavy,
+      # so keep it on local disk rather than the NAS share.
+      - ${VIOFOSYNC_CONFIG:?set VIOFOSYNC_CONFIG to the host path mounted at /config}:/config
+      # The recordings archive.
+      - ${VIOFOSYNC_RECORDINGS:?set VIOFOSYNC_RECORDINGS to the host path mounted at /recordings}:/recordings:rw
+
+    environment:
+      # Must own the two host paths above — run `id <user>` to find them.
+      PUID: ${PUID:?set PUID to the uid owning the config/recordings paths}
+      PGID: ${PGID:?set PGID to the gid owning the config/recordings paths}
+      TZ: ${TZ:-Europe/Warsaw}
+
+    # Optional: Intel iGPU passthrough for hardware-accelerated exports.
+    # The entrypoint auto-detects the render node's group. Verify with
+    #   docker exec viofosync vainfo
+    # and look for "export encoder available: … qsv …" in the startup log.
+    # devices:
+    #   - /dev/dri:/dev/dri
+    #
+    # Some hosts (Synology DSM) need the render group granted explicitly.
+    # Find the GID with:
+    #   docker exec viofosync sh -c 'stat -c %g /dev/dri/renderD128'
+    # group_add:
+    #   - "937"

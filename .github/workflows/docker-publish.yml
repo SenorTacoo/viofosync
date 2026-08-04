@@ -1,0 +1,50 @@
+# This fork builds its own image because it carries local patches
+# (DELETE_RO_AFTER_DOWNLOAD) that the upstream robxyz/viofosync image
+# does not have. Pushes to Docker Hub so Portainer can deploy a plain
+# Web-editor stack — env vars stay editable in the Portainer UI, which
+# a repository stack does not allow.
+#
+# Requires two repo secrets (Settings → Secrets and variables → Actions):
+#   DOCKERHUB_USERNAME — your Docker Hub account name
+#   DOCKERHUB_TOKEN    — a Docker Hub access token with Read & Write
+name: Publish image
+
+on:
+  push:
+    branches: [main]
+    # Don't rebuild for changes that can't affect the image. The
+    # .dockerignore already keeps tests/docs out of the build context.
+    paths-ignore:
+      - "**.md"
+      - "tests/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # amd64 only: the arm64 leg would run under QEMU emulation and
+          # the jellyfin-ffmpeg7 install makes that painfully slow. Add
+          # linux/arm64 here if you ever deploy to an ARM host.
+          platforms: linux/amd64
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/viofosync:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/viofosync:${{ github.sha }}
+          # Layer cache in the registry, so a rebuild that only touched
+          # web/ skips the ffmpeg apt layer entirely.
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/viofosync:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/viofosync:buildcache,mode=max
