@@ -42,6 +42,7 @@ def _editable_values(snap) -> dict[str, Any]:
         "DERIVE_THUMBS_EAGER": snap.derive_thumbs_eager,
         "DERIVE_FILMSTRIPS_EAGER": snap.derive_filmstrips_eager,
         "DELETE_AFTER_DOWNLOAD": snap.delete_after_download,
+        "DELETE_RO_AFTER_DOWNLOAD": snap.delete_ro_after_download,
         "SYNC_RO_ONLY": snap.sync_ro_only,
         "LOCATIONS": [
             {"name": p.name, "lat": p.lat, "lon": p.lon,

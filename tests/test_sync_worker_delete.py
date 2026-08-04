@@ -2,7 +2,7 @@
 
 The actual SyncWorker is too tightly bound to the live event loop
 to drive in unit tests, so we test the *helper* that holds the
-three-guard logic. Task 4 extracts ``_should_delete_after_download``
+guard logic. Task 4 extracts ``_should_delete_after_download``
 plus a thin caller; the tests pin the logic in isolation.
 """
 from __future__ import annotations
@@ -18,10 +18,13 @@ from web.services.sync_worker import (
 class _Item:
     """Minimal QueueItem stand-in — only the fields the helper reads."""
 
-    def __init__(self, filename: str, source_dir: str, remote_size) -> None:
+    def __init__(
+        self, filename: str, source_dir: str, remote_size, locked: int = 0,
+    ) -> None:
         self.filename = filename
         self.source_dir = source_dir
         self.remote_size = remote_size
+        self.locked = locked
 
 
 # ---- _should_delete_after_download ----
@@ -38,7 +41,7 @@ def test_should_delete_off_setting_returns_false() -> None:
     assert reason == "setting_off"
 
 
-def test_should_delete_ro_clip_returns_false() -> None:
+def test_should_delete_ro_clip_returns_false_by_default() -> None:
     item = _Item("X.MP4", "/DCIM/Movie/RO", 1000)
     ok, reason = _should_delete_after_download(
         item, dest_path="/tmp/X.MP4",
@@ -47,7 +50,51 @@ def test_should_delete_ro_clip_returns_false() -> None:
         local_exists=True,
     )
     assert ok is False
+    assert reason == "ro_protected"
+
+
+def test_should_delete_ro_clip_allowed_when_opted_in() -> None:
+    """DELETE_RO_AFTER_DOWNLOAD lets the 'sync RO only, then free the
+    card' workflow delete the very clips it downloaded."""
+    item = _Item("X.MP4", "/DCIM/Movie/RO", 1000)
+    ok, reason = _should_delete_after_download(
+        item, dest_path="/tmp/X.MP4",
+        delete_enabled=True,
+        local_size=1000,
+        local_exists=True,
+        delete_ro=True,
+    )
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_should_delete_user_lock_vetoes_even_with_ro_opt_in() -> None:
+    """The user's 'retain indefinitely' pin is an explicit per-clip
+    decision, so no setting overrides it."""
+    item = _Item("X.MP4", "/DCIM/Movie", 1000, locked=1)
+    ok, reason = _should_delete_after_download(
+        item, dest_path="/tmp/X.MP4",
+        delete_enabled=True,
+        local_size=1000,
+        local_exists=True,
+        delete_ro=True,
+    )
+    assert ok is False
     assert reason == "locked"
+
+
+def test_should_delete_ro_opt_in_still_verifies_local_copy() -> None:
+    """Opting into RO deletes doesn't relax the size/existence guards."""
+    item = _Item("X.MP4", "/DCIM/Movie/RO", 1000)
+    ok, reason = _should_delete_after_download(
+        item, dest_path="/tmp/X.MP4",
+        delete_enabled=True,
+        local_size=999,
+        local_exists=True,
+        delete_ro=True,
+    )
+    assert ok is False
+    assert reason == "size_mismatch"
 
 
 def test_should_delete_missing_local_file_returns_false() -> None:
@@ -171,6 +218,61 @@ def test_maybe_delete_skips_ro_clip(tmp_path) -> None:
             base_url="http://192.168.1.230",
         )
     assert calls == []
+
+
+def test_maybe_delete_ro_clip_when_opted_in(tmp_path) -> None:
+    """The RO opt-in issues cmd=4003 against the clip's own /RO/ path."""
+    item = _Item("X.MP4", "/DCIM/Movie/RO", 100)
+    dest_path = tmp_path / "X.MP4"
+    dest_path.write_bytes(b"a" * 100)
+    calls = []
+
+    def fake_delete(base_url, source_dir, filename, **kwargs):
+        calls.append((base_url, source_dir, filename))
+        return True
+
+    with patch(
+        "web.services.sync_worker.vfs.delete_dashcam_file",
+        fake_delete,
+    ):
+        _maybe_delete_from_dashcam(
+            item=item,
+            dest_path=str(dest_path),
+            delete_enabled=True,
+            delete_ro=True,
+            base_url="http://192.168.1.230",
+        )
+    assert calls == [
+        ("http://192.168.1.230", "/DCIM/Movie/RO", "X.MP4"),
+    ]
+
+
+def test_maybe_delete_ro_failure_is_reported_not_raised(tmp_path) -> None:
+    """Firmware may refuse cmd=4003 on a write-protected RO clip. That
+    surfaces as a failed-delete event, never as an exception."""
+    item = _Item("X.MP4", "/DCIM/Movie/RO", 100)
+    dest_path = tmp_path / "X.MP4"
+    dest_path.write_bytes(b"a" * 100)
+    captured = []
+
+    class _SinkStub:
+        def dashcam_delete(self, filename, *, ok, reason,
+                           local_size=None, remote_size=None):
+            captured.append({"ok": ok, "reason": reason})
+
+    with patch(
+        "web.services.sync_worker.vfs.delete_dashcam_file",
+        lambda *a, **k: False,
+    ):
+        _maybe_delete_from_dashcam(
+            item=item,
+            dest_path=str(dest_path),
+            delete_enabled=True,
+            delete_ro=True,
+            base_url="http://192.168.1.230",
+            sink=_SinkStub(),
+        )
+    assert captured == [{"ok": False, "reason": "request_failed"}]
 
 
 def test_maybe_delete_logs_warning_on_helper_failure(tmp_path, caplog) -> None:

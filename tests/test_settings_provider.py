@@ -125,3 +125,20 @@ def test_delete_after_download_round_trips_through_snapshot(tmp_path: Path) -> N
 def test_delete_after_download_default_is_false(tmp_path: Path) -> None:
     snap = _make(tmp_path).get()
     assert snap.delete_after_download is False
+
+
+def test_delete_ro_after_download_round_trips_through_snapshot(
+    tmp_path: Path,
+) -> None:
+    provider = _make(tmp_path)
+    snap = provider.update({"DELETE_RO_AFTER_DOWNLOAD": True}, actor="test")
+    assert snap.delete_ro_after_download is True
+    again = _make(tmp_path).get()
+    assert again.delete_ro_after_download is True
+
+
+def test_delete_ro_after_download_default_is_false(tmp_path: Path) -> None:
+    """Existing installs must not start deleting write-protected event
+    clips just because they had auto-delete on."""
+    snap = _make(tmp_path).get()
+    assert snap.delete_ro_after_download is False

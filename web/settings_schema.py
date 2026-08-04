@@ -84,6 +84,12 @@ class SettingsModel(BaseModel):
     # timeline view.
     DERIVE_FILMSTRIPS_EAGER: bool = False
     DELETE_AFTER_DOWNLOAD: bool = False
+    # Clips in the camera's /RO/ folder are firmware write-protected, so
+    # auto-delete skips them by default. Opt in to attempt cmd=4003 on them
+    # too — needed by the "sync only RO clips, then free the card" workflow.
+    # Inert unless DELETE_AFTER_DOWNLOAD is also on. The user's own
+    # "retain indefinitely" lock still blocks the delete regardless.
+    DELETE_RO_AFTER_DOWNLOAD: bool = False
     TIMEOUT: int = Field(default=10, ge=1, le=60)
     DOWNLOAD_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     MAX_DOWNLOAD_ATTEMPTS: int = Field(default=5, ge=1, le=20)
@@ -210,7 +216,7 @@ EDITABLE_KEYS = {
     "ADDRESS", "ADDRESS_FALLBACK", "IMPORT_PATH", "GROUPING", "HTML", "GPS_EXTRACT",
     "GPS_TRIAGE",
     "DERIVE_THUMBS_EAGER", "DERIVE_FILMSTRIPS_EAGER",
-    "DELETE_AFTER_DOWNLOAD",
+    "DELETE_AFTER_DOWNLOAD", "DELETE_RO_AFTER_DOWNLOAD",
     "TIMEOUT", "DOWNLOAD_ATTEMPTS", "MAX_DOWNLOAD_ATTEMPTS", "SYNC_INTERVAL",
     "ENABLE_SCHEDULED_SYNC", "WEB_HOST", "WEB_PORT", "EXPORT_ENCODER",
     "NOMINATIM_EMAIL", "GEOCODE_ENABLED",

@@ -105,6 +105,13 @@ def _filter_ro_only(listing):
             yield r
 
 
+def _is_ro_source(source_dir: str | None) -> bool:
+    """True when a queue row's dashcam path lies in the camera's
+    write-protected /RO/ (locked/event) folder."""
+    src = source_dir or ""
+    return "/RO/" in src or src.endswith("/RO")
+
+
 def _should_delete_after_download(
     item,
     *,
@@ -112,17 +119,27 @@ def _should_delete_after_download(
     delete_enabled: bool,
     local_size: int,
     local_exists: bool,
+    delete_ro: bool = False,
 ) -> tuple[bool, str]:
-    """The three-guard decision. Pure function — no side effects.
-    Returns ``(ok_to_delete, reason)`` where reason is one of
-    ``setting_off`` / ``locked`` / ``local_missing`` /
+    """The post-download delete decision. Pure function — no side
+    effects. Returns ``(ok_to_delete, reason)`` where reason is one of
+    ``setting_off`` / ``locked`` / ``ro_protected`` / ``local_missing`` /
     ``size_mismatch`` / ``ok``.
+
+    ``locked`` (the user's "retain indefinitely" pin) is an absolute veto:
+    it is an explicit per-clip decision, so no setting overrides it. The
+    camera's /RO/ folder is a weaker signal — a firmware write-protect on
+    event clips — so ``delete_ro`` (DELETE_RO_AFTER_DOWNLOAD) lets the
+    "sync RO clips only, then free the card" workflow through. Whether the
+    firmware honours cmd=4003 on an RO path is the camera's call; a refusal
+    surfaces as a failed delete, not as a wrong local state.
     """
     if not delete_enabled:
         return False, "setting_off"
-    src = item.source_dir or ""
-    if "/RO/" in src or src.endswith("/RO"):
+    if getattr(item, "locked", 0):
         return False, "locked"
+    if _is_ro_source(item.source_dir) and not delete_ro:
+        return False, "ro_protected"
     if not local_exists:
         return False, "local_missing"
     if not item.remote_size or local_size != item.remote_size:
@@ -136,12 +153,12 @@ def _maybe_delete_from_dashcam(
     dest_path: str,
     delete_enabled: bool,
     base_url: str,
+    delete_ro: bool = False,
     sink: "WebSink | None" = None,
 ) -> None:
-    """Apply the three-guard check and, if all pass, ask the
-    dashcam to delete the clip. Failure-to-delete is logged at
-    WARNING and never raised — the caller has already marked the
-    queue row done.
+    """Apply the guard check and, if all pass, ask the dashcam to
+    delete the clip. Failure-to-delete is logged at WARNING and never
+    raised — the caller has already marked the queue row done.
 
     When ``sink`` is provided, broadcasts a ``dashcam_delete``
     event with the outcome. Only fires when delete is enabled
@@ -158,10 +175,20 @@ def _maybe_delete_from_dashcam(
         delete_enabled=delete_enabled,
         local_size=local_size,
         local_exists=local_exists,
+        delete_ro=delete_ro,
     )
     if not ok:
         if reason == "locked":
-            log.info("not deleting %s from dashcam: locked", item.filename)
+            log.info(
+                "not deleting %s from dashcam: marked retain indefinitely",
+                item.filename,
+            )
+        elif reason == "ro_protected":
+            log.info(
+                "not deleting %s from dashcam: read-only clip "
+                "(enable DELETE_RO_AFTER_DOWNLOAD to include these)",
+                item.filename,
+            )
         elif reason == "local_missing":
             log.warning(
                 "not deleting %s from dashcam: local file missing",
@@ -1102,6 +1129,7 @@ class SyncWorker:
                         item=item,
                         dest_path=dest_path,
                         delete_enabled=snap.delete_after_download,
+                        delete_ro=snap.delete_ro_after_download,
                         base_url=base,
                         sink=sink,
                     )

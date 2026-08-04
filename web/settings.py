@@ -64,6 +64,7 @@ class Snapshot:
     derive_thumbs_eager: bool
     derive_filmstrips_eager: bool
     delete_after_download: bool
+    delete_ro_after_download: bool
     timeout: float
     download_attempts: int
     max_attempts: int
@@ -293,6 +294,7 @@ class SettingsProvider:
             derive_thumbs_eager=m.DERIVE_THUMBS_EAGER,
             derive_filmstrips_eager=m.DERIVE_FILMSTRIPS_EAGER,
             delete_after_download=m.DELETE_AFTER_DOWNLOAD,
+            delete_ro_after_download=m.DELETE_RO_AFTER_DOWNLOAD,
             timeout=float(m.TIMEOUT),
             download_attempts=m.DOWNLOAD_ATTEMPTS,
             max_attempts=m.MAX_DOWNLOAD_ATTEMPTS,

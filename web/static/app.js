@@ -3740,9 +3740,25 @@ function renderSyncSection(pane) {
   dnote.className = "hint";
   dnote.textContent =
     "Frees space on the dashcam SD card by removing each clip from the device " +
-    "once it's safely downloaded and verified. Read-only / locked clips are never " +
-    "deleted. This is irreversible — make sure your local archive is the master copy.";
+    "once it's safely downloaded and verified. This is irreversible — make sure " +
+    "your local archive is the master copy.";
   pane.appendChild(dnote);
+
+  renderField(
+    pane,
+    "DELETE_RO_AFTER_DOWNLOAD",
+    "…including read-only (event) clips",
+    checkbox("DELETE_RO_AFTER_DOWNLOAD"),
+  );
+  const roDelNote = document.createElement("p");
+  roDelNote.className = "hint";
+  roDelNote.textContent =
+    "By default the delete above skips clips in the dashcam's RO folder. Turn " +
+    "this on to remove those too — the pairing for a 'sync read-only only, then " +
+    "free the card' setup. Clips you marked 'retain indefinitely' are still never " +
+    "deleted, and some firmware refuses to delete RO clips at all (the attempt is " +
+    "logged if it fails).";
+  pane.appendChild(roDelNote);
 }
 
 function renderGpsSection(pane) {

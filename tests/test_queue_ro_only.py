@@ -40,6 +40,15 @@ def test_next_pending_ro_only_returns_none_when_no_ro(db: Database) -> None:
     assert queue.next_pending(db, ro_only=True) is None
 
 
+def test_next_pending_carries_locked_flag(db: Database) -> None:
+    """The post-download dashcam delete vetoes on the user's 'retain
+    indefinitely' pin, so the item it inspects has to carry it."""
+    _add_pending(db, filename="DRV.MP4", source_dir="/DCIM/Movie", enq=1)
+    assert queue.next_pending(db).locked == 0
+    queue.set_locked(db, ["DRV.MP4"], True)
+    assert queue.next_pending(db).locked == 1
+
+
 def test_next_pending_default_unchanged(db: Database) -> None:
     """Without ro_only, the worker still picks driving clips first
     when they're enqueued earlier."""

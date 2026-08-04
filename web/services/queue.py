@@ -101,6 +101,10 @@ class QueueItem:
     attempts: int
     last_error: Optional[str]
     last_attempt_at: Optional[int]
+    # User "retain indefinitely" pin. Defaulted so older construction sites
+    # keep working; the post-download dashcam delete reads it as a hard veto
+    # (see sync_worker._should_delete_after_download).
+    locked: int = 0
 
 
 def reconcile(
@@ -375,6 +379,7 @@ def next_pending(
         attempts=row["attempts"],
         last_error=row["last_error"],
         last_attempt_at=row["last_attempt_at"],
+        locked=row["locked"] or 0,
     )
 
 
