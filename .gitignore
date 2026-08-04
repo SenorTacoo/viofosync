@@ -8,6 +8,11 @@ test/*
 # testing
 .pytest_cache
 tmp
+.coverage
+code_coverage/
+
+# Editable-install leftovers (pip install -e writes src/*.egg-info)
+src/*.egg-info/
 
 # mac
 .DS_Store
