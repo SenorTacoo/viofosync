@@ -84,6 +84,21 @@ def test_delete_from_camera_ro_refusal_is_an_error(tmp_path):
     assert states == {"R.MP4": "pending", "A.MP4": "pending"}
 
 
+def test_delete_from_camera_keeps_done_rows_done(tmp_path):
+    """Clearing the card is the whole point of deleting a downloaded clip —
+    but it must not erase the fact that we hold it in the archive."""
+    from web.services.queue import delete_from_camera
+    rec, db = _env(tmp_path)
+    _q(db, "D.MP4", "/DCIM/Movie", state="done")
+    with patch("web.services.queue.vfs.delete_dashcam_file", return_value=True):
+        res = delete_from_camera(db, ["D.MP4"], "http://cam")
+    assert res["deleted"] == 1
+    with db.conn() as c:
+        assert c.execute(
+            "SELECT state FROM download_queue WHERE filename='D.MP4'"
+        ).fetchone()["state"] == "done"
+
+
 def test_delete_from_camera_counts_errors(tmp_path):
     from web.services.queue import delete_from_camera
     rec, db = _env(tmp_path)

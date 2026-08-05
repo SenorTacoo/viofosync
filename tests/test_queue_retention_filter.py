@@ -90,6 +90,18 @@ def test_sweep_respects_protect_ro(db: Database) -> None:
     assert _row(db, "RO.MP4")["state"] == "pending"
 
 
+def test_sweep_respects_protect_ro_for_native_paths(db: Database) -> None:
+    """Same clip, the shape the XML listing actually stores."""
+    _add(
+        db, filename="RO.MP4", age_days=90,
+        source_dir="A:\\DCIM\\Movie\\RO\\RO.MP4",
+    )
+    assert queue.retention_sweep_queue(
+        db, max_days=3, protect_ro=True, _now=NOW,
+    )["skipped"] == 0
+    assert _row(db, "RO.MP4")["state"] == "pending"
+
+
 def test_sweep_skips_ro_when_protection_is_off(db: Database) -> None:
     _add(db, filename="RO.MP4", age_days=90, source_dir="/DCIM/Movie/RO")
     assert queue.retention_sweep_queue(

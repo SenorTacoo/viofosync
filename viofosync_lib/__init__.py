@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Re-export the public API.
@@ -83,6 +84,65 @@ def _delete_body_status(body: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def is_ro_path(path: str | None) -> bool:
+    """True when a dashcam path lies in the write-protected ``RO``
+    folder (the camera's locked/event clips).
+
+    Separator- and case-agnostic, and true for both a directory and a
+    full file path, because the listing hands us either shape: the XML
+    ``FPATH`` is native (``A:\\DCIM\\Movie\\RO\\X.MP4``), the HTML
+    scrape's href is URL-style (``/DCIM/Movie/RO/X.MP4``). Every RO
+    decision in the app funnels through here so one path shape can't
+    read as locked in one place and as ordinary footage in another.
+    """
+    norm = (path or "").replace("\\", "/").upper().rstrip("/")
+    return "/RO/" in norm or norm.endswith("/RO")
+
+
+def _dashcam_posix_path(source_dir: str, filename: str) -> str:
+    """URL-style absolute path — ``/DCIM/Movie/RO/X.MP4``.
+
+    This is the form ``download_file`` puts in a GET URL, and the form
+    ``cmd=4003`` does NOT accept (see :func:`_dashcam_native_path`). Kept
+    as the fallback for any firmware that wants it.
+
+    ``source_dir`` is whatever the listing recorded for the clip: in
+    practice the *full file path* (the XML's ``FPATH``, the HTML
+    scrape's href), for older rows a plain directory. The filename is
+    appended only when the path doesn't already end with it.
+    """
+    cleaned = re.sub(r"^[A-Za-z]:", "", source_dir or "")
+    cleaned = cleaned.replace("\\", "/").rstrip("/")
+    if cleaned.rsplit("/", 1)[-1].lower() != filename.lower():
+        cleaned = f"{cleaned}/{filename}"
+    return cleaned if cleaned.startswith("/") else f"/{cleaned}"
+
+
+def _dashcam_native_path(source_dir: str, filename: str) -> str:
+    """The camera's own path form — ``A:\\DCIM\\Movie\\RO\\X.MP4``.
+
+    Verified against an A229 on firmware answering ``cmd=4003``: the
+    POSIX form is rejected with ``Status -5`` ("no such file") even for
+    an ordinary, unprotected clip in ``/DCIM/Movie``, while the same
+    delete with the drive letter and backslashes succeeds. The drive
+    letter is preserved when the listing supplied one (``B:`` is the
+    SSD on models that have it) and defaults to ``A:`` (the SD card)
+    otherwise.
+
+    Locked clips keep living in the ``RO`` subdirectory, which the
+    listing already encodes in the path — there is nothing extra to do
+    for them here beyond not mangling it.
+    """
+    raw = (source_dir or "").replace("/", "\\").rstrip("\\")
+    m = re.match(r"^([A-Za-z]:)(.*)$", raw)
+    drive, rest = (m.group(1), m.group(2)) if m else ("A:", raw)
+    if rest.rsplit("\\", 1)[-1].lower() != filename.lower():
+        rest = f"{rest}\\{filename}"
+    if not rest.startswith("\\"):
+        rest = f"\\{rest}"
+    return f"{drive}{rest}"
+
+
 def delete_dashcam_file(
     base_url: str,
     source_dir: str,
@@ -90,28 +150,57 @@ def delete_dashcam_file(
     *,
     timeout: float = 10.0,
 ) -> bool:
-    """Ask the Viofo dashcam to delete ``<source_dir>/<filename>``.
+    """Ask the Viofo dashcam to delete a clip.
 
-    Confirmed protocol against the A229 Pro:
+    Verified against an A229:
 
-        GET <base_url>/?custom=1&cmd=4003&str=<absolute-path>
+        GET <base_url>/?custom=1&cmd=4003&str=A%3A%5CDCIM%5CMovie%5CX.MP4
 
-    Works for write-protected clips too — those live under
-    ``/DCIM/Movie/RO`` and are deleted by the same command with the
-    ``/RO`` path; whether the firmware honours it is the camera's
-    call, reported back through the body ``<Status>``.
+    The ``str`` argument is a *camera filesystem* path, not a URL path:
+    drive letter, backslashes, percent-encoded. The URL-style
+    ``/DCIM/Movie/X.MP4`` is rejected with ``Status -5`` even for an
+    ordinary unprotected clip — which is what made this look like a
+    write-protection problem. Write-protected clips are no different;
+    the listing simply puts them in the ``RO`` subdirectory, and that
+    path deletes like any other.
 
-    Returns True only when the request succeeded *and* the camera did
-    not report a non-zero ``<Status>``. False on any HTTP, URL, or
-    timeout error, and on an explicit refusal. Never raises — failure
+    ``source_dir`` is whatever the listing recorded for the clip — the
+    full ``A:\\DCIM\\Movie\\…\\X.MP4`` file path in practice, a plain
+    directory for older rows; both resolve correctly. On a refusal the
+    URL-style path is retried once, so firmware that wants the other
+    form still works.
+
+    Returns True only when a request succeeded *and* the camera did not
+    report a non-zero ``<Status>``. False on any HTTP, URL, or timeout
+    error, and on a refusal of both path forms. Never raises — failure
     is the caller's cue to log a warning and continue.
     """
     log = logging.getLogger("viofosync_lib.delete")
-    # source_dir already includes the leading slash on the dashcam
-    # (e.g. "/DCIM/Movie") and never has a trailing slash; build the
-    # absolute path with a single join.
-    path = f"{source_dir}/{filename}"
-    url = f"{base_url}/?custom=1&cmd=4003&str={path}"
+    native = _dashcam_native_path(source_dir, filename)
+    posix = _dashcam_posix_path(source_dir, filename)
+    # Native first (the confirmed form); the URL-style path is only
+    # worth a second request when it actually differs. safe="" on the
+    # native form percent-encodes ':' and '\' as the camera expects;
+    # the fallback keeps its '/' separators literal.
+    attempts = [(native, "")]
+    if posix != native:
+        attempts.append((posix, "/"))
+    for path, safe in attempts:
+        quoted = urllib.parse.quote(path, safe=safe)
+        outcome = _try_delete(
+            f"{base_url}/?custom=1&cmd=4003&str={quoted}",
+            filename, path, timeout=timeout, log=log,
+        )
+        if outcome is not None:
+            return outcome
+    return False
+
+
+def _try_delete(url, filename, path, *, timeout, log) -> bool | None:
+    """One cmd=4003 attempt. True = deleted, False = transport/HTTP
+    failure (no point trying another path form), None = the camera
+    answered but refused this path, so a different form may still
+    work."""
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             if not 200 <= getattr(resp, "status", 0) < 300:
@@ -123,20 +212,23 @@ def delete_dashcam_file(
                 body = resp.read().decode("utf-8", errors="replace")
             except OSError:  # pragma: no cover — body read is best-effort
                 body = ""
-        status = _delete_body_status(body)
-        if status not in (None, 0):
-            log.warning(
-                "dashcam delete %s: camera refused (status %s)",
-                filename, status,
-            )
-            return False
-        return True
     except urllib.error.HTTPError as e:
         log.warning("dashcam delete %s: HTTP %s", filename, e.code)
         return False
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         log.warning("dashcam delete %s: %s", filename, e)
         return False
+    status = _delete_body_status(body)
+    if status not in (None, 0):
+        # Log the path we asked for: a refusal and a mistyped path look
+        # identical from the status code alone (this firmware answers
+        # -5 for "no such file"), and the path is the part we control.
+        log.warning(
+            "dashcam delete %s: camera refused (status %s) for %s",
+            filename, status, path,
+        )
+        return None
+    return True
 
 
 __all__ = [
@@ -159,6 +251,7 @@ __all__ = [
     "get_filepath",
     "get_group_name",
     "has_final_moov",
+    "is_ro_path",
     "parse_moov",
     "remote_moov_reachable",
 ]

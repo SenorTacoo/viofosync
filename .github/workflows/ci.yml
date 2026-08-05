@@ -1,10 +1,16 @@
 name: CI
 
+# On main this workflow does NOT run on its own — "Publish image" calls it
+# as its gate, so a push there would otherwise run the suite twice for the
+# same commit. Everything else still gets CI directly.
 on:
   push:
-    branches: [main, web-ui]
+    branches-ignore: [main]
   pull_request:
-    branches: [main, web-ui]
+    branches: [main]
+  # Callable so "Publish image" can run these exact checks as its gate —
+  # one definition of what green means, no copy that can drift.
+  workflow_call:
 
 jobs:
   test:

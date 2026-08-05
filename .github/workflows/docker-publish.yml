@@ -7,21 +7,35 @@
 # Requires two repo secrets (Settings → Secrets and variables → Actions):
 #   DOCKERHUB_USERNAME — your Docker Hub account name
 #   DOCKERHUB_TOKEN    — a Docker Hub access token with Read & Write
+#
+# CI is the gate: the build job needs the `test` job, which calls ci.yml,
+# so a failing suite means no image is pushed — including for a manual
+# workflow_dispatch run.
 name: Publish image
 
 on:
   push:
     branches: [main]
-    # Don't rebuild for changes that can't affect the image. The
-    # .dockerignore already keeps tests/docs out of the build context.
+    # Only docs are skipped. This workflow is now the sole thing running
+    # CI on main, so ignoring more (tests/**, the workflow files) would
+    # mean pushing those with no checks at all. Rebuilding for them costs
+    # almost nothing: .dockerignore keeps tests, docs and .github out of
+    # the build context, so the context is byte-identical and every layer
+    # comes from the registry cache.
     paths-ignore:
       - "**.md"
-      - "tests/**"
-      - ".github/workflows/ci.yml"
   workflow_dispatch:
 
 jobs:
+  # The gate: ruff + pytest, reusing ci.yml itself rather than a copy of
+  # its steps. A red test suite fails this job, `needs` never resolves,
+  # and nothing is pushed to Docker Hub — so :latest can only ever move
+  # to a commit that passed CI.
+  test:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

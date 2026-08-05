@@ -59,7 +59,7 @@ def _event_type_for(camera_field: str, source_dir: str) -> str:
     ``source_dir`` (snapshotted from download_queue at scan time).
     Event-mode clips collapse into ``normal``.
     """
-    if "/RO/" in source_dir.upper():
+    if vfs.is_ro_path(source_dir):
         return "ro"
     if camera_field.upper().startswith("P"):
         return "parking"

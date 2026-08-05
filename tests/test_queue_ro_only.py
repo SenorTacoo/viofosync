@@ -40,6 +40,22 @@ def test_next_pending_ro_only_returns_none_when_no_ro(db: Database) -> None:
     assert queue.next_pending(db, ro_only=True) is None
 
 
+def test_next_pending_ro_only_matches_native_camera_paths(db: Database) -> None:
+    """The XML listing's FPATH is a native path — drive letter and
+    backslashes — so an RO test that only knows '/RO/' silently reads
+    every locked clip as ordinary footage."""
+    _add_pending(
+        db, filename="DRV.MP4", source_dir="A:\\DCIM\\Movie\\DRV.MP4", enq=1,
+    )
+    _add_pending(
+        db, filename="LOCK.MP4",
+        source_dir="A:\\DCIM\\Movie\\RO\\LOCK.MP4", enq=2,
+    )
+    item = queue.next_pending(db, ro_only=True)
+    assert item is not None
+    assert item.filename == "LOCK.MP4"
+
+
 def test_next_pending_carries_locked_flag(db: Database) -> None:
     """The post-download dashcam delete vetoes on the user's 'retain
     indefinitely' pin, so the item it inspects has to carry it."""

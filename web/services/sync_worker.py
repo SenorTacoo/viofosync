@@ -100,16 +100,14 @@ def _filter_ro_only(listing):
     """Yield only Recordings whose dashcam source path lies under
     /RO/. Used when the user has 'Sync read-only files only' on."""
     for r in listing:
-        fp = (getattr(r, "filepath", None) or "").upper()
-        if "/RO/" in fp or fp.endswith("/RO"):
+        if vfs.is_ro_path(getattr(r, "filepath", None)):
             yield r
 
 
 def _is_ro_source(source_dir: str | None) -> bool:
     """True when a queue row's dashcam path lies in the camera's
-    write-protected /RO/ (locked/event) folder."""
-    src = source_dir or ""
-    return "/RO/" in src or src.endswith("/RO")
+    write-protected RO (locked/event) folder."""
+    return vfs.is_ro_path(source_dir)
 
 
 def _should_delete_after_download(

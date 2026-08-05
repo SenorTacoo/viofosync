@@ -2794,7 +2794,7 @@ function renderHourBody(day, hh, items) {
       ? (SKIP_REASON_TITLE[it.skip_reason] || SKIP_REASON_TITLE.user) : "";
     tr.innerHTML = `
       <td><input type="checkbox" class="qi-check" value="${escHtml(it.filename)}"
-            ${selectable ? "" : "disabled"}
+            ${selectable ? "" : `disabled title="${escHtml(unselectableReason(it.state))}"`}
             ${checked ? "checked" : ""} /></td>
       <td>${ts}</td>
       <td>${kind}</td>
@@ -2823,10 +2823,21 @@ function renderHourBody(day, hh, items) {
 }
 
 // Which queue states can be selected for a bulk action: pending (download
-// next / skip), failed (skip / retry), skipped (clear skip).
+// next / skip), failed (skip / retry), skipped (clear skip), done (delete
+// from camera / mark read-only — a downloaded clip is exactly the one you
+// want to clear off the card). Excluded: 'downloading' (deleting a clip
+// mid-transfer breaks it) and 'gone' (already off the camera).
 function isSelectable(stateStr) {
   return stateStr === "pending" || stateStr === "failed"
-      || stateStr === "skipped";
+      || stateStr === "skipped" || stateStr === "done";
+}
+
+// Why a row can't be ticked. A disabled checkbox with no explanation just
+// reads as broken.
+function unselectableReason(stateStr) {
+  if (stateStr === "downloading") return "Downloading — wait for it to finish";
+  if (stateStr === "gone") return "No longer on the camera";
+  return "Not selectable in this state";
 }
 
 function countSelectedInDay(day) {

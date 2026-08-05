@@ -321,11 +321,20 @@ _NEWEST_CAPTURE_SQL = (
 
 
 def _ro_source_sql(alias: str = "") -> str:
-    """SQL test for "this row lives in the dashcam's write-protected /RO
-    folder". The listing stores the path with or without a trailing
-    slash, so both forms are matched."""
+    """SQL test for "this row lives in the dashcam's write-protected RO
+    folder".
+
+    ``source_dir`` holds the listing's path verbatim, and its shape
+    depends on the camera and the listing mode: the XML's ``FPATH`` is a
+    native path (``A:\\DCIM\\Movie\\RO\\X.MP4``), the HTML scrape's href
+    is URL-style (``/DCIM/Movie/RO/X.MP4``). Match both separators, and
+    both a directory value and a full file path.
+    """
     p = f"{alias}." if alias else ""
-    return f"({p}source_dir LIKE '%/RO/%' OR {p}source_dir LIKE '%/RO')"
+    return (
+        f"({p}source_dir LIKE '%/RO/%' OR {p}source_dir LIKE '%/RO' "
+        f"OR {p}source_dir LIKE '%\\RO\\%' OR {p}source_dir LIKE '%\\RO')"
+    )
 
 
 def _retention_expired_sql(alias: str = "", *, protect_ro: bool = True) -> str:
@@ -629,7 +638,11 @@ def _day_expr() -> str:
     return day_key_sql()
 
 
-_RO_SQL = "source_dir LIKE '%/RO/%'"
+# The RO test used by the kind filters and the per-day counts. Same
+# expression as the download gate's — one definition, so a path shape
+# that reads as RO in one place can't read as driving footage in
+# another. Callers alias it by rewriting the bare ``source_dir``.
+_RO_SQL = _ro_source_sql()
 
 
 def _kind_filters(
@@ -1148,8 +1161,9 @@ def delete_from_camera(
     them were RO clips) instead of the request never being made.
 
     On a successful delete the queue row becomes 'gone' (no longer on the
-    camera). Network failures are counted, not raised. Returns
-    {deleted, skipped, errors, ro_errors}."""
+    camera) — except a 'done' row, which keeps its state because we still
+    hold the clip in the archive. Network failures are counted, not raised.
+    Returns {deleted, skipped, errors, ro_errors}."""
     if not filenames:
         return {"deleted": 0, "skipped": 0, "errors": 0, "ro_errors": 0}
     ph = ",".join("?" * len(filenames))
@@ -1170,13 +1184,17 @@ def delete_from_camera(
             deleted += 1
         else:
             errors += 1
-            if "/RO/" in sd or sd.endswith("/RO"):
+            if vfs.is_ro_path(sd):
                 ro_errors += 1
     if gone:
         gph = ",".join("?" * len(gone))
         with db.write() as c:
+            # A 'done' row stays 'done': clearing the card doesn't undo the
+            # fact that we hold the clip locally, and the archive counts read
+            # that state. 'gone' is for rows we never got.
             c.execute(
-                f"UPDATE download_queue SET state='gone' WHERE filename IN ({gph})",
+                f"UPDATE download_queue SET state='gone' "
+                f"WHERE filename IN ({gph}) AND state <> 'done'",
                 gone,
             )
     log.info("delete from camera: %d deleted, %d pinned, %d error(s)"
