@@ -1377,6 +1377,15 @@ const TRIAGE_STATE_ICON = {
   skipped: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="6"/><path d="M4 4l8 8"/></svg>',
   geofence: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 7l6-4 6 4M4 6.5V13h8V6.5"/></svg>',
 };
+// Why a queue row sits in 'skipped'. Mirrors download_queue.skip_reason
+// (NULL on legacy rows reads as a manual skip).
+const SKIP_REASON_TITLE = {
+  user: "Skipped manually — use Clear skip to queue it again",
+  geofence: "Skipped: parked at home",
+  retention: "Skipped: older than the retention window, it would be "
+    + "deleted right after downloading. Clear skip to fetch and keep it.",
+};
+
 const TRIAGE_STATE_TITLE = {
   pending: "Queued for download",
   downloading: "Downloading",
@@ -2779,6 +2788,10 @@ function renderHourBody(day, hh, items) {
     const selectable = isSelectable(it.state);
     const checked = state.queueSelected.has(it.filename);
     const kind = renderKindBadge(it);
+    // A skip is only actionable if you know who did it: 'user' is the
+    // bulk action, 'geofence' the home zone, 'retention' the age filter.
+    const stateTitle = it.state === "skipped"
+      ? (SKIP_REASON_TITLE[it.skip_reason] || SKIP_REASON_TITLE.user) : "";
     tr.innerHTML = `
       <td><input type="checkbox" class="qi-check" value="${escHtml(it.filename)}"
             ${selectable ? "" : "disabled"}
@@ -2788,7 +2801,7 @@ function renderHourBody(day, hh, items) {
       <td class="gps-cell">${renderGpsBadge(it)}</td>
       <td>${escHtml(it.filename)}</td>
       <td>${size}</td>
-      <td class="state-${it.state}">${it.state}</td>
+      <td class="state-${it.state}" title="${escHtml(stateTitle)}">${it.state}</td>
       <td>${it.attempts}</td>
       <td class="order-cell">${pos}</td>
     `;
@@ -2940,13 +2953,20 @@ const QUEUE_ACTIONS = {
     body: (f) => ({ filenames: f }),
     confirm: (n) =>
       `Delete ${n} clip(s) from the dashcam SD card? This cannot be undone.`,
-    // The route returns {deleted, skipped, errors} (not {updated}), and
-    // {ok:false,error} when no camera is configured.
+    // The route returns {deleted, skipped, errors, ro_errors} (not
+    // {updated}), and {ok:false,error} when no camera is configured.
+    // Read-only clips are attempted like any other — `skipped` now only
+    // counts clips pinned "retain indefinitely", and a camera that
+    // refuses to delete a protected clip shows up in ro_errors.
     toast: (r) => r.ok === false
       ? `Failed: ${r.error || "no dashcam configured"}`
       : `Deleted ${r.deleted} from camera`
-        + (r.skipped ? `, ${r.skipped} protected` : "")
-        + (r.errors ? `, ${r.errors} error(s)` : ""),
+        + (r.skipped ? `, ${r.skipped} pinned (retain indefinitely)` : "")
+        + (r.errors
+            ? `, ${r.errors} failed`
+              + (r.ro_errors
+                  ? ` (${r.ro_errors} read-only — camera refused)` : "")
+            : ""),
     toastType: (r) => (r.ok === false || r.errors) ? "error" : "success",
   },
 };
@@ -4157,7 +4177,10 @@ function renderArchiveSection(pane) {
   rnote.className = "hint";
   rnote.textContent =
     "Cleanup runs after each sync cycle. Files older than the day cap are " +
-    "always removed first. The two disk-pressure triggers below are " +
+    "always removed first, and clips on the camera that are already past " +
+    "it are never downloaded — they show up as skipped in Downloads, and " +
+    "clearing the skip fetches one and pins it. The two disk-pressure " +
+    "triggers below are " +
     "independent — either or both may be set. Filesystem % is the right " +
     "choice when recordings live on a dedicated volume. GiB quota is the " +
     "right choice when recordings sit inside a Synology share / ZFS " +

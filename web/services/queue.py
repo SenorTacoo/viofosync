@@ -320,12 +320,51 @@ _NEWEST_CAPTURE_SQL = (
 )
 
 
+def _ro_source_sql(alias: str = "") -> str:
+    """SQL test for "this row lives in the dashcam's write-protected /RO
+    folder". The listing stores the path with or without a trailing
+    slash, so both forms are matched."""
+    p = f"{alias}." if alias else ""
+    return f"({p}source_dir LIKE '%/RO/%' OR {p}source_dir LIKE '%/RO')"
+
+
+def _retention_expired_sql(alias: str = "", *, protect_ro: bool = True) -> str:
+    """SQL test for "the local retention time rule would delete this clip
+    the moment it finished downloading".
+
+    Mirrors :func:`retention._eligible_by_time` exactly, on the queue's
+    columns: a ``locked`` row (user "retain indefinitely") is never
+    expired because the sweep would not delete it either, and neither is
+    a dashcam RO row while ``RETENTION_PROTECT_RO`` is on. Rows with no
+    ``recorded_at`` are never expired — an unknown age is not an old age.
+
+    Binds exactly one parameter: the cutoff timestamp
+    (``now - max_days * 86400``).
+    """
+    p = f"{alias}." if alias else ""
+    sql = (
+        f"({p}recorded_at IS NOT NULL AND {p}recorded_at < ? "
+        f"AND COALESCE({p}locked, 0) = 0"
+    )
+    if protect_ro:
+        sql += f" AND NOT {_ro_source_sql(alias)}"
+    return sql + ")"
+
+
 def next_pending(
     db: Database, *, ro_only: bool = False, triage_gate: bool = False,
-    active_guard: bool = False,
+    active_guard: bool = False, retention_max_days: int = 0,
+    retention_protect_ro: bool = True, _now: Optional[int] = None,
 ) -> Optional[QueueItem]:
     """Highest priority, oldest enqueue time. If ``ro_only`` is set, only
     consider rows whose source_dir is under /RO/.
+
+    If ``retention_max_days`` is > 0, clips already older than the local
+    retention window are never picked: the sweep would delete them
+    seconds after they landed, so downloading them is pure wasted
+    bandwidth. :func:`retention_sweep_queue` normally parks those rows in
+    ``skipped``/``retention`` up front; this gate is the belt-and-braces
+    for a row that ages past the window while sitting in the queue.
 
     If ``triage_gate`` is set (GPS_TRIAGE on), a row is held back while its
     GPS-bearing sibling is still awaiting triage (``triaged_at IS NULL AND
@@ -341,10 +380,14 @@ def next_pending(
     sql = "SELECT dq.* FROM download_queue dq WHERE dq.state='pending'"
     params: List[object] = []
     if ro_only:
+        sql += f" AND {_ro_source_sql('dq')}"
+    if retention_max_days > 0:
+        now = _now if _now is not None else int(time.time())
         sql += (
-            " AND (dq.source_dir LIKE '%/RO/%' "
-            "OR dq.source_dir LIKE '%/RO')"
+            " AND NOT "
+            + _retention_expired_sql("dq", protect_ro=retention_protect_ro)
         )
+        params.append(now - retention_max_days * 86400)
     if triage_gate:
         sql += (
             " AND NOT EXISTS ("
@@ -901,16 +944,25 @@ def delete_clips(db: Database, filenames: List[str], recordings: str) -> dict:
 def unskip(db: Database, filenames: List[str]) -> int:
     """Return ``skipped`` files to ``pending`` for downloading again,
     resetting attempts/last_error for a fresh try (mirrors ``retry``).
-    Only ``skipped`` rows change; returns the number updated."""
+    Only ``skipped`` rows change; returns the number updated.
+
+    Un-skipping carries a permanent release marker so the auto-skips
+    can't immediately undo the user's decision: a geofence row records
+    ``geofence_released_at``, and a retention row is pinned
+    (``locked=1``) — the same pin the archive's "retain indefinitely"
+    sets, which is what stops the sweep deleting the clip the moment it
+    lands. Asking for an out-of-window clip is asking to keep it."""
     if not filenames:
         return 0
     with db.write() as c:
         ph = ",".join("?" * len(filenames))
         cur = c.execute(
             f"UPDATE download_queue SET state='pending', "
-            f"attempts=0, last_error=NULL, skip_reason=NULL, "
+            f"attempts=0, last_error=NULL, "
+            f"locked=CASE WHEN skip_reason='retention' THEN 1 ELSE locked END, "
             f"geofence_released_at=CASE WHEN skip_reason='geofence' "
-            f"  THEN ? ELSE geofence_released_at END "
+            f"  THEN ? ELSE geofence_released_at END, "
+            f"skip_reason=NULL "
             f"WHERE filename IN ({ph}) AND state='skipped'",
             [int(time.time())] + filenames,
         )
@@ -951,6 +1003,69 @@ def unskip_geofence(db: Database) -> int:
             "AND geofence_released_at IS NULL"
         )
         return cur.rowcount
+
+
+def retention_sweep_queue(
+    db: Database, *, max_days: int, protect_ro: bool = True,
+    _now: Optional[int] = None,
+) -> dict:
+    """Keep the queue in step with the local time-based retention window.
+
+    Two halves, run together so a settings change applies live:
+
+    * clips already outside the window are auto-skipped as
+      ``skipped``/``retention`` — without this the worker downloads a
+      clip only for the next sweep to delete it minutes later
+    * retention-skipped clips that are back inside the window (the user
+      widened ``RETENTION_MAX_DAYS``, or turned the rule off) return to
+      ``pending``
+
+    Only the time rule is mirrored — disk-pressure eviction is
+    oldest-first and says nothing about a specific clip's age. Rows the
+    user pinned (``locked``) are left alone in both directions, which is
+    also how :func:`unskip` releases a clip for good: un-skipping a
+    retention row pins it, so this pass can never take it back.
+
+    Returns ``{"skipped": n, "released": n}``.
+    """
+    now = _now if _now is not None else int(time.time())
+    with db.write() as c:
+        if max_days > 0:
+            cutoff = now - max_days * 86400
+            expired = _retention_expired_sql(protect_ro=protect_ro)
+            skipped = c.execute(
+                f"UPDATE download_queue SET state='skipped', "
+                f"skip_reason='retention' "
+                f"WHERE state IN ('pending', 'failed') AND {expired}",
+                (cutoff,),
+            ).rowcount
+            released = c.execute(
+                f"UPDATE download_queue SET state='pending', attempts=0, "
+                f"last_error=NULL, skip_reason=NULL "
+                f"WHERE state='skipped' AND skip_reason='retention' "
+                f"AND NOT {expired}",
+                (cutoff,),
+            ).rowcount
+        else:
+            # Rule off — nothing is expired, so every retention skip is
+            # released and no cutoff is needed.
+            skipped = 0
+            released = c.execute(
+                "UPDATE download_queue SET state='pending', attempts=0, "
+                "last_error=NULL, skip_reason=NULL "
+                "WHERE state='skipped' AND skip_reason='retention'"
+            ).rowcount
+    if skipped:
+        log.info(
+            "retention: %d queued clip(s) skipped — older than %d day(s), "
+            "they would be deleted on arrival", skipped, max_days,
+        )
+    if released:
+        log.info(
+            "retention: %d queued clip(s) back inside the retention "
+            "window — returned to pending", released,
+        )
+    return {"skipped": skipped, "released": released}
 
 
 def geofence_candidates(db: Database, day: str) -> List[dict]:
@@ -1022,24 +1137,32 @@ def set_locked(db: Database, filenames: List[str], locked: bool = True) -> int:
 def delete_from_camera(
     db: Database, filenames: List[str], base_url: str, *, timeout: float = 10.0,
 ) -> dict:
-    """Delete the given clips from the dashcam SD card (cmd=4003). Skips clips
-    the user has locked (retain indefinitely) and dashcam RO clips (source_dir
-    under /RO/ — firmware write-protected). On a successful delete the queue row
-    becomes 'gone' (no longer on the camera). Network failures are counted, not
-    raised. Returns {deleted, skipped, errors}."""
+    """Delete the given clips from the dashcam SD card (cmd=4003).
+
+    The only client-side veto is the user's ``locked`` pin ("retain
+    indefinitely") — those are counted as ``skipped``. Dashcam RO clips
+    (``source_dir`` under /RO/) ARE attempted: this is an explicit,
+    confirmed user action on a hand-picked selection, and the camera's
+    write-protection is the camera's to enforce. If the firmware refuses,
+    that refusal comes back as an error (``ro_errors`` counts how many of
+    them were RO clips) instead of the request never being made.
+
+    On a successful delete the queue row becomes 'gone' (no longer on the
+    camera). Network failures are counted, not raised. Returns
+    {deleted, skipped, errors, ro_errors}."""
     if not filenames:
-        return {"deleted": 0, "skipped": 0, "errors": 0}
+        return {"deleted": 0, "skipped": 0, "errors": 0, "ro_errors": 0}
     ph = ",".join("?" * len(filenames))
     with db.conn() as c:
         rows = c.execute(
             f"SELECT filename, source_dir, locked FROM download_queue "
             f"WHERE filename IN ({ph})", filenames,
         ).fetchall()
-    deleted = skipped = errors = 0
+    deleted = skipped = errors = ro_errors = 0
     gone: List[str] = []
     for r in rows:
         sd = r["source_dir"] or ""
-        if r["locked"] or "/RO/" in sd or sd.endswith("/RO"):
+        if r["locked"]:
             skipped += 1
             continue
         if vfs.delete_dashcam_file(base_url, sd, r["filename"], timeout=timeout):
@@ -1047,6 +1170,8 @@ def delete_from_camera(
             deleted += 1
         else:
             errors += 1
+            if "/RO/" in sd or sd.endswith("/RO"):
+                ro_errors += 1
     if gone:
         gph = ",".join("?" * len(gone))
         with db.write() as c:
@@ -1054,9 +1179,16 @@ def delete_from_camera(
                 f"UPDATE download_queue SET state='gone' WHERE filename IN ({gph})",
                 gone,
             )
-    log.info("delete from camera: %d deleted, %d skipped, %d error(s) — %s",
-             deleted, skipped, errors, _names(filenames))
-    return {"deleted": deleted, "skipped": skipped, "errors": errors}
+    log.info("delete from camera: %d deleted, %d pinned, %d error(s)"
+             "%s — %s",
+             deleted, skipped, errors,
+             f" ({ro_errors} read-only clip(s) the camera refused)"
+             if ro_errors else "",
+             _names(filenames))
+    return {
+        "deleted": deleted, "skipped": skipped,
+        "errors": errors, "ro_errors": ro_errors,
+    }
 
 
 def skip_listed_names(db: Database, names: Sequence[str]) -> set[str]:

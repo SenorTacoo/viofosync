@@ -326,6 +326,21 @@ async def lifespan(app: FastAPI):
         provider.subscribe(_on_geofence_settings_changed)
     )
 
+    def _on_retention_settings_changed(keys, snap) -> None:
+        # Re-evaluate the queue against the new window right away: a
+        # shorter window parks the aged-out backlog, a longer one (or
+        # turning the rule off) hands it back — neither should wait for
+        # the next sync cycle.
+        if {"RETENTION_MAX_DAYS", "RETENTION_PROTECT_RO"} & keys:
+            _tasks.spawn(
+                app.state.sync_worker._run_retention_queue_pass(),
+                name="retention-queue-pass",
+            )
+
+    app.state.settings_unsubscribes.append(
+        provider.subscribe(_on_retention_settings_changed)
+    )
+
     app.state.mqtt = MqttService(
         db=app.state.db,
         provider=provider,

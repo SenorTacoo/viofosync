@@ -18,6 +18,7 @@ plus one deliberately public submodule:
 from __future__ import annotations
 
 import logging
+import re
 import urllib.error
 import urllib.request
 
@@ -68,6 +69,20 @@ def download_file_with(
     )
 
 
+# Novatek/cardv replies carry the real outcome in the body, not the
+# HTTP status: ``<Function><Cmd>4003</Cmd><Status>0</Status></Function>``
+# where 0 means "done" and anything else is a refusal (the firmware
+# answers 200 OK either way). Bodies without a <Status> tag are treated
+# as success — some firmware returns an empty body on a good delete.
+_STATUS_RE = re.compile(r"<Status>\s*(-?\d+)\s*</Status>")
+
+
+def _delete_body_status(body: str) -> int | None:
+    """Parsed ``<Status>`` from a cmd=4003 reply, or None when absent."""
+    m = _STATUS_RE.search(body)
+    return int(m.group(1)) if m else None
+
+
 def delete_dashcam_file(
     base_url: str,
     source_dir: str,
@@ -81,9 +96,15 @@ def delete_dashcam_file(
 
         GET <base_url>/?custom=1&cmd=4003&str=<absolute-path>
 
-    Returns True on a 2xx response, False on any HTTP, URL, or
-    timeout error. Never raises — failure is the caller's cue to
-    log a warning and continue.
+    Works for write-protected clips too — those live under
+    ``/DCIM/Movie/RO`` and are deleted by the same command with the
+    ``/RO`` path; whether the firmware honours it is the camera's
+    call, reported back through the body ``<Status>``.
+
+    Returns True only when the request succeeded *and* the camera did
+    not report a non-zero ``<Status>``. False on any HTTP, URL, or
+    timeout error, and on an explicit refusal. Never raises — failure
+    is the caller's cue to log a warning and continue.
     """
     log = logging.getLogger("viofosync_lib.delete")
     # source_dir already includes the leading slash on the dashcam
@@ -93,12 +114,23 @@ def delete_dashcam_file(
     url = f"{base_url}/?custom=1&cmd=4003&str={path}"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
-            ok = 200 <= getattr(resp, "status", 0) < 300
-            if not ok:
+            if not 200 <= getattr(resp, "status", 0) < 300:
                 log.warning(
                     "dashcam delete %s: HTTP %s", filename, resp.status
                 )
-            return ok
+                return False
+            try:
+                body = resp.read().decode("utf-8", errors="replace")
+            except OSError:  # pragma: no cover — body read is best-effort
+                body = ""
+        status = _delete_body_status(body)
+        if status not in (None, 0):
+            log.warning(
+                "dashcam delete %s: camera refused (status %s)",
+                filename, status,
+            )
+            return False
+        return True
     except urllib.error.HTTPError as e:
         log.warning("dashcam delete %s: HTTP %s", filename, e.code)
         return False

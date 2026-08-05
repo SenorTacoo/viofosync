@@ -826,6 +826,27 @@ class SyncWorker:
         )
         await self._emit_disk_pct()
 
+    async def _run_retention_queue_pass(self) -> None:
+        """Park queued clips that are already outside the retention
+        window (and release them again if the window widens).
+
+        Downloading a clip the sweep deletes minutes later costs the
+        camera's bandwidth and the card's read cycles for nothing, so
+        this runs before triage — the skipped clips don't even get a
+        GPS read. Purely local DB work; never raises into the cycle."""
+        snap = self._provider.get()
+        try:
+            res = await asyncio.to_thread(
+                q.retention_sweep_queue, self.db,
+                max_days=getattr(snap, "retention_max_days", 0) or 0,
+                protect_ro=getattr(snap, "retention_protect_ro", True),
+            )
+        except Exception:  # pragma: no cover — never kill the cycle
+            log.exception("retention queue pass failed")
+            return
+        if res["skipped"] or res["released"]:
+            q.emit_queue_changed(self.db, self.hub)
+
     # ---- probe ----
 
     async def _probe_one(self, address: str) -> bool:
@@ -943,6 +964,11 @@ class SyncWorker:
         # the camera lies about size). See _run_recording_status_pass.
         await self._run_recording_status_pass()
 
+        # Drop anything the retention window has already aged out before we
+        # spend a single camera round-trip on it — triage reads, downloads,
+        # then an immediate delete by the sweep was the old sequence.
+        await self._run_retention_queue_pass()
+
         # Triage queued clips (if enabled) before downloading any, so the
         # journey view shows where clips were recorded first.
         triaged_n = await self._run_triage_pass()
@@ -978,6 +1004,10 @@ class SyncWorker:
                 ro_only=snap.sync_ro_only,
                 triage_gate=getattr(snap, "gps_triage", False),
                 active_guard=True,
+                retention_max_days=getattr(snap, "retention_max_days", 0) or 0,
+                retention_protect_ro=getattr(
+                    snap, "retention_protect_ro", True
+                ),
             )
             if item is None:
                 break

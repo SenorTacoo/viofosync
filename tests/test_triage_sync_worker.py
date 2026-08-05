@@ -196,7 +196,8 @@ async def test_drain_passes_triage_gate(tmp_path, monkeypatch):
     captured = {}
     from web.services import queue as q
 
-    def spy(_db, *, ro_only=False, triage_gate=False, active_guard=False):
+    def spy(_db, *, ro_only=False, triage_gate=False, active_guard=False,
+            **_retention):
         captured["ro_only"] = ro_only
         captured["triage_gate"] = triage_gate
         return None          # empty queue -> drain ends immediately

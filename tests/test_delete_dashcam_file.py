@@ -13,8 +13,9 @@ from viofosync_lib import delete_dashcam_file
 
 
 class _FakeResponse:
-    def __init__(self, status: int = 200) -> None:
+    def __init__(self, status: int = 200, body: bytes = b"") -> None:
         self.status = status
+        self._body = body
 
     def __enter__(self):
         return self
@@ -23,7 +24,7 @@ class _FakeResponse:
         return None
 
     def read(self) -> bytes:
-        return b""
+        return self._body
 
 
 def test_delete_returns_true_on_success() -> None:
@@ -47,6 +48,41 @@ def test_delete_returns_true_on_success() -> None:
         "&str=/DCIM/Movie/2026_0508_104020_001234F.MP4"
     )
     assert captured["timeout"] == 5.0
+
+
+_OK_BODY = (
+    b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>"
+    b"<Function><Cmd>4003</Cmd><Status>0</Status></Function>"
+)
+_REFUSED_BODY = (
+    b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>"
+    b"<Function><Cmd>4003</Cmd><Status>-14</Status></Function>"
+)
+
+
+def _urlopen_returning(body: bytes, status: int = 200):
+    def fake_urlopen(req, timeout=None):
+        return _FakeResponse(status=status, body=body)
+    return fake_urlopen
+
+
+def test_delete_returns_true_on_zero_status_body() -> None:
+    with patch("urllib.request.urlopen", _urlopen_returning(_OK_BODY)):
+        ok = delete_dashcam_file(
+            "http://192.168.1.230", "/DCIM/Movie/RO", "X.MP4",
+        )
+    assert ok is True
+
+
+def test_delete_returns_false_when_camera_refuses() -> None:
+    """HTTP 200 with a non-zero <Status> is a refusal, not a delete —
+    reporting it as success would mark the clip gone while it is still
+    on the card."""
+    with patch("urllib.request.urlopen", _urlopen_returning(_REFUSED_BODY)):
+        ok = delete_dashcam_file(
+            "http://192.168.1.230", "/DCIM/Movie/RO", "X.MP4",
+        )
+    assert ok is False
 
 
 def test_delete_returns_false_on_http_error() -> None:

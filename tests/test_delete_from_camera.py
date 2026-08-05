@@ -1,4 +1,8 @@
-"""queue.delete_from_camera: dashcam SD-card delete, skipping locked/RO."""
+"""queue.delete_from_camera: dashcam SD-card delete, skipping pinned clips.
+
+Read-only (/RO) clips are attempted like any other — the camera enforces
+its own write-protection, and a refusal is reported as an error.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -30,20 +34,54 @@ def test_delete_from_camera_deletes_and_marks_gone(tmp_path):
     with patch("web.services.queue.vfs.delete_dashcam_file", return_value=True) as m:
         res = delete_from_camera(db, ["A.MP4"], "http://cam")
     m.assert_called_once_with("http://cam", "/DCIM/Movie", "A.MP4", timeout=10.0)
-    assert res == {"deleted": 1, "skipped": 0, "errors": 0}
+    assert res == {"deleted": 1, "skipped": 0, "errors": 0, "ro_errors": 0}
     with db.conn() as c:
         assert c.execute("SELECT state FROM download_queue WHERE filename='A.MP4'").fetchone()["state"] == "gone"
 
 
-def test_delete_from_camera_skips_locked_and_ro(tmp_path):
+def test_delete_from_camera_skips_only_locked(tmp_path):
     from web.services.queue import delete_from_camera
     rec, db = _env(tmp_path)
     _q(db, "L.MP4", "/DCIM/Movie", locked=1)
-    _q(db, "R.MP4", "/DCIM/Movie/RO")
     with patch("web.services.queue.vfs.delete_dashcam_file", return_value=True) as m:
-        res = delete_from_camera(db, ["L.MP4", "R.MP4"], "http://cam")
+        res = delete_from_camera(db, ["L.MP4"], "http://cam")
     m.assert_not_called()
-    assert res == {"deleted": 0, "skipped": 2, "errors": 0}
+    assert res == {"deleted": 0, "skipped": 1, "errors": 0, "ro_errors": 0}
+
+
+@pytest.mark.parametrize("source_dir", ["/DCIM/Movie/RO", "/DCIM/Movie/RO/"])
+def test_delete_from_camera_attempts_ro(tmp_path, source_dir):
+    """A read-only clip is a delete request like any other — the camera,
+    not the client, decides whether write-protection blocks it."""
+    from web.services.queue import delete_from_camera
+    rec, db = _env(tmp_path)
+    _q(db, "R.MP4", source_dir)
+    with patch("web.services.queue.vfs.delete_dashcam_file", return_value=True) as m:
+        res = delete_from_camera(db, ["R.MP4"], "http://cam")
+    m.assert_called_once_with("http://cam", source_dir, "R.MP4", timeout=10.0)
+    assert res == {"deleted": 1, "skipped": 0, "errors": 0, "ro_errors": 0}
+    with db.conn() as c:
+        assert c.execute(
+            "SELECT state FROM download_queue WHERE filename='R.MP4'"
+        ).fetchone()["state"] == "gone"
+
+
+def test_delete_from_camera_ro_refusal_is_an_error(tmp_path):
+    """When the firmware refuses, the clip stays queued and the refusal is
+    counted separately so the UI can say why."""
+    from web.services.queue import delete_from_camera
+    rec, db = _env(tmp_path)
+    _q(db, "R.MP4", "/DCIM/Movie/RO")
+    _q(db, "A.MP4", "/DCIM/Movie")
+    with patch("web.services.queue.vfs.delete_dashcam_file", return_value=False):
+        res = delete_from_camera(db, ["R.MP4", "A.MP4"], "http://cam")
+    assert res == {"deleted": 0, "skipped": 0, "errors": 2, "ro_errors": 1}
+    with db.conn() as c:
+        states = {
+            r["filename"]: r["state"] for r in
+            c.execute("SELECT filename, state FROM download_queue").fetchall()
+        }
+    assert states == {"R.MP4": "pending", "A.MP4": "pending"}
 
 
 def test_delete_from_camera_counts_errors(tmp_path):
@@ -52,7 +90,7 @@ def test_delete_from_camera_counts_errors(tmp_path):
     _q(db, "A.MP4", "/DCIM/Movie")
     with patch("web.services.queue.vfs.delete_dashcam_file", return_value=False):
         res = delete_from_camera(db, ["A.MP4"], "http://cam")
-    assert res == {"deleted": 0, "skipped": 0, "errors": 1}
+    assert res == {"deleted": 0, "skipped": 0, "errors": 1, "ro_errors": 0}
     with db.conn() as c:
         assert c.execute("SELECT state FROM download_queue WHERE filename='A.MP4'").fetchone()["state"] == "pending"
 
@@ -60,7 +98,9 @@ def test_delete_from_camera_counts_errors(tmp_path):
 def test_delete_from_camera_empty(tmp_path):
     from web.services.queue import delete_from_camera
     rec, db = _env(tmp_path)
-    assert delete_from_camera(db, [], "http://cam") == {"deleted": 0, "skipped": 0, "errors": 0}
+    assert delete_from_camera(db, [], "http://cam") == {
+        "deleted": 0, "skipped": 0, "errors": 0, "ro_errors": 0,
+    }
 
 
 # ── endpoint tests ──────────────────────────────────────────────────────────
